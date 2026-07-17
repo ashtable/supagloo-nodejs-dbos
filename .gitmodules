@@ -1,6 +1,6 @@
-[submodule "submodules/supagloo-prompts"]
-	path = submodules/supagloo-prompts
+[submodule "supagloo-prompts"]
+	path = supagloo-prompts
 	url = https://github.com/ashtable/supagloo-prompts.git
-[submodule "submodules/supagloo-database-lib"]
-	path = submodules/supagloo-database-lib
+[submodule "supagloo-database-lib"]
+	path = supagloo-database-lib
 	url = https://github.com/ashtable/supagloo-database-lib.git
