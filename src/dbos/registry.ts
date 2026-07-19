@@ -42,6 +42,7 @@ export type QueueName = keyof typeof QUEUE_CONFIG;
  */
 export const WORKFLOW_NAMES = {
   noopProof: "noopProof",
+  scaffoldProject: "scaffoldProject",
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -50,8 +51,9 @@ export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
  * Which queue each workflow lands on. The noop proof rides `git-ops` — the
  * lightest real queue and the one the first real workflow (`scaffoldProject`,
  * task 17) uses — so the proof exercises the same dispatch path the earliest real
- * work will.
+ * work will. `scaffoldProject` (task 17) is that first real git-ops workflow.
  */
 export const WORKFLOW_QUEUE = {
   noopProof: "git-ops",
+  scaffoldProject: "git-ops",
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;

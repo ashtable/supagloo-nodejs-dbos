@@ -23,6 +23,11 @@ const env: Env = loadEnv({
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
   NODE_ENV: "test",
+  // launchDbos() now injects the git-ops GitHub config from env (Task #17), so these
+  // are required to boot even though the noop workflow never touches GitHub.
+  GITHUB_APP_ID: "123456",
+  GITHUB_APP_PRIVATE_KEY:
+    "-----BEGIN RSA PRIVATE KEY-----\nnoop\n-----END RSA PRIVATE KEY-----",
 });
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });

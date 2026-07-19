@@ -30,13 +30,19 @@ describe("static queue registry", () => {
 });
 
 describe("static workflow registry", () => {
-  it("declares exactly the workflows built in this task (noopProof only)", () => {
-    expect(Object.values(WORKFLOW_NAMES).sort()).toEqual(["noopProof"]);
+  it("declares the workflows built so far (noopProof + scaffoldProject)", () => {
+    expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
+      "noopProof",
+      "scaffoldProject",
+    ]);
   });
 
-  it("maps every workflow onto a declared queue (noopProof → git-ops)", () => {
+  it("maps every workflow onto a declared queue (both ride git-ops)", () => {
     expect(WORKFLOW_QUEUE.noopProof).toBe("git-ops");
-    expect(Object.keys(QUEUE_CONFIG)).toContain(WORKFLOW_QUEUE.noopProof);
+    expect(WORKFLOW_QUEUE.scaffoldProject).toBe("git-ops");
+    for (const queue of Object.values(WORKFLOW_QUEUE)) {
+      expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
+    }
   });
 });
 
