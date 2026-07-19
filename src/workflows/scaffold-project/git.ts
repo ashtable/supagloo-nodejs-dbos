@@ -32,16 +32,108 @@ export const SCAFFOLD_COMMIT = {
   date: "2020-01-01T00:00:00Z",
 } as const;
 
+/**
+ * Redact the credential from any URL userinfo (`scheme://user:password@host`) so a
+ * git failure can never carry a plaintext token into a DBOS checkpoint or the logs.
+ * Applied to EVERY occurrence in a string, generically (not keyed to a specific
+ * token value), so it also protects future steps that embed different credentials.
+ * The username is kept (`x-access-token:***@`) for debuggability; a bare userinfo
+ * with no `user:pass` split is redacted whole (`***@`).
+ */
+export function redactUrlCredentials(text: string): string {
+  return text.replace(
+    /(:\/\/)([^/@\s]*)@/g,
+    (_full, scheme: string, userinfo: string) => {
+      const colon = userinfo.indexOf(":");
+      const redacted = colon === -1 ? "***" : `${userinfo.slice(0, colon)}:***`;
+      return `${scheme}${redacted}@`;
+    },
+  );
+}
+
+/**
+ * A failed `git` invocation, with the credential already redacted from `message`
+ * and `stderr`. `permanent` marks failures that retrying cannot fix (bad credential,
+ * missing repo, denied permission) so a step's `shouldRetry` can fail fast; anything
+ * else (network blips, timeouts, ambiguous errors) stays transient/retryable.
+ */
+export class GitCommandError extends Error {
+  readonly stderr: string;
+  readonly exitCode: number | null;
+  readonly permanent: boolean;
+  constructor(opts: {
+    message: string;
+    stderr: string;
+    exitCode: number | null;
+    permanent: boolean;
+  }) {
+    super(opts.message);
+    this.name = "GitCommandError";
+    this.stderr = opts.stderr;
+    this.exitCode = opts.exitCode;
+    this.permanent = opts.permanent;
+  }
+}
+
+/**
+ * High-confidence signals that a git-over-HTTPS failure is PERMANENT for this token:
+ * authentication/permission/not-found. Deliberately conservative — connection,
+ * DNS, TLS, RPC and timeout failures are NOT here, so they remain transient and get
+ * retried. Anything not matched is treated as transient (see {@link isPermanentGitFailure}).
+ */
+const PERMANENT_GIT_STDERR: readonly RegExp[] = [
+  /authentication failed/i,
+  /invalid username or password/i,
+  /repository not found/i,
+  /permission to .+ denied/i,
+  /remote:\s*(permission|access) denied/i,
+  /requested URL returned error:\s*(401|403|404)/i,
+];
+
+/** True when git's output signals a permanent (non-retryable) failure. */
+export function isPermanentGitFailure(stderr: string, message: string): boolean {
+  const text = `${stderr}\n${message}`;
+  return PERMANENT_GIT_STDERR.some((re) => re.test(text));
+}
+
+/**
+ * Wrap a raw `execFile` rejection into a redacted, classified {@link GitCommandError}.
+ * The raw error (its message/cmd/stack all carry the plaintext clone/push URL) is
+ * NOT kept as `cause` — that would re-leak the credential — so the wrapped error's
+ * fresh stack and redacted message are the only things that survive.
+ */
+function toGitCommandError(err: unknown): GitCommandError {
+  const e = (err ?? {}) as {
+    message?: unknown;
+    stderr?: unknown;
+    code?: unknown;
+  };
+  const rawMessage = typeof e.message === "string" ? e.message : String(err);
+  const rawStderr = typeof e.stderr === "string" ? e.stderr : "";
+  return new GitCommandError({
+    message: redactUrlCredentials(rawMessage),
+    stderr: redactUrlCredentials(rawStderr),
+    exitCode: typeof e.code === "number" ? e.code : null,
+    permanent: isPermanentGitFailure(rawStderr, rawMessage),
+  });
+}
+
 export async function git(
   args: string[],
   opts: { cwd?: string; env?: Record<string, string> } = {},
 ): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd: opts.cwd,
-    env: { ...process.env, ...HERMETIC_ENV, ...opts.env },
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return stdout.toString();
+  try {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: opts.cwd,
+      env: { ...process.env, ...HERMETIC_ENV, ...opts.env },
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return stdout.toString();
+  } catch (err) {
+    // Redact the embedded credential and classify BEFORE the error escapes — it must
+    // never reach a DBOS checkpoint or a log line with a plaintext token.
+    throw toGitCommandError(err);
+  }
 }
 
 /** Clone `cloneUrl` into `dir` (a clean, fresh clone of the default branch). */

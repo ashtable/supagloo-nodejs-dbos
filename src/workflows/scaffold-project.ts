@@ -11,8 +11,8 @@ import {
   ensureRepoReachable,
   mergePullRequest,
   openPullRequest,
-  RepoUnreachableError,
 } from "./scaffold-project/github-rest";
+import { retryUnlessPermanent } from "./scaffold-project/retry";
 import {
   BASE_BRANCH,
   WORKING_BRANCH,
@@ -160,8 +160,9 @@ async function scaffoldProjectFn(
     {
       name: "ensureRepoAccessible",
       ...NETWORK_RETRY,
-      // A genuinely unreachable repo is permanent — surface it, do not retry.
-      shouldRetry: (e) => !(e instanceof RepoUnreachableError),
+      // Fail fast on typed permanent failures (unreachable repo, permanent 4xx);
+      // retry transient ones. Shared classifier — see `retry.ts`.
+      shouldRetry: retryUnlessPermanent,
     },
   );
 
@@ -184,7 +185,9 @@ async function scaffoldProjectFn(
       await ensureClone(ctx);
       await markStageDone(prisma, jobId, "cloneToWorkspace");
     },
-    { name: "cloneToWorkspace", ...NETWORK_RETRY },
+    // Clone shells out to git; a redacted, classified GitCommandError lets a
+    // permanent auth/not-found failure fail fast (see `git.ts` / `retry.ts`).
+    { name: "cloneToWorkspace", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
   );
 
   // 4) writeRemotionScaffold — template + supagloo.project.json (task-16 fn).
@@ -238,7 +241,9 @@ async function scaffoldProjectFn(
         mergeSha: merged.sha ?? baseSha,
       };
     },
-    { name: "pushOpenMergeBasePr", ...NETWORK_RETRY },
+    // Push (git) + PR open/merge (REST): fail fast on a permanent git auth failure
+    // or a permanent 4xx from GitHub; retry transient 5xx/429/network.
+    { name: "pushOpenMergeBasePr", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
   );
 
   // 7) cutWorkingBranch — cut v0.0.1 from the base and push it.
@@ -250,7 +255,8 @@ async function scaffoldProjectFn(
       await markStageDone(prisma, jobId, "cutWorkingBranch");
       return workingSha;
     },
-    { name: "cutWorkingBranch", ...NETWORK_RETRY },
+    // Pushes the working branch (git); fail fast on a permanent git auth/push failure.
+    { name: "cutWorkingBranch", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
   );
 
   // 8) finalizeRecords — Project + 2 ProjectVersion rows + job stages/status.

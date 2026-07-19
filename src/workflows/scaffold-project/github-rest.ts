@@ -14,6 +14,30 @@ export class RepoUnreachableError extends Error {
   }
 }
 
+/**
+ * A non-success GitHub REST response on a genuine FAILURE path (not the idempotent
+ * 422-already-exists / 405-already-merged paths, which are handled inline as
+ * successes). Carries the HTTP status so callers can classify permanent vs transient
+ * via {@link isPermanentHttpStatus}.
+ */
+export class GithubRestError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "GithubRestError";
+    this.status = status;
+  }
+}
+
+/**
+ * A permanent HTTP failure: a 4xx that is NOT 429. 4xx (bad credential, forbidden,
+ * gone, unprocessable) will not change on retry, so we fail fast; 429 (rate-limit)
+ * and 5xx (server error) are transient and get retried with backoff.
+ */
+export function isPermanentHttpStatus(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 429;
+}
+
 export interface GithubRestConfig {
   apiBaseUrl: string;
   /** A minted installation token (`ghs_…`). */
@@ -61,7 +85,12 @@ export async function ensureRepoReachable(
   while (url) {
     const res = await fetchImpl(url, { headers: authHeaders(cfg.token) });
     if (!res.ok) {
-      throw new Error(`installation repositories list failed: ${res.status}`);
+      // A 401/403 here (bad/insufficient installation token) is permanent; a 5xx is
+      // transient. Typed so the step's `shouldRetry` can tell them apart.
+      throw new GithubRestError(
+        `installation repositories list failed: ${res.status}`,
+        res.status,
+      );
     }
     const body = (await res.json()) as {
       repositories?: Array<{ full_name?: string }>;
@@ -139,7 +168,7 @@ export async function openPullRequest(
     const existing = await findOpenPrByHead(cfg, args.owner, args.repo, args.head);
     if (existing) return existing;
   }
-  throw new Error(`open pull request failed: ${res.status}`);
+  throw new GithubRestError(`open pull request failed: ${res.status}`, res.status);
 }
 
 /**
@@ -169,5 +198,5 @@ export async function mergePullRequest(
   if (res.status === 405) {
     return { merged: true }; // already merged (idempotent replay)
   }
-  throw new Error(`merge pull request failed: ${res.status}`);
+  throw new GithubRestError(`merge pull request failed: ${res.status}`, res.status);
 }

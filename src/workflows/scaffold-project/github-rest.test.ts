@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
   ensureRepoReachable,
+  GithubRestError,
+  isPermanentHttpStatus,
   openPullRequest,
   mergePullRequest,
   RepoUnreachableError,
 } from "./github-rest";
+import { retryUnlessPermanent } from "./retry";
 
 // GitHub REST half of the git-ops flow, driven by an INJECTED fetch (the only
 // thing mocked at the unit level — real network is unavailable in unit tests).
@@ -168,5 +171,92 @@ describe("mergePullRequest", () => {
       number: 7,
     });
     expect(res.merged).toBe(true);
+  });
+});
+
+// The retry-classification promised by the Task-17 plan: PR open / merge / repo-list
+// failures throw a typed GithubRestError carrying the HTTP status, so a step's
+// `shouldRetry` fails fast on permanent 4xx (bad credential / gone / forbidden) and
+// still retries transient 5xx / 429 / network blips. The 422-already-exists and
+// 405-already-merged idempotent paths above are unaffected — they are NOT failures.
+describe("failure classification (permanent vs transient)", () => {
+  it("isPermanentHttpStatus: 4xx except 429 are permanent; 5xx and 429 are transient", () => {
+    expect(isPermanentHttpStatus(400)).toBe(true);
+    expect(isPermanentHttpStatus(401)).toBe(true);
+    expect(isPermanentHttpStatus(403)).toBe(true);
+    expect(isPermanentHttpStatus(404)).toBe(true);
+    expect(isPermanentHttpStatus(422)).toBe(true);
+    expect(isPermanentHttpStatus(429)).toBe(false); // rate-limit → transient
+    expect(isPermanentHttpStatus(500)).toBe(false);
+    expect(isPermanentHttpStatus(502)).toBe(false);
+    expect(isPermanentHttpStatus(503)).toBe(false);
+  });
+
+  it("openPullRequest throws a PERMANENT GithubRestError on 403 (shouldRetry → false)", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(403, { message: "Forbidden" })) as unknown as typeof fetch;
+    const err = await openPullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      head: "v0.0.0",
+      base: "main",
+      title: "t",
+      body: "b",
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(403);
+    expect(retryUnlessPermanent(err)).toBe(false);
+  });
+
+  it("openPullRequest throws a TRANSIENT GithubRestError on 500 (shouldRetry → true)", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(500, { message: "boom" })) as unknown as typeof fetch;
+    const err = await openPullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      head: "v0.0.0",
+      base: "main",
+      title: "t",
+      body: "b",
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(500);
+    expect(retryUnlessPermanent(err)).toBe(true);
+  });
+
+  it("mergePullRequest throws a PERMANENT GithubRestError on 404 (shouldRetry → false)", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(404, { message: "Not Found" })) as unknown as typeof fetch;
+    const err = await mergePullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(404);
+    expect(retryUnlessPermanent(err)).toBe(false);
+  });
+
+  it("mergePullRequest throws a TRANSIENT GithubRestError on 503 (shouldRetry → true)", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(503, { message: "unavailable" })) as unknown as typeof fetch;
+    const err = await mergePullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(retryUnlessPermanent(err)).toBe(true);
+  });
+
+  it("ensureRepoReachable throws a PERMANENT GithubRestError on a 401 list failure", async () => {
+    const fetchImpl = (async () =>
+      jsonResponse(401, { message: "Bad credentials" })) as unknown as typeof fetch;
+    const err = await ensureRepoReachable(cfgWith(fetchImpl), "acme", "empty-one").catch(
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(401);
+    expect(retryUnlessPermanent(err)).toBe(false);
   });
 });
