@@ -1,0 +1,18 @@
+// Supagloo-generated composition body — DO NOT EDIT.
+// Regenerated from supagloo.project.json.
+import { AbsoluteFill, Sequence } from "remotion";
+import { Shelter } from "./scenes/Shelter";
+import { Refuge } from "./scenes/Refuge";
+
+export const VideoComposition = () => {
+  return (
+    <AbsoluteFill style={{ backgroundColor: "#000000" }}>
+      <Sequence name="Shelter" from={0} durationInFrames={150}>
+        <Shelter />
+      </Sequence>
+      <Sequence name="Refuge" from={150} durationInFrames={210}>
+        <Refuge />
+      </Sequence>
+    </AbsoluteFill>
+  );
+};

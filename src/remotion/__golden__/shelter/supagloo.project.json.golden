@@ -1,0 +1,45 @@
+{
+  "manifestVersion": 1,
+  "composition": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "aspectRatio": "9:16"
+  },
+  "scenes": [
+    {
+      "id": "scene-1",
+      "name": "Shelter",
+      "scriptText": "He who dwells in the shelter of the Most High will rest in the shadow of the Almighty.",
+      "reference": "Psalm 91:1",
+      "translation": "BSB",
+      "visualPrompt": "A traveler resting under a vast starlit desert sky",
+      "durationSeconds": 5,
+      "captions": true,
+      "visualAssetKey": "projects/demo/scenes/scene-1.jpg"
+    },
+    {
+      "id": "scene-2",
+      "name": "Refuge",
+      "scriptText": "I will say of the LORD, He is my refuge and my fortress, my God, in whom I trust.",
+      "reference": "Psalm 91:2",
+      "translation": "BSB",
+      "visualPrompt": "A stone fortress on a hill at golden hour",
+      "durationSeconds": 7,
+      "captions": true,
+      "visualAssetKey": "projects/demo/scenes/scene-2.jpg"
+    }
+  ],
+  "narratorVoice": {
+    "description": "Warm, reverent male narrator",
+    "label": "Narrator"
+  },
+  "music": {
+    "style": "ambient cinematic pads",
+    "assetKey": "projects/demo/music/bed.mp3"
+  },
+  "endCard": {
+    "headline": "Find shelter today",
+    "subtext": "Psalm 91"
+  }
+}

@@ -14,12 +14,17 @@
     "dev": "tsx watch src/main.ts",
     "test": "vitest run",
     "test:unit": "vitest run",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e:bundle": "vitest run --config vitest.e2e.bundle.config.ts"
   },
   "dependencies": {
     "@dbos-inc/dbos-sdk": "^4.23.6",
     "@prisma/client": "7.8.0",
+    "@remotion/bundler": "4.0.490",
     "@supagloo/database-lib": "file:./supagloo-database-lib",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.490",
     "zod": "^4.4.3"
   },
   "devDependencies": {

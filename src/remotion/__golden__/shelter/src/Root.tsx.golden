@@ -1,0 +1,17 @@
+// Supagloo-generated Remotion root — DO NOT EDIT.
+// Regenerated from supagloo.project.json.
+import { Composition } from "remotion";
+import { VideoComposition } from "./Video";
+
+export const RemotionRoot = () => {
+  return (
+    <Composition
+      id="Main"
+      component={VideoComposition}
+      durationInFrames={360}
+      fps={30}
+      width={1080}
+      height={1920}
+    />
+  );
+};
