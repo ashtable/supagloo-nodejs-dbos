@@ -67,7 +67,7 @@ export async function applyManifest(
   for (const name of existing) {
     const rel = `${SCENES_DIR}/${name}`;
     if (!nextScenePaths.has(rel)) {
-      await rm(join(scenesAbs, name), { force: true });
+      await rm(join(scenesAbs, name), { force: true, recursive: true });
       removed.push(rel);
     }
   }

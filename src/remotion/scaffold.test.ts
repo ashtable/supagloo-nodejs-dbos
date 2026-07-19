@@ -1,4 +1,11 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -77,6 +84,23 @@ describe("applyManifest (regeneration = full scene-dir overwrite)", () => {
     expect(existsSync(join(dir, "remotion.config.ts"))).toBe(true);
     // The canonical manifest is rewritten to the new manifest.
     expect(read("supagloo.project.json")).toContain('"Intro"');
+  });
+
+  it("cleans up a stray subdirectory under src/scenes without crashing", async () => {
+    await writeRemotionScaffold(shelterManifest, dir);
+    // An imported repo's src/scenes/ isn't guaranteed to be flat (its shape is
+    // not validated by verifySupaglooProject/parseManifest). A stray
+    // subdirectory the manifest never produced must be cleaned up: rm({ force:
+    // true }) alone throws ERR_FS_EISDIR on a directory, so recursive removal is
+    // required here.
+    const strayDir = join(dir, "src", "scenes", "legacy");
+    mkdirSync(strayDir, { recursive: true });
+    writeFileSync(join(strayDir, "Old.tsx"), "// stale imported scene", "utf8");
+
+    const { removed } = await applyManifest(minimalManifest, dir);
+
+    expect(readdirSync(join(dir, "src", "scenes"))).toEqual(["Intro.tsx"]);
+    expect(removed).toContain("src/scenes/legacy");
   });
 
   it("is idempotent — re-applying the same manifest yields identical files", async () => {
