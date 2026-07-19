@@ -8,6 +8,10 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/e2e/**/*.e2e.ts"],
+    // The Remotion bundle e2e (*.bundle.e2e.ts) is DB-free and runs via its own
+    // no-globalSetup config (vitest.e2e.bundle.config.ts) — keep it out of the
+    // Postgres-backed DB e2e run so it never double-runs or spins Postgres.
+    exclude: ["**/node_modules/**", "**/dist/**", "tests/e2e/**/*.bundle.e2e.ts"],
     testTimeout: 60_000,
     // Generous hook timeout: globalSetup may spin up Postgres (reuse-or-spawn)
     // and beforeAll launches DBOS (which migrates its own system-db schema).

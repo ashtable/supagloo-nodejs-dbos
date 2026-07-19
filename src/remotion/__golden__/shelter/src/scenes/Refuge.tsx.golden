@@ -1,0 +1,61 @@
+// Supagloo-generated scene source — DO NOT EDIT.
+// Regenerated from supagloo.project.json (scene id "scene-2").
+import { AbsoluteFill, Img, interpolate, useCurrentFrame } from "remotion";
+import { getAssetUrl } from "../lib/assets";
+
+const visualAssetKey = "projects/demo/scenes/scene-2.jpg";
+const scriptText = "I will say of the LORD, He is my refuge and my fortress, my God, in whom I trust.";
+const reference = "Psalm 91:2";
+
+export const Refuge = () => {
+  const frame = useCurrentFrame();
+  const src = getAssetUrl(visualAssetKey);
+
+  return (
+    <AbsoluteFill style={{ backgroundColor: "#000000" }}>
+      {src ? (
+        <Img
+          src={src}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      ) : null}
+      <AbsoluteFill
+        style={{
+          justifyContent: "flex-end",
+          alignItems: "center",
+          padding: 80,
+          gap: 16,
+          opacity: interpolate(frame, [0, 15], [0, 1], {
+            extrapolateLeft: "clamp",
+            extrapolateRight: "clamp",
+          }),
+        }}
+      >
+        <p
+          style={{
+            margin: 0,
+            color: "#ffffff",
+            fontSize: 48,
+            fontWeight: 700,
+            textAlign: "center",
+            textShadow: "0 2px 12px rgba(0, 0, 0, 0.8)",
+          }}
+        >
+          {scriptText}
+        </p>
+        <p
+          style={{
+            margin: 0,
+            color: "#ffffff",
+            fontSize: 28,
+            fontWeight: 500,
+            opacity: 0.85,
+            textShadow: "0 2px 12px rgba(0, 0, 0, 0.8)",
+          }}
+        >
+          {reference}
+        </p>
+      </AbsoluteFill>
+    </AbsoluteFill>
+  );
+};
