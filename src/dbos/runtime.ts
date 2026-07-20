@@ -3,9 +3,14 @@ import { createPrismaClient, type PrismaClient } from "@supagloo/database-lib";
 import { DBOS_APP_NAME, type Env } from "../config/env";
 import { QUEUE_CONFIG } from "./registry";
 import { clearAppDb, ensureNoopProofTable, setAppDb } from "../db/app-db";
-// Importing the workflow module performs its STATIC registration
+import {
+  clearScaffoldConfig,
+  setScaffoldConfig,
+} from "../workflows/scaffold-project/config";
+// Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
+import "../workflows/scaffold-project";
 
 let appDb: PrismaClient | undefined;
 
@@ -28,6 +33,16 @@ export async function launchDbos(env: Env): Promise<void> {
   setAppDb(appDb);
   await ensureNoopProofTable(appDb);
 
+  // Inject the app-level GitHub config the git-ops workflows read (mirrors setAppDb:
+  // steps never touch process.env). App id/key sign App JWTs; base URLs are
+  // env-overridable (real hosts in prod, stub URLs in test).
+  setScaffoldConfig({
+    githubApiBaseUrl: env.GITHUB_API_BASE_URL,
+    githubGitBaseUrl: env.GITHUB_GIT_BASE_URL,
+    githubAppId: env.GITHUB_APP_ID,
+    githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
+  });
+
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
@@ -43,6 +58,7 @@ export async function launchDbos(env: Env): Promise<void> {
 export async function shutdownDbos(): Promise<void> {
   await DBOS.shutdown();
   clearAppDb();
+  clearScaffoldConfig();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;

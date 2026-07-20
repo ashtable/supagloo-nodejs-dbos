@@ -64,8 +64,12 @@ ENV NODE_ENV=production
 
 # libssl is present for Prisma's engine even though the worker uses the driver-
 # adapter (pg) client at runtime — precautionary parity with the deps stage; harmless.
+# git is REQUIRED AT RUNTIME (Task #17): the scaffoldProject git-ops workflow shells
+# out to the `git` CLI to clone/commit/push (house style — no npm git dep). git is in
+# the deps stage (to clone database-lib at build time) but that stage is not copied
+# into the runner, so it must be installed here or the workflow fails in production.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends openssl \
+  && apt-get install -y --no-install-recommends openssl git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 # node_modules carries the db-lib symlink; the copied submodule is what that
