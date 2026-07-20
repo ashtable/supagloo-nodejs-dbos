@@ -1,8 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import type { PrismaClient } from "@supagloo/database-lib";
 import {
   SCAFFOLD_STAGES,
   initialStages,
   mergeStage,
+  markJobRunning,
   JobStagesSchema,
   type JobStage,
 } from "./stages";
@@ -68,5 +70,20 @@ describe("mergeStage", () => {
   it("is a no-op for an unknown key (never appends)", () => {
     const next = mergeStage(base, "notARealStage", "done");
     expect(next).toEqual(base);
+  });
+});
+
+describe("markJobRunning", () => {
+  it("flips the job's top-level status to running (status only)", async () => {
+    const update = vi.fn().mockResolvedValue(undefined);
+    const prisma = { projectJob: { update } } as unknown as PrismaClient;
+
+    await markJobRunning(prisma, "job-1");
+
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledWith({
+      where: { id: "job-1" },
+      data: { status: "running" },
+    });
   });
 });

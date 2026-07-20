@@ -1,3 +1,8 @@
+import {
+  GIT_OPS_QUEUE_NAME,
+  SCAFFOLD_PROJECT_WORKFLOW_NAME,
+} from "@supagloo/database-lib";
+
 /**
  * The static DBOS registry — the single source of truth for the worker's queues
  * and workflows.
@@ -42,7 +47,10 @@ export type QueueName = keyof typeof QUEUE_CONFIG;
  */
 export const WORKFLOW_NAMES = {
   noopProof: "noopProof",
-  scaffoldProject: "scaffoldProject",
+  // Sourced from the SHARED db-lib constant (design-delta §5.1/§7): the API's enqueue
+  // lookup table imports the SAME value, so the worker and the enqueuer can never
+  // disagree on the scaffold workflow name.
+  scaffoldProject: SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -55,5 +63,6 @@ export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
  */
 export const WORKFLOW_QUEUE = {
   noopProof: "git-ops",
-  scaffoldProject: "git-ops",
+  // The git-ops queue name is likewise the shared db-lib constant the API enqueues to.
+  scaffoldProject: GIT_OPS_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;

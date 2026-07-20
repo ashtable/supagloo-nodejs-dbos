@@ -1,8 +1,7 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
   mintInstallationToken,
-  type ProjectCreatedFrom,
-  type ProjectManifest,
+  type ScaffoldProjectPayload,
 } from "@supagloo/database-lib";
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
@@ -24,7 +23,7 @@ import {
   removeWorkspace,
   type ScaffoldContext,
 } from "./scaffold-project/workspace";
-import { markStageDone } from "./scaffold-project/stages";
+import { markJobRunning, markStageDone } from "./scaffold-project/stages";
 import { finalizeRecords } from "./scaffold-project/finalize";
 
 /**
@@ -48,20 +47,10 @@ import { finalizeRecords } from "./scaffold-project/finalize";
 
 export const SCAFFOLD_PROJECT_WORKFLOW_NAME = WORKFLOW_NAMES.scaffoldProject;
 
-export interface ScaffoldProjectPayload {
-  projectId: string;
-  userId: string;
-  ownerId: string;
-  installationId: string;
-  repoOwner: string;
-  repoName: string;
-  repoVisibility: "private" | "public";
-  createdFrom: ProjectCreatedFrom;
-  slug: string;
-  name: string;
-  /** The initial composition to scaffold (written as supagloo.project.json + code). */
-  manifest: ProjectManifest;
-}
+// The workflow's argument shape is the SHARED db-lib enqueue contract (the API
+// constructs + enqueues it). Re-exported so existing importers of this module (e.g.
+// the e2e) keep importing `ScaffoldProjectPayload` from here.
+export type { ScaffoldProjectPayload };
 
 export interface ScaffoldProjectResult {
   workflowId: string;
@@ -133,6 +122,16 @@ async function scaffoldProjectFn(
   const prisma = getAppDb();
   const cfg = getScaffoldConfig();
   const rest = (token: string) => ({ apiBaseUrl: cfg.githubApiBaseUrl, token });
+
+  // 0) markJobRunning — flip the job lifecycle status queued → running so the polling
+  //    UI observes progress before any stage completes. Status ONLY (no stage change).
+  await boundary("markJobRunning");
+  await DBOS.runStep(
+    async () => {
+      await markJobRunning(prisma, jobId);
+    },
+    { name: "markJobRunning" },
+  );
 
   // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
   await boundary("mintInstallationToken");

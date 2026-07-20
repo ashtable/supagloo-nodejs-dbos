@@ -1,4 +1,8 @@
 import { describe, it, expect } from "vitest";
+import {
+  GIT_OPS_QUEUE_NAME,
+  SCAFFOLD_PROJECT_WORKFLOW_NAME,
+} from "@supagloo/database-lib";
 import { QUEUE_CONFIG, WORKFLOW_NAMES, WORKFLOW_QUEUE } from "./registry";
 import {
   NOOP_PROOF_WORKFLOW_NAME,
@@ -43,6 +47,15 @@ describe("static workflow registry", () => {
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
+  });
+
+  // Task #18: the registry's scaffold name + queue are sourced from the SHARED
+  // db-lib constants (the API imports the SAME values for its enqueue lookup table),
+  // so the two services can never drift. This is the "shared fixture" the API's
+  // workflow-lookup unit test pins against.
+  it("sources the scaffold name + git-ops queue from the shared db-lib constants", () => {
+    expect(WORKFLOW_NAMES.scaffoldProject).toBe(SCAFFOLD_PROJECT_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.scaffoldProject).toBe(GIT_OPS_QUEUE_NAME);
   });
 });
 
