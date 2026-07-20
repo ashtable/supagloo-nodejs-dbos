@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
@@ -35,8 +36,9 @@ describe("static queue registry", () => {
 });
 
 describe("static workflow registry", () => {
-  it("declares the workflows built so far (noopProof + scaffoldProject + importProject)", () => {
+  it("declares the workflows built so far (noopProof + scaffoldProject + importProject + commitVersion)", () => {
     expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
+      "commitVersion",
       "importProject",
       "noopProof",
       "scaffoldProject",
@@ -47,6 +49,7 @@ describe("static workflow registry", () => {
     expect(WORKFLOW_QUEUE.noopProof).toBe("git-ops");
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe("git-ops");
     expect(WORKFLOW_QUEUE.importProject).toBe("git-ops");
+    expect(WORKFLOW_QUEUE.commitVersion).toBe("git-ops");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
@@ -56,11 +59,13 @@ describe("static workflow registry", () => {
   // SHARED db-lib constants (the API imports the SAME values for its enqueue lookup
   // table), so the two services can never drift. This is the "shared fixture" the API's
   // workflow-lookup unit test pins against.
-  it("sources the scaffold + import names + git-ops queue from the shared db-lib constants", () => {
+  it("sources the scaffold + import + commit names + git-ops queue from the shared db-lib constants", () => {
     expect(WORKFLOW_NAMES.scaffoldProject).toBe(SCAFFOLD_PROJECT_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe(GIT_OPS_QUEUE_NAME);
     expect(WORKFLOW_NAMES.importProject).toBe(IMPORT_PROJECT_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.importProject).toBe(GIT_OPS_QUEUE_NAME);
+    expect(WORKFLOW_NAMES.commitVersion).toBe(COMMIT_VERSION_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.commitVersion).toBe(GIT_OPS_QUEUE_NAME);
   });
 });
 

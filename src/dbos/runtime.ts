@@ -12,6 +12,7 @@ import {
 import "../workflows/noop-proof";
 import "../workflows/scaffold-project";
 import "../workflows/import-project";
+import "../workflows/commit-version";
 
 let appDb: PrismaClient | undefined;
 
