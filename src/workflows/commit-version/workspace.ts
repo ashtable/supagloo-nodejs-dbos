@@ -10,6 +10,7 @@ import {
   cloneBranch,
   commitWithMessage,
   headCommitHasJobId,
+  resetHard,
   workingTreeDirty,
 } from "./git";
 
@@ -47,6 +48,13 @@ export interface CommitOutcome {
   committed: boolean;
   headCommitSha: string;
   changedFiles: string[];
+}
+
+/** Injectable git ops for {@link commitBranch}. `push` defaults to the real remote push;
+ *  a test overrides it to simulate a transient push failure (the failure mode DBOS's step
+ *  retry replays in-process against the same on-disk workspace). */
+export interface CommitBranchDeps {
+  push?: (dir: string, branch: string) => Promise<void>;
 }
 
 const DEFAULT_ROOT = join(tmpdir(), "supagloo-commit");
@@ -90,7 +98,11 @@ export async function ensureManifestApplied(
  *
  * Every path yields at most ONE commit for a given job — "re-run doesn't double-commit".
  */
-export async function commitBranch(ctx: CommitContext): Promise<CommitOutcome> {
+export async function commitBranch(
+  ctx: CommitContext,
+  deps: CommitBranchDeps = {},
+): Promise<CommitOutcome> {
+  const push = deps.push ?? pushBranch;
   const path = await ensureCommitClone(ctx);
   await applyManifest(ctx.manifest, path);
 
@@ -105,8 +117,21 @@ export async function commitBranch(ctx: CommitContext): Promise<CommitOutcome> {
 
   // Case 2: the manifest produced a real change → commit + push.
   if (await workingTreeDirty(path)) {
+    // Capture the pre-commit tip so a FAILED push can be rolled back. The commit itself is
+    // local; only a successful push makes it durable. If push throws (e.g. a transient
+    // network error DBOS's NETWORK_RETRY replays in-process against THIS same on-disk
+    // workspace), leaving the local commit in place would let the retry's Case-1 check see
+    // its own trailer and wrongly report "already pushed" — recording a SHA that never
+    // reached the remote (a silent DB↔remote divergence). Resetting back makes the retry
+    // re-derive the dirty tree via applyManifest and re-take this commit-and-push path.
+    const preCommitSha = await revParse(path, "HEAD");
     const headCommitSha = await commitWithMessage(path, ctx.message, ctx.jobId);
-    await pushBranch(path, ctx.branchName);
+    try {
+      await push(path, ctx.branchName);
+    } catch (err) {
+      await resetHard(path, preCommitSha);
+      throw err;
+    }
     return {
       committed: true,
       headCommitSha,

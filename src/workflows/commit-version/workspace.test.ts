@@ -176,4 +176,39 @@ describe("commitBranch — idempotent commit + push (replay-safe)", () => {
     expect(second.changedFiles).toEqual([]);
     expect(originHead()).toBe(headAfterFirst);
   });
+
+  // Narrower than the "fresh clone" replay above: here the workspace SURVIVES between
+  // attempts (DBOS's NETWORK_RETRY re-invokes the step callback IN-PROCESS — no crash, no
+  // re-clone) but the FIRST push failed transiently. The local commit made before the push
+  // must be rolled back, or its jobId trailer would fool the retry (same on-disk workspace)
+  // into Case 1's "already pushed" no-op — recording a SHA that never reached the remote.
+  it("rolls back the orphaned local commit when push fails, so the same-workspace retry commits + pushes for real", async () => {
+    const ctx = makeCtx();
+
+    // Attempt 1: the push throws a transient error (the network blip DBOS retries by
+    // re-running the SAME step callback against the SAME workspace).
+    const boom = new Error("transient push failure (network blip)");
+    await expect(
+      commitBranch(ctx, {
+        push: async () => {
+          throw boom;
+        },
+      }),
+    ).rejects.toBe(boom);
+
+    // Nothing reached the remote...
+    expect(originHead()).toBe(seededHead);
+    // ...and the failed commit was rolled back locally: HEAD is back at the pre-commit tip,
+    // so the trailer that would trigger the false "already pushed" path is gone.
+    const path = commitWorkspacePath(ctx);
+    expect(g(["rev-parse", "HEAD"], path).trim()).toBe(seededHead);
+
+    // Attempt 2 = DBOS's automatic in-process step retry: SAME workspace (NOT removed, no
+    // fresh clone), real push. It must actually commit + push, not short-circuit as a replay.
+    const outcome = await commitBranch(ctx);
+    expect(outcome.committed).toBe(true);
+    expect(outcome.changedFiles.some((f) => f.endsWith("Shelter.tsx"))).toBe(true);
+    expect(originHead()).toBe(outcome.headCommitSha);
+    expect(commitsBetween(seededHead, outcome.headCommitSha)).toBe(1);
+  });
 });

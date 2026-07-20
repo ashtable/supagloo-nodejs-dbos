@@ -107,3 +107,15 @@ export async function headCommitHasJobId(
   const body = await git(["log", "-1", "--format=%B"], { cwd: dir });
   return body.includes(commitJobTrailer(jobId));
 }
+
+/**
+ * Hard-reset the workspace back to `sha`, discarding any local commit (and working-tree
+ * changes) made past it. Used to roll back a commit whose PUSH failed transiently: if the
+ * local commit were left in place, a step retry against the SAME on-disk workspace would
+ * see the jobId trailer on HEAD and wrongly take {@link headCommitHasJobId}'s "already
+ * pushed" no-op path — recording a SHA that never reached the remote. `applyManifest`
+ * regenerates the tree idempotently on the retry, so discarding it here is safe.
+ */
+export async function resetHard(dir: string, sha: string): Promise<void> {
+  await git(["reset", "--hard", sha], { cwd: dir });
+}
