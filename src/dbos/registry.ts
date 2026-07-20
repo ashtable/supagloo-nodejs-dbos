@@ -2,6 +2,7 @@ import {
   COMMIT_VERSION_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
+  PUBLISH_VERSION_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
 
@@ -59,6 +60,9 @@ export const WORKFLOW_NAMES = {
   // Task #21: the third real git-ops workflow (commit an edited manifest). Same
   // shared-constant discipline — the API enqueues to this exact name.
   commitVersion: COMMIT_VERSION_WORKFLOW_NAME,
+  // Task #22: the fourth real git-ops workflow (publish: merge working → main, tag,
+  // cut next branch). Same shared-constant discipline — the API enqueues to this name.
+  publishVersion: PUBLISH_VERSION_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -77,4 +81,6 @@ export const WORKFLOW_QUEUE = {
   importProject: GIT_OPS_QUEUE_NAME,
   // commitVersion (task 21) rides the same git-ops queue.
   commitVersion: GIT_OPS_QUEUE_NAME,
+  // publishVersion (task 22) rides the same git-ops queue.
+  publishVersion: GIT_OPS_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;
