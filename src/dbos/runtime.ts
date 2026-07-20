@@ -11,6 +11,7 @@ import {
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
 import "../workflows/scaffold-project";
+import "../workflows/import-project";
 
 let appDb: PrismaClient | undefined;
 
