@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   GIT_OPS_QUEUE_NAME,
+  IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
 import { QUEUE_CONFIG, WORKFLOW_NAMES, WORKFLOW_QUEUE } from "./registry";
@@ -34,28 +35,32 @@ describe("static queue registry", () => {
 });
 
 describe("static workflow registry", () => {
-  it("declares the workflows built so far (noopProof + scaffoldProject)", () => {
+  it("declares the workflows built so far (noopProof + scaffoldProject + importProject)", () => {
     expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
+      "importProject",
       "noopProof",
       "scaffoldProject",
     ]);
   });
 
-  it("maps every workflow onto a declared queue (both ride git-ops)", () => {
+  it("maps every workflow onto a declared queue (all ride git-ops)", () => {
     expect(WORKFLOW_QUEUE.noopProof).toBe("git-ops");
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe("git-ops");
+    expect(WORKFLOW_QUEUE.importProject).toBe("git-ops");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
   });
 
-  // Task #18: the registry's scaffold name + queue are sourced from the SHARED
-  // db-lib constants (the API imports the SAME values for its enqueue lookup table),
-  // so the two services can never drift. This is the "shared fixture" the API's
+  // Task #18/19: the registry's scaffold + import names + queues are sourced from the
+  // SHARED db-lib constants (the API imports the SAME values for its enqueue lookup
+  // table), so the two services can never drift. This is the "shared fixture" the API's
   // workflow-lookup unit test pins against.
-  it("sources the scaffold name + git-ops queue from the shared db-lib constants", () => {
+  it("sources the scaffold + import names + git-ops queue from the shared db-lib constants", () => {
     expect(WORKFLOW_NAMES.scaffoldProject).toBe(SCAFFOLD_PROJECT_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe(GIT_OPS_QUEUE_NAME);
+    expect(WORKFLOW_NAMES.importProject).toBe(IMPORT_PROJECT_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.importProject).toBe(GIT_OPS_QUEUE_NAME);
   });
 });
 

@@ -1,5 +1,6 @@
 import {
   GIT_OPS_QUEUE_NAME,
+  IMPORT_PROJECT_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
 
@@ -51,6 +52,9 @@ export const WORKFLOW_NAMES = {
   // lookup table imports the SAME value, so the worker and the enqueuer can never
   // disagree on the scaffold workflow name.
   scaffoldProject: SCAFFOLD_PROJECT_WORKFLOW_NAME,
+  // Task #19: the second real git-ops workflow. Same shared-constant discipline as
+  // scaffold — the API enqueues to this exact name via the db-lib routing table.
+  importProject: IMPORT_PROJECT_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -65,4 +69,6 @@ export const WORKFLOW_QUEUE = {
   noopProof: "git-ops",
   // The git-ops queue name is likewise the shared db-lib constant the API enqueues to.
   scaffoldProject: GIT_OPS_QUEUE_NAME,
+  // importProject (task 19) rides the same git-ops queue as scaffold.
+  importProject: GIT_OPS_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;
