@@ -15,6 +15,7 @@ import { ProviderHttpError } from "./errors";
  * refresh).
  */
 
+// Real OpenRouter's TTS/narration modality token is "audio", not "speech" — do not drift.
 export interface DiscoveryConfig {
   /** Provider ROOT (e.g. `https://openrouter.ai`); discovery paths are appended. */
   openrouterBaseUrl: string;
