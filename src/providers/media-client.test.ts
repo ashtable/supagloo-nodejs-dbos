@@ -131,6 +131,22 @@ describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", ()
     expect(err).toBeInstanceOf(ProviderHttpError);
     expect(retryUnlessPermanent(err)).toBe(false);
   });
+
+  it("throws a 502 ProviderHttpError when a 200 body has no usable data[0].url", async () => {
+    const rec = recorder(
+      () =>
+        new Response(JSON.stringify({ created: 1700000000, data: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const err = await requestImage(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "m", prompt: "x" },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderHttpError);
+    expect((err as ProviderHttpError).status).toBe(502);
+  });
 });
 
 describe("fetchAssetBytes (Task #32 — download a pre-authorized asset URL, no auth header)", () => {

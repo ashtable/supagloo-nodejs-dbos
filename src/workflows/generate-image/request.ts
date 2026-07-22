@@ -33,6 +33,15 @@ export function parseImageRequest(row: ImageRequestRow): ImageRequest {
       `generateImage does not handle the "${row.kind}" kind`,
     );
   }
+  if (row.provider !== "openrouter") {
+    // Defense-in-depth on the workflow's own invariant: the provider-call step
+    // unconditionally loads an OpenRouter credential. The API's kind→provider
+    // matrix rejects non-openrouter image rows with a 422 at creation time, but
+    // the workflow must not silently trust that upstream guard.
+    throw new GenerationRequestInvalidError(
+      `generateImageWorkflow only supports the openrouter provider, got: "${row.provider}"`,
+    );
+  }
   if (!row.projectId) {
     throw new GenerationRequestInvalidError(
       "image generation requires a projectId (a generated image asset is stored under " +

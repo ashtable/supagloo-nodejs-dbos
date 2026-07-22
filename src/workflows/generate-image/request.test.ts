@@ -40,6 +40,12 @@ describe("parseImageRequest", () => {
     );
   });
 
+  it("rejects a non-openrouter provider (defense-in-depth on the workflow's own invariant)", () => {
+    expect(() => parseImageRequest({ ...baseRow, provider: "gloo" as never })).toThrow(
+      GenerationRequestInvalidError,
+    );
+  });
+
   it("rejects a null projectId (an image asset has nowhere to live without a project)", () => {
     expect(() => parseImageRequest({ ...baseRow, projectId: null })).toThrow(
       GenerationRequestInvalidError,
