@@ -1,6 +1,7 @@
 import {
   AI_GENERATION_QUEUE_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
+  GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
@@ -72,6 +73,10 @@ export const WORKFLOW_NAMES = {
   // Task #32: the image-generation workflow (openrouter-only media). Same shared-constant
   // discipline — the API enqueues to this name on the ai-generation queue.
   generateImage: GENERATE_IMAGE_WORKFLOW_NAME,
+  // Task #33: the audio-generation workflow (narration + music, openrouter-only). One
+  // workflow, both audio kinds. Same shared-constant discipline — the API enqueues to this
+  // name on the ai-generation queue.
+  generateAudio: GENERATE_AUDIO_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -96,4 +101,6 @@ export const WORKFLOW_QUEUE = {
   generateScript: AI_GENERATION_QUEUE_NAME,
   // generateImage (task 32) rides the same ai-generation queue.
   generateImage: AI_GENERATION_QUEUE_NAME,
+  // generateAudio (task 33) rides the same ai-generation queue.
+  generateAudio: AI_GENERATION_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;
