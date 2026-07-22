@@ -11,6 +11,8 @@ import {
   clearProviderConfig,
   setProviderConfig,
 } from "../providers/config";
+import { clearS3Config, setS3Config } from "../files/s3-config";
+import { makeInternalS3Client } from "../files/s3-client";
 // Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
@@ -19,6 +21,7 @@ import "../workflows/import-project";
 import "../workflows/commit-version";
 import "../workflows/publish-version";
 import "../workflows/generate-script";
+import "../workflows/generate-image";
 
 let appDb: PrismaClient | undefined;
 
@@ -64,6 +67,20 @@ export async function launchDbos(env: Env): Promise<void> {
     secretsEncryptionKey: env.SECRETS_ENCRYPTION_KEY,
   });
 
+  // Inject the S3 config (task #32): the internal-role client the asset-uploading workflows
+  // PUT generated assets with (design §4/§8). Built ONCE here from the validated env — the
+  // upload step reads getS3Config(), never process.env. Cleared (+ client destroyed) on shutdown.
+  setS3Config({
+    client: makeInternalS3Client({
+      endpoint: env.S3_ENDPOINT,
+      region: env.S3_REGION,
+      bucket: env.S3_BUCKET,
+      accessKey: env.S3_ACCESS_KEY,
+      secretKey: env.S3_SECRET_KEY,
+    }),
+    bucket: env.S3_BUCKET,
+  });
+
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
@@ -81,6 +98,7 @@ export async function shutdownDbos(): Promise<void> {
   clearAppDb();
   clearScaffoldConfig();
   clearProviderConfig();
+  clearS3Config();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;

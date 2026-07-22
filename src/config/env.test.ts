@@ -25,6 +25,14 @@ const GITHUB_APP = {
 // supagloo-nodejs-api's loader so API and DBOS agree on the same key contract.
 const SECRETS_ENCRYPTION_KEY = "0".repeat(64);
 
+// Task #32 S3 (writer role): required for the asset-uploading workflows.
+const S3_ENV = {
+  S3_ENDPOINT: "http://minio:9000",
+  S3_BUCKET: "supagloo-dev",
+  S3_ACCESS_KEY: "supagloo",
+  S3_SECRET_KEY: "supagloo-dev",
+};
+
 function validEnv(
   overrides: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
@@ -33,6 +41,7 @@ function validEnv(
     DBOS_DATABASE_URL: SYSTEM_URL,
     SECRETS_ENCRYPTION_KEY,
     ...GITHUB_APP,
+    ...S3_ENV,
     ...overrides,
   };
 }
@@ -176,5 +185,32 @@ describe("loadEnv", () => {
     const key = "abcdef0123456789".repeat(4);
     const env = loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: key }));
     expect(env.SECRETS_ENCRYPTION_KEY).toBe(key);
+  });
+
+  // Task #32 S3 (writer role) — required; region defaults; public endpoint optional/unused.
+  it("requires S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY (fail-fast)", () => {
+    for (const key of [
+      "S3_ENDPOINT",
+      "S3_BUCKET",
+      "S3_ACCESS_KEY",
+      "S3_SECRET_KEY",
+    ] as const) {
+      expect(() => loadEnv(validEnv({ [key]: undefined }))).toThrow(
+        new RegExp(key),
+      );
+    }
+  });
+
+  it("defaults S3_REGION to us-east-1 and accepts an override", () => {
+    expect(loadEnv(validEnv()).S3_REGION).toBe("us-east-1");
+    expect(loadEnv(validEnv({ S3_REGION: "eu-west-1" })).S3_REGION).toBe(
+      "eu-west-1",
+    );
+  });
+
+  it("rejects a non-http S3_ENDPOINT", () => {
+    expect(() => loadEnv(validEnv({ S3_ENDPOINT: "minio:9000" }))).toThrow(
+      /S3_ENDPOINT|http/i,
+    );
   });
 });

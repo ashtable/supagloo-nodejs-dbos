@@ -39,6 +39,10 @@ const GLOO_STUB = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
 // collection" + passage fetch for fetchScripturePassage. Same host port as
 // docker-compose.test.yml.
 const YOUVERSION_STUB = process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
+// Task #32 generateImageWorkflow: the in-process worker uploads generated assets to the
+// Compose MinIO, reachable from the host at the PUBLIC endpoint (localhost:9000).
+const S3_PUBLIC_ENDPOINT =
+  process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -146,7 +150,28 @@ async function openRouterStubReady(): Promise<boolean> {
       body: JSON.stringify({ responses: [] }),
       signal: AbortSignal.timeout(3000),
     });
-    return admin.ok;
+    if (!admin.ok) return false;
+    // Task #32 staleness probe: the image-generation route must exist (a pre-#32 image 404s
+    // it), so a reused-but-stale stub is rebuilt rather than silently failing the image e2e.
+    const image = await fetch(`${OPENROUTER_STUB}/api/v1/images/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "stub/image-model", prompt: "probe" }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return image.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Task #32: the Compose MinIO must be up (the image workflow uploads a real object).
+async function minioReady(): Promise<boolean> {
+  try {
+    const res = await fetch(`${S3_PUBLIC_ENDPOINT}/minio/health/live`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
   } catch {
     return false;
   }
@@ -193,7 +218,8 @@ async function allReady(): Promise<boolean> {
     (await gitServerReady()) &&
     (await openRouterStubReady()) &&
     (await glooStubReady()) &&
-    (await youversionStubReady())
+    (await youversionStubReady()) &&
+    (await minioReady())
   );
 }
 
@@ -234,6 +260,8 @@ export default async function setup() {
     "openrouter-stub",
     "gloo-stub",
     "youversion-stub",
+    "minio",
+    "minio-init",
   ]);
 
   if (!(await waitFor(bothDbsReachable, 90_000))) {
@@ -262,6 +290,10 @@ export default async function setup() {
   if (!(await waitFor(youversionStubReady, 60_000))) {
     compose(["down"]);
     throw new Error("youversion-stub (with the Bible collection route) not ready within 60s");
+  }
+  if (!(await waitFor(minioReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("minio (health/live) not ready within 60s");
   }
 
   return async () => {

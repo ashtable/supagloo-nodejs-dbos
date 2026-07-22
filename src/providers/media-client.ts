@@ -87,6 +87,85 @@ export async function requestSpeech(
   };
 }
 
+// --- Image generation -----------------------------------------------------------
+
+export interface RequestImageArgs {
+  modelId: string;
+  prompt: string;
+}
+
+export interface ImageResult {
+  /** A URL the generated image can be downloaded from (fetched by {@link fetchAssetBytes}). */
+  imageUrl: string;
+}
+
+/**
+ * `POST /api/v1/images/generations` — OpenAI-Images-compatible: `{ model, prompt }` →
+ * `{ created, data: [{ url }] }`. We return the URL REFERENCE (not the bytes) so the
+ * workflow's separate `fetchAssetBytes` step downloads it — mirroring the video
+ * submit→download decomposition, and keeping the (multi-MB) bytes out of the DBOS
+ * checkpoint (only the small URL is a step return).
+ *
+ * IMPLEMENTATION-TIME DECISION (design-delta does NOT pin OpenRouter's image-gen contract,
+ * unlike TTS `/api/v1/audio/speech` and video `/api/v1/videos`). Chosen: the OpenAI Images
+ * URL shape, because it cleanly separates the API call from the byte fetch (honoring the
+ * two named steps `callImageModel` → `fetchAssetBytes`) and is a standard OpenAI-compatible
+ * contract. ALTERNATIVE (verify against live OpenRouter): the chat-completions path with
+ * `modalities: ["image"]` returning inline base64 in `message.images[].image_url.url` — that
+ * would make `fetchAssetBytes` a base64 decode rather than a GET. Confirm before prod.
+ */
+export async function requestImage(
+  cfg: MediaClientConfig,
+  args: RequestImageArgs,
+): Promise<ImageResult> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(
+    `${trimSlash(cfg.openrouterBaseUrl)}/api/v1/images/generations`,
+    {
+      method: "POST",
+      headers: { ...authHeader(cfg), "content-type": "application/json" },
+      body: JSON.stringify({ model: args.modelId, prompt: args.prompt }),
+    },
+  );
+  await ensureOk(res, "image generation");
+  const body = (await res.json()) as { data?: Array<{ url?: string }> };
+  const url = body.data?.[0]?.url;
+  if (typeof url !== "string" || url.length === 0) {
+    // A 200 with no usable URL is a malformed provider response — treat as a transient
+    // upstream hiccup (502) so the step's MEDIA_RETRY re-tries rather than failing hard.
+    throw new ProviderHttpError(
+      "image generation returned no image url",
+      502,
+      JSON.stringify(body).slice(0, 500),
+    );
+  }
+  return { imageUrl: url };
+}
+
+export interface FetchedAsset {
+  bytes: Buffer;
+  contentType: string | null;
+}
+
+/**
+ * Download a generated asset from a pre-authorized URL (the image/video content URL the
+ * provider returned). NO auth header — the URL is already authorized (same contract as
+ * {@link downloadBytes}); attaching the provider bearer to a third-party CDN URL is wrong.
+ * Returns the bytes + the response `content-type` (stored as the S3 object's ContentType).
+ */
+export async function fetchAssetBytes(
+  cfg: MediaClientConfig,
+  url: string,
+): Promise<FetchedAsset> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(url, { method: "GET" });
+  await ensureOk(res, "asset download");
+  return {
+    bytes: Buffer.from(await res.arrayBuffer()),
+    contentType: res.headers.get("content-type"),
+  };
+}
+
 // --- Video (async job) ----------------------------------------------------------
 
 export interface SubmitVideoJobArgs {

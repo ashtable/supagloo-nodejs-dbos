@@ -57,6 +57,11 @@ const env: Env = loadEnv({
   OPENROUTER_BASE_URL: OPENROUTER_STUB,
   YOUVERSION_BASE_URL: YOUVERSION_STUB,
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
+  // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
+  S3_ENDPOINT: "http://minio:9000",
+  S3_BUCKET: "supagloo-dev",
+  S3_ACCESS_KEY: "supagloo",
+  S3_SECRET_KEY: "supagloo-dev",
 });
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
