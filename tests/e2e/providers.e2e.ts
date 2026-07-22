@@ -44,6 +44,11 @@ const env: Env = loadEnv({
   OPENROUTER_BASE_URL: OPENROUTER_STUB,
   GLOO_BASE_URL: GLOO_STUB,
   SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  // Task #32 made the S3 (writer) vars required at boot (unused by this providers e2e).
+  S3_ENDPOINT: "http://minio:9000",
+  S3_BUCKET: "supagloo-dev",
+  S3_ACCESS_KEY: "supagloo",
+  S3_SECRET_KEY: "supagloo-dev",
 });
 
 const stubSchema = z.object({ stub: z.boolean() });

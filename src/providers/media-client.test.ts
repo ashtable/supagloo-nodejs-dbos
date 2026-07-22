@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { ProviderHttpError } from "./errors";
+import { ProviderHttpError, retryUnlessPermanent } from "./errors";
 import {
   downloadBytes,
+  fetchAssetBytes,
   getVideoContentUrls,
   getVideoJob,
+  requestImage,
   requestSpeech,
   submitVideoJob,
 } from "./media-client";
@@ -78,6 +80,100 @@ describe("requestSpeech (TTS raw byte stream)", () => {
         { ...CFG, fetchImpl: rec.fetch },
         { modelId: "m", input: "x" },
       ),
+    ).rejects.toBeInstanceOf(ProviderHttpError);
+  });
+});
+
+describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", () => {
+  it("POSTs /api/v1/images/generations with {model, prompt} + Bearer auth and parses data[0].url", async () => {
+    const rec = recorder(
+      () =>
+        new Response(
+          JSON.stringify({
+            created: 1700000000,
+            data: [{ url: "https://cdn.example/img/abc.png" }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const result = await requestImage(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "resolved/image-model", prompt: "a serene sunrise over hills" },
+    );
+    expect(result.imageUrl).toBe("https://cdn.example/img/abc.png");
+
+    const req = rec.reqs[0];
+    expect(req.url).toBe("https://openrouter.ai/api/v1/images/generations");
+    expect(req.method).toBe("POST");
+    expect(req.headers.get("authorization")).toBe("Bearer sk-or-test");
+    const body = JSON.parse(req.body);
+    expect(body.model).toBe("resolved/image-model");
+    expect(body.prompt).toBe("a serene sunrise over hills");
+  });
+
+  it("classifies a 503 as transient (ProviderHttpError → retryUnlessPermanent true)", async () => {
+    const rec = recorder(() => new Response("busy", { status: 503 }));
+    const err = await requestImage(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "m", prompt: "x" },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderHttpError);
+    expect((err as ProviderHttpError).status).toBe(503);
+    expect(retryUnlessPermanent(err)).toBe(true);
+  });
+
+  it("classifies a 400 as permanent (ProviderHttpError → retryUnlessPermanent false)", async () => {
+    const rec = recorder(() => new Response("bad prompt", { status: 400 }));
+    const err = await requestImage(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "m", prompt: "x" },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderHttpError);
+    expect(retryUnlessPermanent(err)).toBe(false);
+  });
+
+  it("throws a 502 ProviderHttpError when a 200 body has no usable data[0].url", async () => {
+    const rec = recorder(
+      () =>
+        new Response(JSON.stringify({ created: 1700000000, data: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const err = await requestImage(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "m", prompt: "x" },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderHttpError);
+    expect((err as ProviderHttpError).status).toBe(502);
+  });
+});
+
+describe("fetchAssetBytes (Task #32 — download a pre-authorized asset URL, no auth header)", () => {
+  it("GETs the URL with NO auth header and returns the bytes + content-type", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const rec = recorder(
+      () =>
+        new Response(png, {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+    );
+    const { bytes, contentType } = await fetchAssetBytes(
+      { ...CFG, fetchImpl: rec.fetch },
+      "https://cdn.example/img/abc.png",
+    );
+    expect(bytes.equals(png)).toBe(true);
+    expect(contentType).toBe("image/png");
+    // A pre-authorized URL must not carry the provider bearer.
+    expect(rec.reqs[0].headers.get("authorization")).toBeNull();
+    expect(rec.reqs[0].url).toBe("https://cdn.example/img/abc.png");
+  });
+
+  it("surfaces a non-2xx download as a ProviderHttpError", async () => {
+    const rec = recorder(() => new Response("gone", { status: 404 }));
+    await expect(
+      fetchAssetBytes({ ...CFG, fetchImpl: rec.fetch }, "https://cdn.example/x"),
     ).rejects.toBeInstanceOf(ProviderHttpError);
   });
 });

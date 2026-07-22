@@ -103,6 +103,30 @@ export const envSchema = z.object({
         "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
         "generate one with `openssl rand -hex 32`",
     }),
+
+  // Task #32 S3 (design-delta §4/§8). The asset-uploading workflows PUT generated media
+  // against the INTERNAL endpoint. Names copied VERBATIM from supagloo-nodejs-api's loader so
+  // the two services agree. dbos is a WRITER (internal role only), so it needs
+  // S3_ENDPOINT + bucket + creds + region; S3_PUBLIC_ENDPOINT is accepted for name-parity with
+  // the API but UNUSED here (dbos never presigns). Required (fail-fast) — a wrong/missing
+  // endpoint or credential silently breaks uploads.
+  S3_ENDPOINT: z
+    .string()
+    .min(1)
+    .refine((value) => HTTP_URL.test(value), {
+      message: "S3_ENDPOINT must be an http:// or https:// URL",
+    }),
+  // Accepted for parity with the API's env; dbos does not presign, so it is unused here.
+  S3_PUBLIC_ENDPOINT: z
+    .string()
+    .refine((value) => HTTP_URL.test(value), {
+      message: "S3_PUBLIC_ENDPOINT must be an http:// or https:// URL",
+    })
+    .optional(),
+  S3_BUCKET: z.string().min(1),
+  S3_ACCESS_KEY: z.string().min(1),
+  S3_SECRET_KEY: z.string().min(1),
+  S3_REGION: z.string().min(1).default("us-east-1"),
 });
 
 export type Env = z.infer<typeof envSchema>;

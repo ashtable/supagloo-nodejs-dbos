@@ -77,6 +77,11 @@ const env: Env = loadEnv({
   GITHUB_APP_PRIVATE_KEY: privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
   SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
+  S3_ENDPOINT: "http://minio:9000",
+  S3_BUCKET: "supagloo-dev",
+  S3_ACCESS_KEY: "supagloo",
+  S3_SECRET_KEY: "supagloo-dev",
 });
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
