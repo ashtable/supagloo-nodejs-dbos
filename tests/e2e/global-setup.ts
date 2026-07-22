@@ -30,6 +30,11 @@ const SYSTEM_URL =
   "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
 const GITHUB_STUB = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
 const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
+// Task #29 provider-call layer: the openrouter-stub (:4802) + gloo-stub (:4803)
+// serve the discovery/generateObject/token-mint/media round-trips the providers
+// e2e drives. Same host ports as docker-compose.test.yml (memory provider-stub-harness).
+const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
+const GLOO_STUB = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -100,11 +105,64 @@ async function gitServerReady(): Promise<boolean> {
   }
 }
 
+async function stubHealthy(baseUrl: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl}/__stub/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Staleness probes (task #29): a reused-but-stale stub image (built before this
+// task's stub edits) is healthy but serves the OLD contract, so gate on the NEW
+// behavior — otherwise the providers e2e silently runs against a stale stub. Mirrors
+// the githubStubReady staleness check.
+async function openRouterStubReady(): Promise<boolean> {
+  if (!(await stubHealthy(OPENROUTER_STUB))) return false;
+  try {
+    // The NEW /api/v1/models filters by output_modalities → exactly the text model;
+    // a stale image returns the full unfiltered catalogue.
+    const res = await fetch(
+      `${OPENROUTER_STUB}/api/v1/models?output_modalities=text`,
+      { signal: AbortSignal.timeout(3000) },
+    );
+    if (!res.ok) return false;
+    const ids = ((await res.json()) as { data: Array<{ id: string }> }).data.map(
+      (m) => m.id,
+    );
+    return ids.length === 1 && ids[0] === "stub/text-model";
+  } catch {
+    return false;
+  }
+}
+
+async function glooStubReady(): Promise<boolean> {
+  if (!(await stubHealthy(GLOO_STUB))) return false;
+  try {
+    // The NEW stub serves the REAL slash path /ai/v2/chat/completions (401 without a
+    // bearer); a stale image only has the hyphenated path and 404s the slash one.
+    const res = await fetch(`${GLOO_STUB}/ai/v2/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.status === 401;
+  } catch {
+    return false;
+  }
+}
+
 async function allReady(): Promise<boolean> {
   return (
     (await bothDbsReachable()) &&
     (await githubStubReady()) &&
-    (await gitServerReady())
+    (await gitServerReady()) &&
+    (await openRouterStubReady()) &&
+    (await glooStubReady())
   );
 }
 
@@ -135,7 +193,16 @@ export default async function setup() {
     );
   }
 
-  compose(["up", "-d", "--build", "postgres", "github-stub", "git-server"]);
+  compose([
+    "up",
+    "-d",
+    "--build",
+    "postgres",
+    "github-stub",
+    "git-server",
+    "openrouter-stub",
+    "gloo-stub",
+  ]);
 
   if (!(await waitFor(bothDbsReachable, 90_000))) {
     compose(["down"]);
@@ -151,6 +218,14 @@ export default async function setup() {
   if (!(await waitFor(gitServerReady, 60_000))) {
     compose(["down"]);
     throw new Error("git-server not ready within 60s");
+  }
+  if (!(await waitFor(openRouterStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("openrouter-stub not ready within 60s");
+  }
+  if (!(await waitFor(glooStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("gloo-stub not ready within 60s");
   }
 
   return async () => {

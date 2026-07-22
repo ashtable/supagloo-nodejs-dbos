@@ -19,12 +19,19 @@ const GITHUB_APP = {
   GITHUB_APP_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----\nX\n-----END RSA PRIVATE KEY-----",
 };
 
+// Task #29 provider-call layer: the single AES-256-GCM key used to decrypt per-user
+// provider secrets (via db-lib's decryptSecret) inside the generation workflows.
+// Required (fail-fast at boot), a 64-hex-char value — copied verbatim from
+// supagloo-nodejs-api's loader so API and DBOS agree on the same key contract.
+const SECRETS_ENCRYPTION_KEY = "0".repeat(64);
+
 function validEnv(
   overrides: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
   return {
     DATABASE_URL: APP_URL,
     DBOS_DATABASE_URL: SYSTEM_URL,
+    SECRETS_ENCRYPTION_KEY,
     ...GITHUB_APP,
     ...overrides,
   };
@@ -123,5 +130,51 @@ describe("loadEnv", () => {
     expect(() => loadEnv(validEnv({ GITHUB_APP_PRIVATE_KEY: undefined }))).toThrow(
       /GITHUB_APP_PRIVATE_KEY/,
     );
+  });
+
+  // --- Task #29 provider-call layer -----------------------------------------
+
+  it("defaults the provider base URLs to the real hosts (prod needs zero config)", () => {
+    const env = loadEnv(validEnv());
+    expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
+    expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
+  });
+
+  it("accepts overridden (stub) provider base URLs", () => {
+    const env = loadEnv(
+      validEnv({
+        OPENROUTER_BASE_URL: "http://localhost:4802",
+        GLOO_BASE_URL: "http://localhost:4803",
+      }),
+    );
+    expect(env.OPENROUTER_BASE_URL).toBe("http://localhost:4802");
+    expect(env.GLOO_BASE_URL).toBe("http://localhost:4803");
+  });
+
+  it("rejects a non-http provider base URL", () => {
+    expect(() =>
+      loadEnv(validEnv({ OPENROUTER_BASE_URL: "ftp://nope" })),
+    ).toThrow(/OPENROUTER_BASE_URL|http/i);
+  });
+
+  it("requires SECRETS_ENCRYPTION_KEY (fail-fast at boot)", () => {
+    expect(() =>
+      loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: undefined })),
+    ).toThrow(/SECRETS_ENCRYPTION_KEY/);
+  });
+
+  it("rejects a SECRETS_ENCRYPTION_KEY that is not 64 hex characters", () => {
+    expect(() =>
+      loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "tooshort" })),
+    ).toThrow(/SECRETS_ENCRYPTION_KEY|hex/i);
+    expect(() =>
+      loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "z".repeat(64) })),
+    ).toThrow(/SECRETS_ENCRYPTION_KEY|hex/i);
+  });
+
+  it("accepts a valid 64-hex SECRETS_ENCRYPTION_KEY", () => {
+    const key = "abcdef0123456789".repeat(4);
+    const env = loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: key }));
+    expect(env.SECRETS_ENCRYPTION_KEY).toBe(key);
   });
 });

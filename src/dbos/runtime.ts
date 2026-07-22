@@ -7,6 +7,10 @@ import {
   clearScaffoldConfig,
   setScaffoldConfig,
 } from "../workflows/scaffold-project/config";
+import {
+  clearProviderConfig,
+  setProviderConfig,
+} from "../providers/config";
 // Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
@@ -46,6 +50,15 @@ export async function launchDbos(env: Env): Promise<void> {
     githubAppPrivateKey: env.GITHUB_APP_PRIVATE_KEY,
   });
 
+  // Inject the provider-call config (task #29): outbound LLM/media base URLs + the
+  // secrets key the credential-load step decrypts with. Same injection discipline as
+  // the app db + scaffold config — step helpers read getProviderConfig(), never env.
+  setProviderConfig({
+    openrouterBaseUrl: env.OPENROUTER_BASE_URL,
+    glooBaseUrl: env.GLOO_BASE_URL,
+    secretsEncryptionKey: env.SECRETS_ENCRYPTION_KEY,
+  });
+
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
@@ -62,6 +75,7 @@ export async function shutdownDbos(): Promise<void> {
   await DBOS.shutdown();
   clearAppDb();
   clearScaffoldConfig();
+  clearProviderConfig();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;
