@@ -22,6 +22,7 @@ import "../workflows/commit-version";
 import "../workflows/publish-version";
 import "../workflows/generate-script";
 import "../workflows/generate-image";
+import "../workflows/generate-audio";
 
 let appDb: PrismaClient | undefined;
 

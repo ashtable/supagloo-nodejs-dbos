@@ -159,7 +159,17 @@ async function openRouterStubReady(): Promise<boolean> {
       body: JSON.stringify({ model: "stub/image-model", prompt: "probe" }),
       signal: AbortSignal.timeout(3000),
     });
-    return image.ok;
+    if (!image.ok) return false;
+    // Task #33 staleness probe: the programmable speech-script admin route must exist (a pre-#33
+    // image 404s it), so a reused-but-stale stub is rebuilt rather than silently failing the
+    // generate-audio retry e2e. Programming an EMPTY script is a harmless no-op reset.
+    const speechAdmin = await fetch(`${OPENROUTER_STUB}/__admin/speech-script`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ responses: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return speechAdmin.ok;
   } catch {
     return false;
   }

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   AI_GENERATION_QUEUE_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
+  GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
@@ -40,9 +41,10 @@ describe("static queue registry", () => {
 });
 
 describe("static workflow registry", () => {
-  it("declares the workflows built so far (git-ops four + noopProof + generateScript + generateImage)", () => {
+  it("declares the workflows built so far (git-ops four + noopProof + generateScript + generateImage + generateAudio)", () => {
     expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
       "commitVersion",
+      "generateAudio",
       "generateImage",
       "generateScript",
       "importProject",
@@ -60,6 +62,7 @@ describe("static workflow registry", () => {
     expect(WORKFLOW_QUEUE.publishVersion).toBe("git-ops");
     expect(WORKFLOW_QUEUE.generateScript).toBe("ai-generation");
     expect(WORKFLOW_QUEUE.generateImage).toBe("ai-generation");
+    expect(WORKFLOW_QUEUE.generateAudio).toBe("ai-generation");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
@@ -84,6 +87,9 @@ describe("static workflow registry", () => {
     // Task #32: the generateImage name + ai-generation queue are the shared db-lib constants.
     expect(WORKFLOW_NAMES.generateImage).toBe(GENERATE_IMAGE_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.generateImage).toBe(AI_GENERATION_QUEUE_NAME);
+    // Task #33: the generateAudio name + ai-generation queue are the shared db-lib constants.
+    expect(WORKFLOW_NAMES.generateAudio).toBe(GENERATE_AUDIO_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.generateAudio).toBe(AI_GENERATION_QUEUE_NAME);
   });
 });
 
