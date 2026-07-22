@@ -70,6 +70,8 @@ const env: Env = loadEnv({
   GITHUB_GIT_BASE_URL: GIT_SERVER,
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY: privateKey,
+  // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
+  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
 });
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });

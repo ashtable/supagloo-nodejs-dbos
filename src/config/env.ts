@@ -22,6 +22,11 @@ import { z } from "zod";
  */
 const POSTGRES_URL = /^postgres(?:ql)?:\/\/.+/;
 const HTTP_URL = /^https?:\/\/.+/;
+// A 32-byte AES-256-GCM key, supplied as 64 hex chars (`openssl rand -hex 32`).
+// Matches database-lib `secrets.ts`'s `KEY_HEX` and supagloo-nodejs-api's identical
+// `SECRETS_KEY_HEX`; validated here so a misconfigured key fails fast at boot rather
+// than on the first decrypt inside a generation workflow.
+const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
 /** The DBOS application name (DBOS.setConfig `name`). Fixed, not env-configured. */
 export const DBOS_APP_NAME = "supagloo-dbos";
@@ -71,6 +76,26 @@ export const envSchema = z.object({
   // OWN var (dbos is the only git client — the API never clones). Default matches
   // prod git-over-HTTPS: `https://github.com/<owner>/<repo>.git`.
   GITHUB_GIT_BASE_URL: providerBaseUrl("GITHUB_GIT_BASE_URL", "https://github.com"),
+
+  // Task #29 provider-call layer (design-delta §7). The outbound LLM/media provider
+  // hosts + the application-secrets key. Names/defaults/validation copied VERBATIM
+  // from supagloo-nodejs-api's env loader so the two services agree (memory
+  // openrouter-gloo-connections-built). Real defaults ⇒ prod needs zero config; the
+  // test Compose overlay overrides the base URLs to the openrouter-stub (:4802) /
+  // gloo-stub (:4803).
+  OPENROUTER_BASE_URL: providerBaseUrl("OPENROUTER_BASE_URL", "https://openrouter.ai"),
+  GLOO_BASE_URL: providerBaseUrl("GLOO_BASE_URL", "https://platform.ai.gloo.com"),
+  // The single AES-256-GCM key that decrypts per-user provider secrets (OpenRouter
+  // API key, Gloo client secret) via db-lib's decryptSecret inside the generation
+  // workflows. A 64-hex-char (32-byte) value, distinct per environment. Required —
+  // fail-fast at boot. NOT per-user data; one key per deployment, shared by API + DBOS.
+  SECRETS_ENCRYPTION_KEY: z
+    .string()
+    .refine((value) => SECRETS_KEY_HEX.test(value), {
+      message:
+        "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
+        "generate one with `openssl rand -hex 32`",
+    }),
 });
 
 export type Env = z.infer<typeof envSchema>;

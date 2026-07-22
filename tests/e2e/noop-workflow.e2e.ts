@@ -28,6 +28,9 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nnoop\n-----END RSA PRIVATE KEY-----",
+  // Task #29 made SECRETS_ENCRYPTION_KEY required at boot; the noop workflow never
+  // decrypts anything but launchDbos() validates env, so provide a dummy 64-hex key.
+  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
 });
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
