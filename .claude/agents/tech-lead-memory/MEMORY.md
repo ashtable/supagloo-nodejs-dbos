@@ -14,4 +14,4 @@ individual files, never here.
 - [Non-UI e2e run via node test runner](non-ui-e2e-runner.md) — how integration tests are invoked
 -->
 
-_(none yet)_
+- [db-lib submodule / Dockerfile pin lockstep](db-lib-submodule-dockerfile-pin-lockstep.md) — how to bump the database-lib submodule; the Dockerfile ARG must move in the same commit (pin test enforces it)
