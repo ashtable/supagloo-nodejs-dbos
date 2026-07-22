@@ -18,6 +18,7 @@ import "../workflows/scaffold-project";
 import "../workflows/import-project";
 import "../workflows/commit-version";
 import "../workflows/publish-version";
+import "../workflows/generate-script";
 
 let appDb: PrismaClient | undefined;
 
@@ -56,6 +57,10 @@ export async function launchDbos(env: Env): Promise<void> {
   setProviderConfig({
     openrouterBaseUrl: env.OPENROUTER_BASE_URL,
     glooBaseUrl: env.GLOO_BASE_URL,
+    // Task #30: the YouVersion Data Exchange host fetchScripturePassage reads (real host in
+    // prod, the youversion-stub in test); the optional real-API app key.
+    youversionBaseUrl: env.YOUVERSION_BASE_URL,
+    youversionAppKey: env.YOUVERSION_APP_KEY,
     secretsEncryptionKey: env.SECRETS_ENCRYPTION_KEY,
   });
 

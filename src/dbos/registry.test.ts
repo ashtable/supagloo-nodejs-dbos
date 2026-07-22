@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
+  AI_GENERATION_QUEUE_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
+  GENERATE_SCRIPT_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
@@ -37,9 +39,10 @@ describe("static queue registry", () => {
 });
 
 describe("static workflow registry", () => {
-  it("declares the workflows built so far (noopProof + scaffoldProject + importProject + commitVersion + publishVersion)", () => {
+  it("declares the workflows built so far (git-ops four + noopProof + generateScript)", () => {
     expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
       "commitVersion",
+      "generateScript",
       "importProject",
       "noopProof",
       "publishVersion",
@@ -47,12 +50,13 @@ describe("static workflow registry", () => {
     ]);
   });
 
-  it("maps every workflow onto a declared queue (all ride git-ops)", () => {
+  it("maps every workflow onto a declared queue (git-ops for git-ops kinds, ai-generation for generateScript)", () => {
     expect(WORKFLOW_QUEUE.noopProof).toBe("git-ops");
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe("git-ops");
     expect(WORKFLOW_QUEUE.importProject).toBe("git-ops");
     expect(WORKFLOW_QUEUE.commitVersion).toBe("git-ops");
     expect(WORKFLOW_QUEUE.publishVersion).toBe("git-ops");
+    expect(WORKFLOW_QUEUE.generateScript).toBe("ai-generation");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
@@ -71,6 +75,9 @@ describe("static workflow registry", () => {
     expect(WORKFLOW_QUEUE.commitVersion).toBe(GIT_OPS_QUEUE_NAME);
     expect(WORKFLOW_NAMES.publishVersion).toBe(PUBLISH_VERSION_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.publishVersion).toBe(GIT_OPS_QUEUE_NAME);
+    // Task #30: the generateScript name + ai-generation queue are the shared db-lib constants.
+    expect(WORKFLOW_NAMES.generateScript).toBe(GENERATE_SCRIPT_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.generateScript).toBe(AI_GENERATION_QUEUE_NAME);
   });
 });
 

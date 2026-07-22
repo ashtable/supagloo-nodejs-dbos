@@ -18,3 +18,4 @@ export * from "./gloo";
 export * from "./generate-object";
 export * from "./discovery";
 export * from "./media-client";
+export * from "./youversion";

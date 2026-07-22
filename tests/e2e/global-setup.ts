@@ -35,6 +35,10 @@ const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
 // e2e drives. Same host ports as docker-compose.test.yml (memory provider-stub-harness).
 const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
 const GLOO_STUB = process.env.GLOO_STUB_URL ?? "http://localhost:4803";
+// Task #30 generateScriptWorkflow: the youversion-stub (:4804) serves "Get a Bible
+// collection" + passage fetch for fetchScripturePassage. Same host port as
+// docker-compose.test.yml.
+const YOUVERSION_STUB = process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -133,7 +137,33 @@ async function openRouterStubReady(): Promise<boolean> {
     const ids = ((await res.json()) as { data: Array<{ id: string }> }).data.map(
       (m) => m.id,
     );
-    return ids.length === 1 && ids[0] === "stub/text-model";
+    if (!(ids.length === 1 && ids[0] === "stub/text-model")) return false;
+    // Task #30 staleness probe: the programmable chat-script admin route must exist (a
+    // pre-#30 image 404s it). Programming an EMPTY script is a harmless no-op reset.
+    const admin = await fetch(`${OPENROUTER_STUB}/__admin/chat-script`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ responses: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return admin.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Task #30: the youversion-stub serves the Bible collection (kjv/bsb) + passage fetch.
+async function youversionStubReady(): Promise<boolean> {
+  if (!(await stubHealthy(YOUVERSION_STUB))) return false;
+  try {
+    const res = await fetch(`${YOUVERSION_STUB}/data-exchange/v1/bibles`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return false;
+    const ids = ((await res.json()) as { data: Array<{ id: string }> }).data.map(
+      (b) => b.id,
+    );
+    return ids.includes("kjv") && ids.includes("bsb");
   } catch {
     return false;
   }
@@ -162,7 +192,8 @@ async function allReady(): Promise<boolean> {
     (await githubStubReady()) &&
     (await gitServerReady()) &&
     (await openRouterStubReady()) &&
-    (await glooStubReady())
+    (await glooStubReady()) &&
+    (await youversionStubReady())
   );
 }
 
@@ -202,6 +233,7 @@ export default async function setup() {
     "git-server",
     "openrouter-stub",
     "gloo-stub",
+    "youversion-stub",
   ]);
 
   if (!(await waitFor(bothDbsReachable, 90_000))) {
@@ -226,6 +258,10 @@ export default async function setup() {
   if (!(await waitFor(glooStubReady, 60_000))) {
     compose(["down"]);
     throw new Error("gloo-stub not ready within 60s");
+  }
+  if (!(await waitFor(youversionStubReady, 60_000))) {
+    compose(["down"]);
+    throw new Error("youversion-stub (with the Bible collection route) not ready within 60s");
   }
 
   return async () => {

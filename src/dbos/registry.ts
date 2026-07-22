@@ -1,5 +1,7 @@
 import {
+  AI_GENERATION_QUEUE_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
+  GENERATE_SCRIPT_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
@@ -63,6 +65,9 @@ export const WORKFLOW_NAMES = {
   // Task #22: the fourth real git-ops workflow (publish: merge working → main, tag,
   // cut next branch). Same shared-constant discipline — the API enqueues to this name.
   publishVersion: PUBLISH_VERSION_WORKFLOW_NAME,
+  // Task #30: the first ai-generation workflow (storyboard + script structured text).
+  // Same shared-constant discipline — the API enqueues to this name on the ai-generation queue.
+  generateScript: GENERATE_SCRIPT_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -83,4 +88,6 @@ export const WORKFLOW_QUEUE = {
   commitVersion: GIT_OPS_QUEUE_NAME,
   // publishVersion (task 22) rides the same git-ops queue.
   publishVersion: GIT_OPS_QUEUE_NAME,
+  // generateScript (task 30) rides the ai-generation queue (the shared db-lib constant).
+  generateScript: AI_GENERATION_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;

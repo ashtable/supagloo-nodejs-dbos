@@ -12,6 +12,10 @@
 export interface ProviderConfig {
   openrouterBaseUrl: string;
   glooBaseUrl: string;
+  /** YouVersion Data Exchange base URL (task #30 fetchScripturePassage). */
+  youversionBaseUrl: string;
+  /** The real YouVersion API's `X-YVP-App-Key` (optional — the stub ignores it). */
+  youversionAppKey?: string;
   /** 64-hex AES-256-GCM key, validated at boot; passed to db-lib decryptSecret. */
   secretsEncryptionKey: string;
 }

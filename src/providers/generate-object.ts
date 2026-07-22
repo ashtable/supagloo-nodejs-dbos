@@ -1,4 +1,8 @@
-import { generateObject, type LanguageModel } from "ai";
+import {
+  generateObject,
+  type LanguageModel,
+  type LanguageModelUsage,
+} from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import type { z } from "zod";
 
@@ -69,20 +73,42 @@ export interface CallLlmStructuredArgs<T> {
   fetchImpl?: typeof fetch;
 }
 
+export interface StructuredResult<T> {
+  object: T;
+  /** AI-SDK token usage (`{inputTokens?, outputTokens?, totalTokens?}`) for persistence. */
+  usage: LanguageModelUsage;
+}
+
 /**
- * Generate a schema-validated object. Returns the parsed object on success; throws
- * `NoObjectGeneratedError` (schema mismatch — hand back to the repair loop) or
- * `APICallError` (HTTP failure — classified by the step's `shouldRetry`) on failure.
+ * Generate a schema-validated object AND surface the token usage. Returns
+ * `{object, usage}` on success; throws `NoObjectGeneratedError` (schema mismatch — hand
+ * back to the repair loop) or `APICallError` (HTTP failure — classified by the step's
+ * `shouldRetry`) on failure. Task #30's generation workflow persists `usage` as
+ * `AiGeneration.tokenUsage`.
  */
-export async function callLlmStructured<T>(
+export async function callLlmStructuredWithUsage<T>(
   args: CallLlmStructuredArgs<T>,
-): Promise<T> {
-  const { object } = await generateObject({
+): Promise<StructuredResult<T>> {
+  const { object, usage } = await generateObject({
     model: buildStructuredModel(args),
     schema: args.schema,
     system: args.system,
     prompt: args.prompt,
     maxRetries: 0,
   });
+  return { object, usage };
+}
+
+/**
+ * Generate a schema-validated object. Returns the parsed object on success; throws
+ * `NoObjectGeneratedError` (schema mismatch — hand back to the repair loop) or
+ * `APICallError` (HTTP failure — classified by the step's `shouldRetry`) on failure.
+ * Thin wrapper over {@link callLlmStructuredWithUsage} that discards the usage — kept for
+ * callers that don't persist token counts.
+ */
+export async function callLlmStructured<T>(
+  args: CallLlmStructuredArgs<T>,
+): Promise<T> {
+  const { object } = await callLlmStructuredWithUsage(args);
   return object;
 }

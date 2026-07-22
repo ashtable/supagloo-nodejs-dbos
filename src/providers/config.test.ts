@@ -22,6 +22,7 @@ describe("provider config singleton", () => {
     setProviderConfig({
       openrouterBaseUrl: "https://openrouter.ai",
       glooBaseUrl: "https://platform.ai.gloo.com",
+      youversionBaseUrl: "https://api.youversion.com",
       secretsEncryptionKey: "a".repeat(64),
     });
     const cfg = getProviderConfig();
@@ -34,6 +35,7 @@ describe("provider config singleton", () => {
     setProviderConfig({
       openrouterBaseUrl: "https://openrouter.ai",
       glooBaseUrl: "https://platform.ai.gloo.com",
+      youversionBaseUrl: "https://api.youversion.com",
       secretsEncryptionKey: "a".repeat(64),
     });
     clearProviderConfig();

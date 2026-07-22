@@ -85,6 +85,13 @@ export const envSchema = z.object({
   // gloo-stub (:4803).
   OPENROUTER_BASE_URL: providerBaseUrl("OPENROUTER_BASE_URL", "https://openrouter.ai"),
   GLOO_BASE_URL: providerBaseUrl("GLOO_BASE_URL", "https://platform.ai.gloo.com"),
+  // Task #30 YouVersion Data Exchange (design-delta §7 workflow 5 / §9-Q10). The base URL
+  // fetchScripturePassage resolves the Bible collection + passages from (real host default ⇒
+  // prod needs zero config; the test Compose overlay overrides it to the youversion-stub
+  // :4804). YOUVERSION_APP_KEY is the real API's `X-YVP-App-Key` — OPTIONAL (the stub ignores
+  // it, and public-domain KJV/BSB fallback works without it), sent as a header when present.
+  YOUVERSION_BASE_URL: providerBaseUrl("YOUVERSION_BASE_URL", "https://api.youversion.com"),
+  YOUVERSION_APP_KEY: z.string().min(1).optional(),
   // The single AES-256-GCM key that decrypts per-user provider secrets (OpenRouter
   // API key, Gloo client secret) via db-lib's decryptSecret inside the generation
   // workflows. A 64-hex-char (32-byte) value, distinct per environment. Required —
