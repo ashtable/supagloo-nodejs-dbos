@@ -41,8 +41,8 @@ import {
  * standalone callSpeech step would checkpoint the audio. Folding keeps the bytes in step-local
  * memory and makes synth→upload atomically retryable against the deterministic idempotent key
  * (`buildAssetKey(projectId, genId)`; re-PUT overwrites). The step returns only the small,
- * checkpoint-safe `{ providerGenerationId }` (the provider's X-Generation-Id header — decision
- * D6, persisted in resultJson for traceability). This mirrors the task-32 image precedent
+ * checkpoint-safe `{ providerGenerationId }` (parsed from the SSE body's `delta.audio.id` field —
+ * decision D6, persisted in resultJson for traceability). This mirrors the task-32 image precedent
  * (there callImageModel returned a URL; here requestSpeech returns bytes, so the fold is even
  * more clear-cut). Registered STATICALLY at module load.
  */
@@ -97,9 +97,9 @@ async function generateAudioFn(
     );
 
     // 2) synthesizeAndUploadAudio (folds callSpeechEndpoint + uploadAssetToS3) — reload the
-    //    key INSIDE the step (never checkpointed), call the speech endpoint (raw mp3 byte
-    //    stream), PUT the bytes to the deterministic idempotent key. The bytes stay in
-    //    step-local memory; only the small { providerGenerationId } is returned/checkpointed.
+    //    key INSIDE the step (never checkpointed), stream the SSE speech chat-completions and
+    //    WAV-wrap the PCM16 bytes, PUT the bytes to the deterministic idempotent key. The bytes
+    //    stay in step-local memory; only the small { providerGenerationId } is returned/checkpointed.
     const assetKey = buildAssetKey(request.projectId, genId);
     const { providerGenerationId } = await DBOS.runStep<{
       providerGenerationId: string | null;
@@ -120,7 +120,7 @@ async function generateAudioFn(
           bucket,
           key: assetKey,
           bytes: speech.bytes,
-          contentType: speech.contentType ?? "audio/mpeg",
+          contentType: speech.contentType,
         });
         return { providerGenerationId: speech.generationId };
       },

@@ -6,7 +6,6 @@ import { getProviderConfig } from "../providers/config";
 import { loadOpenRouterCredential } from "../providers/credentials";
 import {
   downloadBytes,
-  getVideoContentUrls,
   getVideoJob,
   submitVideoJob,
 } from "../providers/media-client";
@@ -207,13 +206,17 @@ async function generateVideoFn(
           openrouterBaseUrl: cfg.openrouterBaseUrl,
           apiKey: cred.apiKey,
         };
-        const { unsignedUrls } = await getVideoContentUrls(mediaCfg, providerJobId);
+        // The completed job's content URLs live in the poll body (`unsigned_urls`) — there is no
+        // separate JSON content-listing endpoint. Re-read the (now completed) job to get them.
+        const { unsignedUrls } = await getVideoJob(mediaCfg, pollingUrl);
         const url = unsignedUrls[0];
         if (!url) {
           // A completed job with no content URL is a malformed provider response — treat as
           // transient (502) so MEDIA_RETRY re-tries rather than failing the generation hard.
           throw new VideoJobFailedError(providerJobId, "completed-without-content-url");
         }
+        // The content URL points back at the OpenRouter API and REQUIRES the bearer (downloadBytes
+        // sends auth).
         const bytes = await downloadBytes(mediaCfg, url);
         const { client, bucket } = getS3Config();
         await uploadAsset(client, {

@@ -1,51 +1,48 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
-import { createPrismaClient, encryptSecret } from "@supagloo/database-lib";
+import {
+  createPrismaClient,
+  GeneratedStoryboardSchema,
+} from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
+import {
+  resolveGenerationSeedCreds,
+  seedOpenRouterConnection,
+  type GenerationSeedCreds,
+} from "../../src/testing/seed-connections";
+import { resolveTextModel } from "../../src/testing/e2e-models";
+import { countStepExecutions } from "../../src/testing/step-introspection";
 import {
   __setGenerateScriptBoundaryHook,
   type GenerateScriptPayload,
   type GenerateScriptResult,
 } from "../../src/workflows/generate-script";
 
-// End-to-end proof of generateScriptWorkflow against the REAL provider-stub harness:
-// openrouter-stub (:4802) serves the structured chat-completions, youversion-stub (:4804)
-// serves the "Get a Bible collection" + passage fetch. DBOS is launched IN-PROCESS
-// (consuming the uncommitted db-lib via the file: dep). No mocks.
+// End-to-end CRASH/REPLAY proof of generateScriptWorkflow against the REAL OpenRouter host
+// (design-delta §7 workflow 5, §10.2/§10.3/§10.5/§10.7/§10.9). DBOS is launched IN-PROCESS; the
+// workflow resolves a live text model, runs a real `generateObject` storyboard round-trip,
+// then this test parks at the persistResult boundary, cancels, and resumes — asserting the
+// checkpointed LLM step(s) REPLAY on resume WITHOUT a second real HTTP call (the §10.5 pattern).
 //
-// This spec retains only the crash/replay DURABILITY proof: it scripts a malformed→valid
-// chat sequence (via POST /__admin/chat-script) to reach a successful repair, parks at the
-// persistResult boundary, cancels, resumes, and asserts the checkpointed LLM steps replay
-// WITHOUT a second HTTP call (the stub's chatCompletions counter stays flat).
+// Real-provider seeding (§10.3): the OpenRouter connection is seeded via
+// `seedOpenRouterConnection` with the real OPENROUTER_E2E_TEST_API_KEY (no fabricated
+// ciphertext); the model id is resolved via discovery (§10.9 — never hardcoded).
 //
-// The deterministic-FAILURE cases that used to live here — the 503-then-200 step retry and
-// the malformed-then-valid repair loop — were reclassified to injected-fetch UNIT tests in
-// task 34-E1 (design-delta §10.6): they simulate provider behavior by construction, which is
-// not end-to-end. See src/providers/{generate-object,errors}.test.ts and
-// src/workflows/generate-script/repair.test.ts.
+// The proof is now HOST-INTROSPECTION-FREE (§10.7): instead of the openrouter-stub's
+// chatCompletions counter, we count the LLM step's recorded executions in the DBOS system DB
+// (`countStepExecutions`, prefix-matching so repair attempts all count) and assert the count is
+// UNCHANGED across the resume, plus the persisted result is schema-valid. The generation is a
+// pure brief→storyboard round-trip (NO scripture), so YouVersion is not exercised at all — its
+// real-hosting is out of this task's OpenRouter/Gloo scope.
+//
+// The deterministic-FAILURE cases that once lived here (503-then-200 retry, malformed→valid
+// repair) were reclassified to injected-fetch UNIT tests in task 34-E1 (§10.6); they cannot and
+// should not be scripted against a real host.
 
-const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
-const YOUVERSION_STUB = process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
 const ENCRYPTION_KEY = "0".repeat(64);
-
-// A storyboard that satisfies GeneratedStoryboardSchema (the "good" LLM response body).
-const GOOD_STORYBOARD = {
-  scenes: [
-    {
-      name: "wilderness · dawn",
-      scriptText: "For God so loved the world",
-      reference: "John 3:16",
-      translation: "KJV",
-      visualPrompt: "sweeping desert at first light, cinematic wide establishing shot",
-      suggestedDurationSeconds: 5,
-    },
-  ],
-  narratorVoice: { description: "warm, reverent baritone, unhurried" },
-  musicStyle: "swelling strings",
-};
 
 const env: Env = loadEnv({
   DATABASE_URL:
@@ -58,8 +55,7 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
-  OPENROUTER_BASE_URL: OPENROUTER_STUB,
-  YOUVERSION_BASE_URL: YOUVERSION_STUB,
+  OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
@@ -70,37 +66,10 @@ const env: Env = loadEnv({
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
+let creds: GenerationSeedCreds;
+let textModel: string;
 
-async function resetOpenRouter(): Promise<void> {
-  await fetch(`${OPENROUTER_STUB}/__stub/reset`, { method: "POST" });
-}
-async function resetYouVersion(): Promise<void> {
-  await fetch(`${YOUVERSION_STUB}/__stub/reset`, { method: "POST" });
-}
-
-/** Program the openrouter-stub's next N chat responses (shifted one per chat call). */
-async function scriptChatResponses(
-  responses: Array<{ status: number; body?: unknown }>,
-): Promise<void> {
-  const res = await fetch(`${OPENROUTER_STUB}/__admin/chat-script`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ responses }),
-  });
-  if (!res.ok) {
-    throw new Error(
-      `openrouter-stub /__admin/chat-script not available (status ${res.status}) — ` +
-        "the stub image is stale; rebuild the provider-stub image",
-    );
-  }
-}
-
-async function stubState(baseUrl: string): Promise<Record<string, number>> {
-  const res = await fetch(`${baseUrl}/__stub/calls`);
-  return ((await res.json()) as { state: Record<string, number> }).state;
-}
-
-async function seedGeneration(kind: "storyboard" | "script"): Promise<{
+async function seedStoryboardGeneration(): Promise<{
   genId: string;
   payload: GenerateScriptPayload;
 }> {
@@ -113,26 +82,24 @@ async function seedGeneration(kind: "storyboard" | "script"): Promise<{
       avatarInitials: "GE",
     },
   });
-  await prisma.openRouterConnection.create({
-    data: {
-      userId: user.id,
-      apiKeyCiphertext: encryptSecret("sk-or-test-key", ENCRYPTION_KEY),
-      keyLast4: "tkey",
-      status: "connected",
-    },
+  await seedOpenRouterConnection({
+    prisma,
+    userId: user.id,
+    apiKey: creds.openrouterKey,
+    encryptionKey: ENCRYPTION_KEY,
   });
   const genId = `gen-${suffix}`;
   await prisma.aiGeneration.create({
     data: {
       id: genId,
       userId: user.id,
-      kind,
+      kind: "storyboard",
       provider: "openrouter",
-      model: "stub/text-model",
+      model: textModel,
       status: "queued",
+      // Brief-only (NO scripture) — a pure LLM round-trip; skips fetchScripturePassage entirely.
       input: {
-        brief: "Break this passage into a reverent vertical video.",
-        scripture: { reference: "John 3:16", translation: "KJV", language: "eng" },
+        brief: "Break a short reverent reflection on hope into a vertical video storyboard.",
       },
     },
   });
@@ -150,8 +117,10 @@ async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  creds = resolveGenerationSeedCreds();
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
+  textModel = await resolveTextModel(env);
 }, 120_000);
 
 afterAll(async () => {
@@ -161,21 +130,13 @@ afterAll(async () => {
   await prisma.$disconnect().catch(() => {});
 });
 
-beforeEach(async () => {
-  await resetOpenRouter();
-  await resetYouVersion();
-});
-
 describe("generateScriptWorkflow — crash / replay after the successful LLM call", () => {
   it("cancels at persistResult, resumes, and does NOT re-call the LLM (checkpointed steps replay)", async () => {
-    await scriptChatResponses([
-      { status: 200, body: { stub: true } }, // first attempt invalid → repair
-      { status: 200, body: GOOD_STORYBOARD }, // repair succeeds
-    ]);
-    const { genId, payload } = await seedGeneration("storyboard");
+    const { genId, payload } = await seedStoryboardGeneration();
 
-    // Park at the boundary just before persistResult — the LLM loop (incl. the repair) has
-    // already run + checkpointed, so the cancel lands after the last LLM call.
+    // Park at the boundary just before persistResult — the real LLM round-trip (incl. any
+    // natural repair attempts) has already run + checkpointed, so the cancel lands after the
+    // last LLM call.
     let release!: () => void;
     const reached = new Promise<void>((resolve) => {
       __setGenerateScriptBoundaryHook(async (label) => {
@@ -202,9 +163,9 @@ describe("generateScriptWorkflow — crash / replay after the successful LLM cal
     );
 
     await reached;
-    // The two LLM calls already happened + checkpointed at this boundary.
-    const beforeCancel = await stubState(OPENROUTER_STUB);
-    expect(beforeCancel.chatCompletions).toBe(2);
+    // The LLM call(s) already happened + checkpointed at this boundary. Capture the count.
+    const llmStepsBefore = await countStepExecutions(client, genId, "callLlmStructured");
+    expect(llmStepsBefore).toBeGreaterThanOrEqual(1);
 
     await DBOS.cancelWorkflow(genId);
     release();
@@ -215,13 +176,15 @@ describe("generateScriptWorkflow — crash / replay after the successful LLM cal
     const resumeHandle = await DBOS.resumeWorkflow<GenerateScriptResult>(genId);
     await resumeHandle.getResult();
 
-    // The crux: the LLM was called exactly TWICE across BOTH attempts — the checkpointed
-    // callLlmStructured steps replayed on resume with no extra HTTP call.
-    const afterResume = await stubState(OPENROUTER_STUB);
-    expect(afterResume.chatCompletions).toBe(2);
+    // The crux (§10.5): the LLM step count is UNCHANGED across the resume — the checkpointed
+    // callLlmStructured step(s) replayed with no extra real HTTP call.
+    const llmStepsAfter = await countStepExecutions(client, genId, "callLlmStructured");
+    expect(llmStepsAfter).toBe(llmStepsBefore);
 
+    // The persisted result is schema-valid (Zod-parse resultJson) — no stub literal asserted.
     const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
     expect(row.status).toBe("succeeded");
-    expect((row.resultJson as { scenes: unknown[] }).scenes.length).toBeGreaterThan(0);
+    const parsed = GeneratedStoryboardSchema.safeParse(row.resultJson);
+    expect(parsed.success).toBe(true);
   }, 150_000);
 });
