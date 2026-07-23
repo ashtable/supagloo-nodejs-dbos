@@ -4,7 +4,7 @@ import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getProviderConfig } from "../providers/config";
 import { loadOpenRouterCredential } from "../providers/credentials";
-import { fetchAssetBytes, requestImage } from "../providers/media-client";
+import { requestImage } from "../providers/media-client";
 import { MEDIA_RETRY, DISCOVERY_RETRY } from "../providers/errors";
 import { getS3Config } from "../files/s3-config";
 import { uploadAsset } from "../files/s3-client";
@@ -27,24 +27,22 @@ import {
  * JSON — there is nothing to re-prompt on).
  *
  * Steps: loadRequestAndCredentials → callImageModel (MEDIA_RETRY: maxAttempts 4 + backoff,
- * 4xx fail-fast) → uploadAssetToS3 (folds the design's `fetchAssetBytes` + `uploadAssetToS3`)
- * → persistResult. It ONLY writes the `AiGeneration` row (status + resultAssetKey) — never
- * `ProjectVersion` or the manifest.
+ * 4xx fail-fast; folds the design's `callImageModel` + `fetchAssetBytes` + `uploadAssetToS3`
+ * into ONE step) → persistResult. It ONLY writes the `AiGeneration` row (status +
+ * resultAssetKey) — never `ProjectVersion` or the manifest.
  *
  * SECRET HANDLING: `loadRequestAndCredentials` verifies the OpenRouter connection exists but
  * returns NO plaintext; the key is (re)loaded INSIDE `callImageModel` so it never lands in a
  * DBOS checkpoint (same discipline as generateScript).
  *
- * WHY fetchAssetBytes + uploadAssetToS3 are ONE DBOS step: (1) the image bytes (MBs) must
- * NEVER enter the DBOS checkpoint — a step return is checkpointed, and a Buffer JSON-serializes
- * ~10x; and (2) a workspace-temp-file handoff between two separate checkpointed steps is NOT
- * crash-safe (on replay the checkpointed fetch step returns without re-writing the file, so
- * upload would find no bytes). Combining keeps the bytes in step-local memory and makes
- * fetch→upload atomically retryable against the deterministic idempotent key
- * (`buildAssetKey(projectId, genId)`; re-PUT overwrites). `callImageModel` returns only the
- * small `{ imageUrl }` (a content URL, not a secret — checkpoint-safe, like video's
- * unsigned_urls). This is the pattern #33 (audio) / #34 (video) will reuse. Registered
- * STATICALLY at module load.
+ * WHY callImageModel + upload are ONE DBOS step: on real OpenRouter the image is returned
+ * INLINE as a base64 data URI in the chat-completions response (`modalities:["image"]`) — there
+ * is no separate content URL to fetch — so `requestImage` yields the bytes directly. Those bytes
+ * (MBs) must NEVER enter a DBOS checkpoint (a step return is checkpointed, and a Buffer
+ * JSON-serializes ~10x), so we upload them WITHIN the same step: the bytes stay in step-local
+ * memory and the generate→upload is atomically retryable against the deterministic idempotent
+ * key (`buildAssetKey(projectId, genId)`; re-PUT overwrites). The audio (#33) / video (#34)
+ * precedent. Registered STATICALLY at module load.
  */
 
 export const GENERATE_IMAGE_WORKFLOW_NAME = WORKFLOW_NAMES.generateImage;
@@ -112,10 +110,15 @@ async function generateImageFn(
       },
     );
 
-    // 2) callImageModel — reload the key INSIDE the step (never checkpointed), call the image
-    //    model, return the (checkpoint-safe) URL reference.
+    // 2) callImageModel (folds fetchAssetBytes + uploadAssetToS3) — reload the key INSIDE the
+    //    step (never checkpointed), call the image model, and PUT the bytes to S3. On real
+    //    OpenRouter the image arrives INLINE as a base64 data URI in the chat-completions
+    //    response (there is no separate URL to fetch), so download+upload collapse into this
+    //    one step; the bytes stay in step-local memory and never enter a DBOS checkpoint. The
+    //    step keeps the name "callImageModel" (the e2e counts its single execution).
+    const assetKey = buildAssetKey(request.projectId, genId);
     await boundary("callImageModel");
-    const { imageUrl } = await DBOS.runStep<{ imageUrl: string }>(
+    await DBOS.runStep(
       async () => {
         const cfg = getProviderConfig();
         const cred = await loadOpenRouterCredential({
@@ -123,34 +126,19 @@ async function generateImageFn(
           userId: request.userId,
           encryptionKey: cfg.secretsEncryptionKey,
         });
-        return requestImage(
+        const { bytes, contentType } = await requestImage(
           { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey },
           { modelId: request.model, prompt: request.prompt },
         );
-      },
-      { name: "callImageModel", ...MEDIA_RETRY, shouldRetry: retryUnlessPermanentGeneration },
-    );
-
-    // 3) uploadAssetToS3 (folds fetchAssetBytes) — download the bytes then PUT them to the
-    //    deterministic idempotent key; the bytes stay in step-local memory (never checkpointed).
-    const assetKey = buildAssetKey(request.projectId, genId);
-    await boundary("uploadAssetToS3");
-    await DBOS.runStep(
-      async () => {
-        const cfg = getProviderConfig();
         const { client, bucket } = getS3Config();
-        const { bytes, contentType } = await fetchAssetBytes(
-          { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: "" },
-          imageUrl,
-        );
         await uploadAsset(client, {
           bucket,
           key: assetKey,
           bytes,
-          contentType: contentType ?? "application/octet-stream",
+          contentType: contentType || "application/octet-stream",
         });
       },
-      { name: "uploadAssetToS3", ...MEDIA_RETRY, shouldRetry: retryUnlessPermanentGeneration },
+      { name: "callImageModel", ...MEDIA_RETRY, shouldRetry: retryUnlessPermanentGeneration },
     );
 
     // 4) persistResult — idempotent success upsert (status succeeded + resultAssetKey + completedAt).

@@ -1,19 +1,22 @@
 import { describe, it, expect } from "vitest";
 import { ProviderHttpError, retryUnlessPermanent } from "./errors";
 import {
+  decodeDataUri,
   downloadBytes,
   fetchAssetBytes,
-  getVideoContentUrls,
   getVideoJob,
+  parseAudioStream,
   requestImage,
   requestSpeech,
   submitVideoJob,
+  wavFromPcm16,
 } from "./media-client";
 
-// Media generation is direct `fetch` (NOT the AI SDK): TTS is a raw byte-stream
-// response, video is an async job + poll + unsigned-URL download. These primitives
-// are the reusable pieces the #33/#34 workflows wrap in DBOS steps (durable polling
-// sleeps live there, not here). Injected fetch, hand-built Responses.
+// Media generation is direct `fetch` (NOT the AI SDK). The contracts below are the REAL
+// OpenRouter shapes confirmed live in task 34-E4 (expanded scope): image via non-streaming
+// chat-completions `modalities:["image"]` (inline base64 data URI), audio via STREAMING
+// chat-completions `modalities:["text","audio"]` (SSE `delta.audio.data` PCM16 → WAV), and video
+// content via the poll body's `unsigned_urls` (downloaded WITH the bearer). Injected fetch.
 
 const CFG = {
   openrouterBaseUrl: "https://openrouter.ai",
@@ -45,110 +48,187 @@ function recorder(handler: (req: Req) => Response): {
   return { reqs, fetch: fetchImpl };
 }
 
-describe("requestSpeech (TTS raw byte stream)", () => {
-  it("returns the raw audio bytes + generation id from a non-JSON audio/mpeg body", async () => {
-    const audio = Buffer.from([0xff, 0xfb, 0x90, 0x64, 0x01, 0x02]);
+/** Build an OpenRouter chat-completions audio SSE stream from base64 PCM16 chunks. */
+function audioSse(
+  chunks: string[],
+  opts: { id?: string } = {},
+): string {
+  const lines: string[] = [": OPENROUTER PROCESSING", ""];
+  chunks.forEach((data, i) => {
+    const audio: Record<string, unknown> = { data };
+    if (i === 0 && opts.id) audio.id = opts.id;
+    lines.push(
+      `data: ${JSON.stringify({ choices: [{ delta: { audio } }] })}`,
+      "",
+    );
+  });
+  lines.push("data: [DONE]", "");
+  return lines.join("\n");
+}
+
+describe("decodeDataUri", () => {
+  it("decodes a base64 data URI to bytes + content type", () => {
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const uri = `data:image/png;base64,${bytes.toString("base64")}`;
+    const out = decodeDataUri(uri);
+    expect(out.contentType).toBe("image/png");
+    expect(out.bytes.equals(bytes)).toBe(true);
+  });
+
+  it("throws a 502 on a non-base64 data URI", () => {
+    const err = (() => {
+      try {
+        decodeDataUri("data:image/png,rawtext");
+        return null;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(err).toBeInstanceOf(ProviderHttpError);
+  });
+});
+
+describe("wavFromPcm16", () => {
+  it("prepends a valid 44-byte RIFF/WAVE header around the PCM data", () => {
+    const pcm = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    const wav = wavFromPcm16(pcm, { sampleRate: 24000, channels: 1 });
+    expect(wav.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    expect(wav.subarray(8, 12).toString("ascii")).toBe("WAVE");
+    expect(wav.subarray(36, 40).toString("ascii")).toBe("data");
+    expect(wav.readUInt32LE(40)).toBe(pcm.length);
+    expect(wav.readUInt32LE(24)).toBe(24000); // sample rate
+    expect(wav.subarray(44).equals(pcm)).toBe(true);
+  });
+});
+
+describe("parseAudioStream", () => {
+  it("concatenates base64 PCM16 deltas (decoded independently) and captures the id", () => {
+    const a = Buffer.from([0x01, 0x02]);
+    const b = Buffer.from([0x03, 0x04, 0x05]);
+    const sse = audioSse([a.toString("base64"), b.toString("base64")], { id: "gen_7" });
+    const { pcm, generationId } = parseAudioStream(sse);
+    expect(pcm.equals(Buffer.concat([a, b]))).toBe(true);
+    expect(generationId).toBe("gen_7");
+  });
+
+  it("ignores comment lines, blank data, and [DONE]", () => {
+    const { pcm } = parseAudioStream(": keep-alive\n\ndata: [DONE]\n");
+    expect(pcm.length).toBe(0);
+  });
+});
+
+describe("requestSpeech (streaming chat-audio → WAV)", () => {
+  it("POSTs chat/completions with modalities audio + stream + pcm16 and returns WAV bytes", async () => {
+    const pcm = Buffer.from([0x10, 0x11, 0x12, 0x13]);
     const rec = recorder(
       () =>
-        new Response(audio, {
+        new Response(audioSse([pcm.toString("base64")], { id: "gen_9" }), {
           status: 200,
-          headers: {
-            "content-type": "audio/mpeg",
-            "x-generation-id": "gen_stub_7",
-          },
+          headers: { "content-type": "text/event-stream" },
         }),
     );
     const result = await requestSpeech(
       { ...CFG, fetchImpl: rec.fetch },
-      { modelId: "resolved/speech-model", input: "In the beginning" },
+      { modelId: "openai/gpt-audio-mini", input: "In the beginning", voice: "alloy" },
     );
-    expect(Buffer.isBuffer(result.bytes)).toBe(true);
-    expect(result.bytes.equals(audio)).toBe(true);
-    expect(result.generationId).toBe("gen_stub_7");
+    expect(result.contentType).toBe("audio/wav");
+    expect(result.generationId).toBe("gen_9");
+    expect(result.bytes.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    expect(result.bytes.subarray(44).equals(pcm)).toBe(true);
 
     const req = rec.reqs[0];
-    expect(req.url).toBe("https://openrouter.ai/api/v1/audio/speech");
+    expect(req.url).toBe("https://openrouter.ai/api/v1/chat/completions");
     expect(req.method).toBe("POST");
     expect(req.headers.get("authorization")).toBe("Bearer sk-or-test");
-    expect(JSON.parse(req.body).model).toBe("resolved/speech-model");
+    const body = JSON.parse(req.body);
+    expect(body.model).toBe("openai/gpt-audio-mini");
+    expect(body.stream).toBe(true);
+    expect(body.modalities).toEqual(["text", "audio"]);
+    expect(body.audio).toEqual({ voice: "alloy", format: "pcm16" });
+    expect(body.messages[0].content).toBe("In the beginning");
+  });
+
+  it("omits voice for music (no voice arg)", async () => {
+    const pcm = Buffer.from([0x20, 0x21]);
+    const rec = recorder(
+      () => new Response(audioSse([pcm.toString("base64")]), { status: 200 }),
+    );
+    await requestSpeech(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "google/lyria-3-clip-preview", input: "cinematic strings" },
+    );
+    expect(JSON.parse(rec.reqs[0].body).audio).toEqual({ format: "pcm16" });
   });
 
   it("surfaces a non-2xx as a ProviderHttpError", async () => {
     const rec = recorder(() => new Response("nope", { status: 500 }));
     await expect(
-      requestSpeech(
-        { ...CFG, fetchImpl: rec.fetch },
-        { modelId: "m", input: "x" },
-      ),
+      requestSpeech({ ...CFG, fetchImpl: rec.fetch }, { modelId: "m", input: "x" }),
     ).rejects.toBeInstanceOf(ProviderHttpError);
   });
 
-  // §10.6 reclassification (task 34-E1): the mid-stream 503-then-200 retry that was proven
-  // only by the now-deleted generateAudio e2e ("failure mid-stream retries cleanly"). The
-  // media step delegates retry to DBOS runStep + MEDIA_RETRY; requestSpeech itself is a
-  // single-shot fetch that throws a transient ProviderHttpError on a 503. We reproduce the
-  // SEQUENCE at the call-function level: the first call throws (classified retryable), the
-  // re-invocation against the 200 returns the audio bytes cleanly — no DBOS needed.
-  it("503-then-200: throws a retryable ProviderHttpError on the 503, then returns the mp3 bytes on the re-invoked 200", async () => {
-    const audio = Buffer.from([0xff, 0xfb, 0x90, 0x64, 0x01, 0x02]);
+  it("throws a 502 when a 200 stream carries no audio deltas", async () => {
+    const rec = recorder(() => new Response("data: [DONE]\n", { status: 200 }));
+    const err = await requestSpeech(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "m", input: "x" },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderHttpError);
+    expect((err as ProviderHttpError).status).toBe(502);
+  });
+
+  it("503-then-200: retryable ProviderHttpError on the 503, then WAV bytes on the re-invoked 200", async () => {
+    const pcm = Buffer.from([0x30, 0x31, 0x32]);
     const queue: Array<() => Response> = [
       () => new Response("busy", { status: 503 }),
-      () =>
-        new Response(audio, {
-          status: 200,
-          headers: { "content-type": "audio/mpeg", "x-generation-id": "gen_stub_7" },
-        }),
+      () => new Response(audioSse([pcm.toString("base64")], { id: "g" }), { status: 200 }),
     ];
     const rec = recorder(() => queue.shift()!());
-    const args = { modelId: "resolved/speech-model", input: "In the beginning" };
+    const args = { modelId: "openai/gpt-audio-mini", input: "hi", voice: "alloy" };
 
-    // Attempt 1 consumes the 503: transient ProviderHttpError the step retries.
-    const transient = await requestSpeech(
-      { ...CFG, fetchImpl: rec.fetch },
-      args,
-    ).catch((e) => e);
+    const transient = await requestSpeech({ ...CFG, fetchImpl: rec.fetch }, args).catch(
+      (e) => e,
+    );
     expect(transient).toBeInstanceOf(ProviderHttpError);
     expect((transient as ProviderHttpError).status).toBe(503);
     expect(retryUnlessPermanent(transient)).toBe(true);
 
-    // Attempt 2 (the runStep re-invocation) consumes the 200 and returns the bytes.
     const result = await requestSpeech({ ...CFG, fetchImpl: rec.fetch }, args);
-    expect(result.bytes.equals(audio)).toBe(true);
-    expect(result.generationId).toBe("gen_stub_7");
-
-    // The speech endpoint was hit exactly twice (503 → 200) — the e2e's `speechRequests===2`.
+    expect(result.bytes.subarray(44).equals(pcm)).toBe(true);
     expect(rec.reqs).toHaveLength(2);
   });
 });
 
-describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", () => {
-  it("POSTs /api/v1/images/generations with {model, prompt} + Bearer auth and parses data[0].url", async () => {
-    const rec = recorder(
-      () =>
-        new Response(
-          JSON.stringify({
-            created: 1700000000,
-            data: [{ url: "https://cdn.example/img/abc.png" }],
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        ),
+describe("requestImage (chat-completions modalities:['image'] → inline base64 bytes)", () => {
+  const okResponse = (dataUri: string) =>
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { images: [{ image_url: { url: dataUri } }] } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
     );
+
+  it("POSTs chat/completions with modalities image and decodes the data URI to bytes", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]);
+    const rec = recorder(() => okResponse(`data:image/png;base64,${png.toString("base64")}`));
     const result = await requestImage(
       { ...CFG, fetchImpl: rec.fetch },
-      { modelId: "resolved/image-model", prompt: "a serene sunrise over hills" },
+      { modelId: "x-ai/grok-imagine-image-quality", prompt: "a serene sunrise over hills" },
     );
-    expect(result.imageUrl).toBe("https://cdn.example/img/abc.png");
+    expect(result.contentType).toBe("image/png");
+    expect(result.bytes.equals(png)).toBe(true);
 
     const req = rec.reqs[0];
-    expect(req.url).toBe("https://openrouter.ai/api/v1/images/generations");
+    expect(req.url).toBe("https://openrouter.ai/api/v1/chat/completions");
     expect(req.method).toBe("POST");
     expect(req.headers.get("authorization")).toBe("Bearer sk-or-test");
     const body = JSON.parse(req.body);
-    expect(body.model).toBe("resolved/image-model");
-    expect(body.prompt).toBe("a serene sunrise over hills");
+    expect(body.model).toBe("x-ai/grok-imagine-image-quality");
+    expect(body.modalities).toEqual(["image"]);
+    expect(body.messages[0].content).toBe("a serene sunrise over hills");
   });
 
-  it("classifies a 503 as transient (ProviderHttpError → retryUnlessPermanent true)", async () => {
+  it("classifies a 503 as transient", async () => {
     const rec = recorder(() => new Response("busy", { status: 503 }));
     const err = await requestImage(
       { ...CFG, fetchImpl: rec.fetch },
@@ -159,8 +239,8 @@ describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", ()
     expect(retryUnlessPermanent(err)).toBe(true);
   });
 
-  it("classifies a 400 as permanent (ProviderHttpError → retryUnlessPermanent false)", async () => {
-    const rec = recorder(() => new Response("bad prompt", { status: 400 }));
+  it("classifies a 400 as permanent", async () => {
+    const rec = recorder(() => new Response("bad", { status: 400 }));
     const err = await requestImage(
       { ...CFG, fetchImpl: rec.fetch },
       { modelId: "m", prompt: "x" },
@@ -169,10 +249,10 @@ describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", ()
     expect(retryUnlessPermanent(err)).toBe(false);
   });
 
-  it("throws a 502 ProviderHttpError when a 200 body has no usable data[0].url", async () => {
+  it("throws a 502 when a 200 body carries no image", async () => {
     const rec = recorder(
       () =>
-        new Response(JSON.stringify({ created: 1700000000, data: [] }), {
+        new Response(JSON.stringify({ choices: [{ message: {} }] }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -186,15 +266,11 @@ describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", ()
   });
 });
 
-describe("fetchAssetBytes (Task #32 — download a pre-authorized asset URL, no auth header)", () => {
+describe("fetchAssetBytes (generic pre-authorized download — no auth header)", () => {
   it("GETs the URL with NO auth header and returns the bytes + content-type", async () => {
-    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     const rec = recorder(
-      () =>
-        new Response(png, {
-          status: 200,
-          headers: { "content-type": "image/png" },
-        }),
+      () => new Response(png, { status: 200, headers: { "content-type": "image/png" } }),
     );
     const { bytes, contentType } = await fetchAssetBytes(
       { ...CFG, fetchImpl: rec.fetch },
@@ -202,9 +278,7 @@ describe("fetchAssetBytes (Task #32 — download a pre-authorized asset URL, no 
     );
     expect(bytes.equals(png)).toBe(true);
     expect(contentType).toBe("image/png");
-    // A pre-authorized URL must not carry the provider bearer.
     expect(rec.reqs[0].headers.get("authorization")).toBeNull();
-    expect(rec.reqs[0].url).toBe("https://cdn.example/img/abc.png");
   });
 
   it("surfaces a non-2xx download as a ProviderHttpError", async () => {
@@ -218,7 +292,7 @@ describe("fetchAssetBytes (Task #32 — download a pre-authorized asset URL, no 
 describe("submitVideoJob", () => {
   it("sends the Idempotency-Key header and parses the 202 job envelope", async () => {
     const rec = recorder(
-      (req) =>
+      () =>
         new Response(
           JSON.stringify({
             id: "vid_1",
@@ -230,20 +304,15 @@ describe("submitVideoJob", () => {
     );
     const job = await submitVideoJob(
       { ...CFG, fetchImpl: rec.fetch },
-      {
-        modelId: "resolved/video-model",
-        input: { prompt: "a dove" },
-        idempotencyKey: "job-abc",
-      },
+      { modelId: "resolved/video-model", input: { prompt: "a dove" }, idempotencyKey: "job-abc" },
     );
     expect(job).toEqual({
       id: "vid_1",
       pollingUrl: "https://openrouter.ai/api/v1/videos/vid_1",
       status: "pending",
     });
-    const req = rec.reqs[0];
-    expect(req.url).toBe("https://openrouter.ai/api/v1/videos");
-    expect(req.headers.get("idempotency-key")).toBe("job-abc");
+    expect(rec.reqs[0].url).toBe("https://openrouter.ai/api/v1/videos");
+    expect(rec.reqs[0].headers.get("idempotency-key")).toBe("job-abc");
   });
 
   it("surfaces a non-2xx submit as a ProviderHttpError", async () => {
@@ -257,8 +326,33 @@ describe("submitVideoJob", () => {
   });
 });
 
-describe("getVideoJob / getVideoContentUrls / downloadBytes", () => {
-  it("polls a job status by its polling URL", async () => {
+describe("getVideoJob (poll body carries unsigned_urls) / downloadBytes (authed)", () => {
+  it("polls a job status and surfaces unsigned_urls from the poll body", async () => {
+    const rec = recorder(
+      () =>
+        new Response(
+          JSON.stringify({
+            id: "vid_1",
+            status: "completed",
+            unsigned_urls: ["https://openrouter.ai/api/v1/videos/vid_1/content?index=0"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const status = await getVideoJob(
+      { ...CFG, fetchImpl: rec.fetch },
+      "https://openrouter.ai/api/v1/videos/vid_1",
+    );
+    expect(status).toEqual({
+      id: "vid_1",
+      status: "completed",
+      unsignedUrls: ["https://openrouter.ai/api/v1/videos/vid_1/content?index=0"],
+    });
+    expect(rec.reqs[0].url).toBe("https://openrouter.ai/api/v1/videos/vid_1");
+    expect(rec.reqs[0].headers.get("authorization")).toBe("Bearer sk-or-test");
+  });
+
+  it("returns [] for unsigned_urls while a job is still in progress", async () => {
     const rec = recorder(
       () =>
         new Response(JSON.stringify({ id: "vid_1", status: "in_progress" }), {
@@ -266,47 +360,20 @@ describe("getVideoJob / getVideoContentUrls / downloadBytes", () => {
           headers: { "content-type": "application/json" },
         }),
     );
-    const status = await getVideoJob(
-      { ...CFG, fetchImpl: rec.fetch },
-      "https://openrouter.ai/api/v1/videos/vid_1",
-    );
-    expect(status).toEqual({ id: "vid_1", status: "in_progress" });
-    expect(rec.reqs[0].url).toBe("https://openrouter.ai/api/v1/videos/vid_1");
+    const status = await getVideoJob({ ...CFG, fetchImpl: rec.fetch }, "https://x/vid_1");
+    expect(status).toEqual({ id: "vid_1", status: "in_progress", unsignedUrls: [] });
   });
 
-  it("reads the unsigned content URLs for a completed job", async () => {
-    const rec = recorder(
-      () =>
-        new Response(
-          JSON.stringify({
-            unsigned_urls: [
-              "https://openrouter.ai/api/v1/videos/vid_1/download?index=0",
-            ],
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        ),
-    );
-    const { unsignedUrls } = await getVideoContentUrls(
-      { ...CFG, fetchImpl: rec.fetch },
-      "vid_1",
-    );
-    expect(unsignedUrls).toEqual([
-      "https://openrouter.ai/api/v1/videos/vid_1/download?index=0",
-    ]);
-    expect(rec.reqs[0].url).toBe(
-      "https://openrouter.ai/api/v1/videos/vid_1/content?index=0",
-    );
-  });
-
-  it("downloads raw bytes from an unsigned URL", async () => {
+  it("downloadBytes GETs the content URL WITH the bearer (the URL requires auth)", async () => {
     const mp4 = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
     const rec = recorder(
       () => new Response(mp4, { status: 200, headers: { "content-type": "video/mp4" } }),
     );
     const bytes = await downloadBytes(
       { ...CFG, fetchImpl: rec.fetch },
-      "https://openrouter.ai/api/v1/videos/vid_1/download?index=0",
+      "https://openrouter.ai/api/v1/videos/vid_1/content?index=0",
     );
     expect(bytes.equals(mp4)).toBe(true);
+    expect(rec.reqs[0].headers.get("authorization")).toBe("Bearer sk-or-test");
   });
 });

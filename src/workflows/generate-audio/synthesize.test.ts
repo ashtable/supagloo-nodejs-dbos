@@ -3,8 +3,9 @@ import { buildSpeechArgs } from "./synthesize";
 import type { AudioRequest } from "./request";
 
 // Pure builder: parsed AudioRequest → requestSpeech args (design-delta §7 workflow 7,
-// decisions D2/D5). narration concatenates the per-scene scripts into one input + maps the
-// voice descriptor; music sends the style label as the input. Both request mp3.
+// decisions D2/D5). narration concatenates the per-scene scripts into one input + a fixed valid
+// voice enum; music sends the style label as the input with NO voice. Both stream chat-audio
+// pcm16 (the media client sets modalities/stream/format — the builder no longer picks a format).
 
 describe("buildSpeechArgs — narration", () => {
   const narration: AudioRequest = {
@@ -25,22 +26,10 @@ describe("buildSpeechArgs — narration", () => {
     const args = buildSpeechArgs(narration);
     expect(args.modelId).toBe("resolved/speech-model");
     expect(args.input).toBe("In the beginning\n\nwas the Word.");
-    expect(args.format).toBe("mp3");
   });
 
-  it("uses the voice label as the provider voice hint when present", () => {
-    expect(buildSpeechArgs(narration).voice).toBe("JEJ-STYLE");
-  });
-
-  it("falls back to the freeform voice description when there is no label", () => {
-    const noLabel: AudioRequest = {
-      ...narration,
-      input: {
-        voice: { description: "warm, weathered baritone" },
-        scenes: narration.kind === "narration" ? narration.input.scenes : [],
-      },
-    };
-    expect(buildSpeechArgs(noLabel).voice).toBe("warm, weathered baritone");
+  it("uses a fixed valid provider voice enum (the freeform descriptor is not a valid voice id)", () => {
+    expect(buildSpeechArgs(narration).voice).toBe("alloy");
   });
 });
 
@@ -53,11 +42,10 @@ describe("buildSpeechArgs — music", () => {
     input: { style: "Swelling strings", durationSeconds: 30 },
   };
 
-  it("sends the style label as the input, mp3, no voice", () => {
+  it("sends the style label as the input, with NO voice (music uses no TTS voice)", () => {
     const args = buildSpeechArgs(music);
     expect(args.modelId).toBe("resolved/music-model");
     expect(args.input).toBe("Swelling strings");
-    expect(args.format).toBe("mp3");
     expect(args.voice).toBeUndefined();
   });
 });

@@ -1,49 +1,57 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { DBOS, DBOSClient, type WorkflowHandle } from "@dbos-inc/dbos-sdk";
+import { DBOSClient } from "@dbos-inc/dbos-sdk";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
   type S3Client,
 } from "@aws-sdk/client-s3";
-import {
-  buildAssetKey,
-  createPrismaClient,
-  encryptSecret,
-} from "@supagloo/database-lib";
+import { buildAssetKey, createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
 import { makeInternalS3Client } from "../../src/files/s3-client";
 import {
-  __setGenerateVideoBoundaryHook,
-  type GenerateVideoPayload,
-  type GenerateVideoResult,
+  resolveGenerationSeedCreds,
+  seedOpenRouterConnection,
+  type GenerationSeedCreds,
+} from "../../src/testing/seed-connections";
+import {
+  resolveVideoModel,
+  type ResolvedVideoModel,
+} from "../../src/testing/e2e-models";
+import { countStepExecutions } from "../../src/testing/step-introspection";
+import type {
+  GenerateVideoPayload,
+  GenerateVideoResult,
 } from "../../src/workflows/generate-video";
 
-// End-to-end proof of generateVideoClipWorkflow against the REAL openrouter-stub async video-job
-// state machine + the REAL Compose MinIO (design-delta §7 workflow 8). DBOS is launched IN-PROCESS;
-// the stub serves POST /api/v1/videos (202 pending, idempotent on the Idempotency-Key), the poll
-// route driving pending → in_progress → completed, and the content/download routes serving fake MP4
-// bytes. The workflow submits, durably-sleeps between polls (interval dropped to 50ms via env), then
-// downloads + PUTs a real MP4 into MinIO under projects/{projectId}/assets/{generationId}. We read
+// End-to-end proof of generateVideoClipWorkflow against the REAL OpenRouter video-job host +
+// the REAL Compose MinIO (design-delta §7 workflow 8, §10.2/§10.3/§10.7/§10.9). DBOS is
+// launched IN-PROCESS; the workflow resolves a live video model, submits the async job,
+// durably-sleeps between real polls through pending → completed, downloads the content bytes,
+// and PUTs a real object into MinIO under projects/{projectId}/assets/{generationId}. We read
 // the object back from the HOST to prove the bytes landed.
 //
-// Two proofs: (1) happy path — clip completes into MinIO, one submit; (2) CRASH/REPLAY (the design's
-// flagship recovery case) — park the workflow at the FIRST poll boundary (after submit committed
-// providerJobId), cancel, resume → it completes exactly once and the stub's videoJobsCreated counter
-// STAYS 1 (the submit step is memoized on replay, never re-issued).
+// Real-provider seeding (§10.3): OpenRouter connection seeded via `seedOpenRouterConnection`
+// with the real OPENROUTER_E2E_TEST_API_KEY; model id resolved via discovery (§10.9). The
+// exactly-once-submit fact is proven structurally via the DBOS system-DB step count
+// (`submitVideoJob` executed once) — replacing the stub's videoJobsCreated counter (§10.7).
+// The asset assertion is "non-empty bytes in MinIO" (no FAKE_MP4 magic-byte literal), and the
+// provider job id is asserted to be a non-empty string (no `vid_` stub-prefix literal).
 //
-// The in-process worker reaches MinIO via S3_ENDPOINT=localhost:9000 (host-reachable). Infra ensured
-// by tests/e2e/global-setup.ts.
+// The separate CRASH/REPLAY proof (park at the first poll boundary → cancel → resume →
+// exactly-once submit across recovery) is DEFERRED to task 34-E7, which reworks it against the
+// real host using the shared system-DB step-introspection helper introduced here. It is a
+// visible `it.todo` below rather than a silently-broken stub-dependent block.
+//
+// Real video generation is minutes-long: the poll interval + attempt ceiling + test timeout
+// are set for a REAL job (not the sub-second stub cadence), and the input is minimized
+// (durationSeconds: 1) per the §10.9 cost mitigation.
 
-const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
 const S3_PUBLIC = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 const S3_BUCKET = process.env.S3_BUCKET ?? "supagloo-dev";
 const ENCRYPTION_KEY = "0".repeat(64);
-
-// MP4 magic (ftyp box) the stub serves as FAKE_MP4.
-const FAKE_MP4 = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
 
 const env: Env = loadEnv({
   DATABASE_URL:
@@ -56,7 +64,7 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
-  OPENROUTER_BASE_URL: OPENROUTER_STUB,
+  OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
   // S3: the in-process worker uploads against the HOST-reachable public endpoint.
   S3_ENDPOINT: S3_PUBLIC,
@@ -65,22 +73,19 @@ const env: Env = loadEnv({
   S3_ACCESS_KEY: process.env.S3_ACCESS_KEY ?? "supagloo",
   S3_SECRET_KEY: process.env.S3_SECRET_KEY ?? "supagloo-dev",
   S3_REGION: process.env.S3_REGION ?? "us-east-1",
-  // Tiny durable-sleep interval so the poll loop runs fast (prod default is 30s).
-  VIDEO_POLL_INTERVAL_SECONDS: "0.05",
+  // Real video jobs take minutes — poll every ~10s up to a ~10-minute ceiling (overridable).
+  VIDEO_POLL_INTERVAL_SECONDS: process.env.VIDEO_POLL_INTERVAL_SECONDS ?? "10",
+  VIDEO_MAX_POLL_ATTEMPTS: process.env.VIDEO_MAX_POLL_ATTEMPTS ?? "60",
 });
+
+// Generous ceiling for a real end-to-end video generation (submit + poll + download + upload).
+const VIDEO_TEST_TIMEOUT_MS = 600_000;
 
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
 let s3: S3Client;
-
-async function resetOpenRouter(): Promise<void> {
-  await fetch(`${OPENROUTER_STUB}/__stub/reset`, { method: "POST" });
-}
-
-async function stubState(): Promise<Record<string, number>> {
-  const res = await fetch(`${OPENROUTER_STUB}/__stub/calls`);
-  return ((await res.json()) as { state: Record<string, number> }).state;
-}
+let creds: GenerationSeedCreds;
+let videoModel: ResolvedVideoModel;
 
 async function seedVideoGeneration(): Promise<{
   genId: string;
@@ -96,13 +101,11 @@ async function seedVideoGeneration(): Promise<{
       avatarInitials: "VE",
     },
   });
-  await prisma.openRouterConnection.create({
-    data: {
-      userId: user.id,
-      apiKeyCiphertext: encryptSecret("sk-or-test-key", ENCRYPTION_KEY),
-      keyLast4: "tkey",
-      status: "connected",
-    },
+  await seedOpenRouterConnection({
+    prisma,
+    userId: user.id,
+    apiKey: creds.openrouterKey,
+    encryptionKey: ENCRYPTION_KEY,
   });
   const project = await prisma.project.create({
     data: {
@@ -124,9 +127,15 @@ async function seedVideoGeneration(): Promise<{
       projectId: project.id,
       kind: "video",
       provider: "openrouter",
-      model: "stub/video-model",
+      model: videoModel.id,
       status: "queued",
-      input: { prompt: "a dove descends over still water", durationSeconds: 6, aspectRatio: "9:16" },
+      // Prompt + the model's SMALLEST supported duration only (§10.9 cost mitigation). No
+      // aspectRatio: it is not a universal video-submit param on real OpenRouter (e.g. grok
+      // reports supported_aspect_ratios: null), and an unsupported param risks a 400.
+      input: {
+        prompt: "a dove descends over still water",
+        durationSeconds: videoModel.minDurationSeconds,
+      },
     },
   });
   return { genId, projectId: project.id, payload: { generationId: genId } };
@@ -138,37 +147,8 @@ async function readObject(key: string): Promise<Buffer> {
   return Buffer.from(bytes);
 }
 
-async function deleteObject(key: string): Promise<void> {
-  await s3
-    .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }))
-    .catch(() => {});
-}
-
-async function enqueueVideo(
-  genId: string,
-  payload: GenerateVideoPayload,
-): Promise<WorkflowHandle<GenerateVideoResult>> {
-  return client.enqueue<GenerateVideoResult>(
-    {
-      workflowName: WORKFLOW_NAMES.generateVideo,
-      queueName: WORKFLOW_QUEUE.generateVideo,
-      workflowID: genId,
-    },
-    payload,
-  );
-}
-
-async function waitForStatus(id: string, statuses: string[]): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    const [wf] = await DBOS.listWorkflows({ workflowIDs: [id] });
-    if (wf && statuses.includes(wf.status)) return;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`workflow ${id} did not reach ${statuses.join("/")} in time`);
-}
-
 beforeAll(async () => {
+  creds = resolveGenerationSeedCreds();
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
   s3 = makeInternalS3Client({
@@ -178,111 +158,64 @@ beforeAll(async () => {
     accessKey: env.S3_ACCESS_KEY,
     secretKey: env.S3_SECRET_KEY,
   });
+  videoModel = await resolveVideoModel(env);
 }, 120_000);
 
 afterAll(async () => {
-  __setGenerateVideoBoundaryHook(undefined);
   s3?.destroy();
   await client?.destroy().catch(() => {});
   await shutdownDbos();
   await prisma.$disconnect().catch(() => {});
 });
 
-beforeEach(async () => {
-  __setGenerateVideoBoundaryHook(undefined);
-  await resetOpenRouter();
-});
-
 describe("generateVideoClipWorkflow — lands a real mp4 in MinIO", () => {
-  it("submits, polls to completion, downloads + uploads the mp4, records providerJobId + resultAssetKey", async () => {
-    const { genId, projectId, payload } = await seedVideoGeneration();
+  it(
+    "submits, polls to completion, downloads + uploads the clip, records providerJobId + resultAssetKey",
+    async () => {
+      const { genId, projectId, payload } = await seedVideoGeneration();
 
-    const handle = await enqueueVideo(genId, payload);
-    const result = (await handle.getResult()) as GenerateVideoResult;
-    expect(result.generationId).toBe(genId);
-    expect(result.providerJobId).toMatch(/^vid_/);
+      const handle = await client.enqueue<GenerateVideoResult>(
+        {
+          workflowName: WORKFLOW_NAMES.generateVideo,
+          queueName: WORKFLOW_QUEUE.generateVideo,
+          workflowID: genId,
+        },
+        payload,
+      );
+      const result = (await handle.getResult()) as GenerateVideoResult;
+      expect(result.generationId).toBe(genId);
+      expect(typeof result.providerJobId).toBe("string");
+      expect(result.providerJobId.length).toBeGreaterThan(0);
 
-    const expectedKey = buildAssetKey(projectId, genId);
-    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(row.status).toBe("succeeded");
-    expect(row.completedAt).toBeInstanceOf(Date);
-    // providerJobId was persisted (replay-safety column, design §2.8).
-    expect(row.providerJobId).toMatch(/^vid_/);
-    expect(row.resultAssetKey).toBe(expectedKey);
-    expect(row.resultJson).toMatchObject({ kind: "video", providerJobId: row.providerJobId });
+      const expectedKey = buildAssetKey(projectId, genId);
+      const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
+      expect(row.status).toBe("succeeded");
+      expect(row.completedAt).toBeInstanceOf(Date);
+      // providerJobId was persisted (replay-safety column, design §2.8) — non-empty, no stub prefix.
+      expect(row.providerJobId).toBe(result.providerJobId);
+      expect(row.resultAssetKey).toBe(expectedKey);
+      expect(row.resultJson).toMatchObject({ kind: "video", providerJobId: row.providerJobId });
 
-    // Exactly one video job was created (happy path, no retry/re-submit).
-    expect((await stubState()).videoJobsCreated).toBe(1);
+      // Exactly one video job was submitted (happy path) — proven structurally via the DBOS
+      // system-DB step count (replaces the stub's videoJobsCreated counter, §10.7).
+      expect(await countStepExecutions(client, genId, "submitVideoJob")).toBe(1);
 
-    // A REAL mp4 object exists in MinIO at the asset key, with the stub's FAKE_MP4 bytes.
-    const bytes = await readObject(expectedKey);
-    expect(bytes.subarray(0, 8)).toEqual(FAKE_MP4);
+      // A REAL mp4 object exists in MinIO at the asset key, with non-empty provider bytes.
+      const bytes = await readObject(expectedKey);
+      expect(bytes.length).toBeGreaterThan(0);
 
-    await deleteObject(expectedKey);
-  }, 120_000);
+      await s3
+        .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: expectedKey }))
+        .catch(() => {});
+    },
+    VIDEO_TEST_TIMEOUT_MS,
+  );
 });
 
 describe("generateVideoClipWorkflow — crash / replay (the flagship recovery case)", () => {
-  it("cancels between submit and completion, resumes to completion, and NEVER re-submits (videoJobsCreated stays 1)", async () => {
-    const { genId, projectId, payload } = await seedVideoGeneration();
-
-    // Park at the FIRST poll boundary — after submitVideoJob has checkpointed + persisted
-    // providerJobId, before any poll reaches `completed`.
-    let release!: () => void;
-    let parked = false;
-    const reached = new Promise<void>((resolve) => {
-      __setGenerateVideoBoundaryHook(async (label) => {
-        if (label === "pollVideoJob" && !parked) {
-          parked = true;
-          resolve();
-          await new Promise<void>((r) => {
-            release = r;
-          });
-        }
-      });
-    });
-
-    const handle = await enqueueVideo(genId, payload);
-    const settled = handle.getResult().then(
-      () => "ok",
-      () => "interrupted",
-    );
-
-    await reached;
-    // The submit step already committed the provider job id before we reached the poll boundary.
-    const parkedRow = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(parkedRow.providerJobId).toMatch(/^vid_/);
-    const submittedJobId = parkedRow.providerJobId;
-    expect((await stubState()).videoJobsCreated).toBe(1);
-
-    // Cancel preempts at the NEXT DBOS call (the poll runStep never executes on this attempt).
-    await DBOS.cancelWorkflow(genId);
-    release();
-    await settled; // the cancelled run has fully unwound
-
-    // Recover: resume from the last completed step (submitVideoJob). The submit is MEMOIZED, so it
-    // is NOT re-issued — videoJobsCreated must stay 1.
-    __setGenerateVideoBoundaryHook(undefined);
-    await waitForStatus(genId, ["CANCELLED", "ERROR"]);
-    const resumeHandle = await DBOS.resumeWorkflow<GenerateVideoResult>(genId);
-    const result = (await resumeHandle.getResult()) as GenerateVideoResult;
-    expect(result.generationId).toBe(genId);
-    // Same job id as before the crash — polling RESUMED the existing job, did not start a new one.
-    expect(result.providerJobId).toBe(submittedJobId);
-
-    const expectedKey = buildAssetKey(projectId, genId);
-    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(row.status).toBe("succeeded");
-    expect(row.providerJobId).toBe(submittedJobId);
-    expect(row.resultAssetKey).toBe(expectedKey);
-
-    // THE flagship assertion: exactly-once submit across the crash/replay.
-    expect((await stubState()).videoJobsCreated).toBe(1);
-
-    // The mp4 still landed in MinIO.
-    const bytes = await readObject(expectedKey);
-    expect(bytes.subarray(0, 8)).toEqual(FAKE_MP4);
-
-    await deleteObject(expectedKey);
-  }, 120_000);
+  // Reworked in 34-E7: the crash/replay proof (park at the first poll boundary → cancel →
+  // resume → exactly-once submit across recovery, asserted via the shared system-DB
+  // step-introspection helper introduced in THIS task) is 34-E7's scope per plan.md. The old
+  // body depended on the openrouter-stub's /__stub introspection, which is removed here.
+  it.todo("cancels between submit and completion, resumes, and NEVER re-submits — reworked in 34-E7");
 });

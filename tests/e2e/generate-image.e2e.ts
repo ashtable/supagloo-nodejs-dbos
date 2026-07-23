@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { DBOSClient } from "@dbos-inc/dbos-sdk";
 import {
@@ -6,32 +6,40 @@ import {
   GetObjectCommand,
   type S3Client,
 } from "@aws-sdk/client-s3";
-import {
-  buildAssetKey,
-  createPrismaClient,
-  encryptSecret,
-} from "@supagloo/database-lib";
+import { buildAssetKey, createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
 import { makeInternalS3Client } from "../../src/files/s3-client";
+import {
+  resolveGenerationSeedCreds,
+  seedOpenRouterConnection,
+  type GenerationSeedCreds,
+} from "../../src/testing/seed-connections";
+import { resolveImageModel } from "../../src/testing/e2e-models";
+import { countStepExecutions } from "../../src/testing/step-introspection";
 import type {
   GenerateImagePayload,
   GenerateImageResult,
 } from "../../src/workflows/generate-image";
 
-// End-to-end proof of generateImageWorkflow against the REAL provider-stub harness +
-// the REAL Compose MinIO (design-delta §7 workflow 6). DBOS is launched IN-PROCESS; the
-// openrouter-stub (:4802) serves POST /api/v1/images/generations (→ a download URL) and
-// the image bytes; the workflow downloads them and PUTs a real object into MinIO under
-// projects/{projectId}/assets/{generationId}. We then read the object back from the HOST
-// to prove the bytes landed. This is the FIRST real S3 write in the codebase.
+// End-to-end proof of generateImageWorkflow against the REAL OpenRouter host + the REAL
+// Compose MinIO (design-delta §7 workflow 6, §10.2/§10.3/§10.7/§10.9). DBOS is launched
+// IN-PROCESS; the workflow resolves a live image model, calls real OpenRouter, downloads the
+// bytes, and PUTs a real object into MinIO under projects/{projectId}/assets/{generationId}.
+// We read the object back from the HOST to prove the bytes landed.
 //
-// The in-process worker reaches MinIO via S3_ENDPOINT=localhost:9000 (host-reachable) —
-// NOT the container-network minio:9000. Infra ensured by tests/e2e/global-setup.ts
-// (reuse-or-spawn: postgres + stubs + minio/minio-init).
+// Real-provider seeding (§10.3): the OpenRouter connection is seeded via
+// `seedOpenRouterConnection` with the real OPENROUTER_E2E_TEST_API_KEY (no fabricated
+// ciphertext). The model id is resolved at run time via discovery (§10.9 — never hardcoded).
+// No stub URL, no /__stub introspection, no fabricated magic-byte literals: the "exactly one
+// provider call" fact is now proven structurally via the DBOS system-DB step count, and the
+// asset assertion is "non-empty bytes in MinIO".
+//
+// The in-process worker reaches MinIO via S3_ENDPOINT=localhost:9000 (host-reachable). Infra
+// ensured by tests/e2e/global-setup.ts. Requires the real e2e secrets in the environment
+// (e.g. `set -a; . ./.env; set +a`).
 
-const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
 const S3_PUBLIC = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 const S3_BUCKET = process.env.S3_BUCKET ?? "supagloo-dev";
 const ENCRYPTION_KEY = "0".repeat(64);
@@ -47,10 +55,10 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
-  OPENROUTER_BASE_URL: OPENROUTER_STUB,
+  // Real OpenRouter host by default (env.ts default), honoring a sourced override.
+  OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
-  // S3: the in-process worker uploads against the HOST-reachable public endpoint
-  // (localhost:9000), not the container-network minio:9000.
+  // S3: the in-process worker uploads against the HOST-reachable public endpoint.
   S3_ENDPOINT: S3_PUBLIC,
   S3_PUBLIC_ENDPOINT: S3_PUBLIC,
   S3_BUCKET,
@@ -62,15 +70,8 @@ const env: Env = loadEnv({
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
 let s3: S3Client;
-
-async function resetOpenRouter(): Promise<void> {
-  await fetch(`${OPENROUTER_STUB}/__stub/reset`, { method: "POST" });
-}
-
-async function stubState(baseUrl: string): Promise<Record<string, number>> {
-  const res = await fetch(`${baseUrl}/__stub/calls`);
-  return ((await res.json()) as { state: Record<string, number> }).state;
-}
+let creds: GenerationSeedCreds;
+let imageModel: string;
 
 async function seedImageGeneration(): Promise<{
   genId: string;
@@ -86,13 +87,11 @@ async function seedImageGeneration(): Promise<{
       avatarInitials: "IE",
     },
   });
-  await prisma.openRouterConnection.create({
-    data: {
-      userId: user.id,
-      apiKeyCiphertext: encryptSecret("sk-or-test-key", ENCRYPTION_KEY),
-      keyLast4: "tkey",
-      status: "connected",
-    },
+  await seedOpenRouterConnection({
+    prisma,
+    userId: user.id,
+    apiKey: creds.openrouterKey,
+    encryptionKey: ENCRYPTION_KEY,
   });
   const project = await prisma.project.create({
     data: {
@@ -114,7 +113,7 @@ async function seedImageGeneration(): Promise<{
       projectId: project.id,
       kind: "image",
       provider: "openrouter",
-      model: "stub/image-model",
+      model: imageModel,
       status: "queued",
       input: { prompt: "a serene sunrise over hills, cinematic wide shot" },
     },
@@ -131,6 +130,8 @@ async function readObject(key: string): Promise<Buffer> {
 }
 
 beforeAll(async () => {
+  // Fail fast + loud if the real secrets are absent (§10.8) — never a silent skip.
+  creds = resolveGenerationSeedCreds();
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
   s3 = makeInternalS3Client({
@@ -140,6 +141,8 @@ beforeAll(async () => {
     accessKey: env.S3_ACCESS_KEY,
     secretKey: env.S3_SECRET_KEY,
   });
+  // Resolve a live image model id via discovery (§10.9 — never hardcoded).
+  imageModel = await resolveImageModel(env);
 }, 120_000);
 
 afterAll(async () => {
@@ -147,10 +150,6 @@ afterAll(async () => {
   await client?.destroy().catch(() => {});
   await shutdownDbos();
   await prisma.$disconnect().catch(() => {});
-});
-
-beforeEach(async () => {
-  await resetOpenRouter();
 });
 
 describe("generateImageWorkflow — lands a real object in MinIO", () => {
@@ -175,15 +174,14 @@ describe("generateImageWorkflow — lands a real object in MinIO", () => {
     expect(row.resultAssetKey).toBe(expectedKey);
     expect(row.resultJson).toBeNull();
 
-    // The image model was called exactly once (no repair loop, happy path).
-    const or = await stubState(OPENROUTER_STUB);
-    expect(or.imageRequests).toBe(1);
+    // The image model was called exactly once (happy path, no retry) — proven structurally
+    // via the DBOS system-DB step count (replaces the stub's imageRequests counter, §10.7).
+    expect(await countStepExecutions(client, genId, "callImageModel")).toBe(1);
 
-    // A REAL object exists in MinIO at the asset key, with the stub's PNG bytes.
+    // A REAL object exists in MinIO at the asset key, with non-empty provider bytes (no
+    // fabricated magic-byte literal — real provider output format is not asserted).
     const bytes = await readObject(expectedKey);
     expect(bytes.length).toBeGreaterThan(0);
-    // PNG magic number.
-    expect(bytes.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
 
     await s3
       .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: expectedKey }))
