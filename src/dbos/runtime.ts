@@ -13,6 +13,10 @@ import {
 } from "../providers/config";
 import { clearS3Config, setS3Config } from "../files/s3-config";
 import { makeInternalS3Client } from "../files/s3-client";
+import {
+  clearVideoPollConfig,
+  setVideoPollConfig,
+} from "../workflows/generate-video/config";
 // Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
@@ -23,6 +27,7 @@ import "../workflows/publish-version";
 import "../workflows/generate-script";
 import "../workflows/generate-image";
 import "../workflows/generate-audio";
+import "../workflows/generate-video";
 
 let appDb: PrismaClient | undefined;
 
@@ -82,6 +87,14 @@ export async function launchDbos(env: Env): Promise<void> {
     bucket: env.S3_BUCKET,
   });
 
+  // Inject the generateVideo poll config (task #34): the durable-sleep interval (~30s in prod,
+  // tiny in the e2e) + the bounded-loop ceiling. The workflow's poll loop reads getVideoPollConfig()
+  // — never process.env — so the sleep cadence is deterministic across replay.
+  setVideoPollConfig({
+    pollIntervalMs: Math.round(env.VIDEO_POLL_INTERVAL_SECONDS * 1000),
+    maxPollAttempts: env.VIDEO_MAX_POLL_ATTEMPTS,
+  });
+
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
@@ -100,6 +113,7 @@ export async function shutdownDbos(): Promise<void> {
   clearScaffoldConfig();
   clearProviderConfig();
   clearS3Config();
+  clearVideoPollConfig();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;
