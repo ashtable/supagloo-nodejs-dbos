@@ -127,6 +127,21 @@ export const envSchema = z.object({
   S3_ACCESS_KEY: z.string().min(1),
   S3_SECRET_KEY: z.string().min(1),
   S3_REGION: z.string().min(1).default("us-east-1"),
+
+  // Task #34 generateVideo poll tuning (design-delta §7 workflow 8, D4). The durable-sleep
+  // interval between video-job polls (design "~30s") and the bounded-loop attempt ceiling
+  // (40 × 30s = a 20-minute ceiling). Real defaults ⇒ prod needs zero config; the e2e drops the
+  // interval to a fraction of a second (via env) so the poll loop runs fast. Coerced so a string
+  // env var ("0.05", "40") parses to a number; both must be positive.
+  VIDEO_POLL_INTERVAL_SECONDS: z.coerce
+    .number()
+    .positive("VIDEO_POLL_INTERVAL_SECONDS must be a positive number of seconds")
+    .default(30),
+  VIDEO_MAX_POLL_ATTEMPTS: z.coerce
+    .number()
+    .int("VIDEO_MAX_POLL_ATTEMPTS must be a positive integer")
+    .positive("VIDEO_MAX_POLL_ATTEMPTS must be a positive integer")
+    .default(40),
 });
 
 export type Env = z.infer<typeof envSchema>;

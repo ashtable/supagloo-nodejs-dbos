@@ -4,6 +4,7 @@ import {
   GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
   GENERATE_SCRIPT_WORKFLOW_NAME,
+  GENERATE_VIDEO_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
@@ -77,6 +78,10 @@ export const WORKFLOW_NAMES = {
   // workflow, both audio kinds. Same shared-constant discipline — the API enqueues to this
   // name on the ai-generation queue.
   generateAudio: GENERATE_AUDIO_WORKFLOW_NAME,
+  // Task #34: the async video-job workflow (openrouter-only). Submit → durable-sleep poll →
+  // download → upload. Same shared-constant discipline — the API enqueues to this name on the
+  // ai-generation queue. This is the LAST AI-generation kind wired.
+  generateVideo: GENERATE_VIDEO_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -103,4 +108,6 @@ export const WORKFLOW_QUEUE = {
   generateImage: AI_GENERATION_QUEUE_NAME,
   // generateAudio (task 33) rides the same ai-generation queue.
   generateAudio: AI_GENERATION_QUEUE_NAME,
+  // generateVideo (task 34) rides the same ai-generation queue.
+  generateVideo: AI_GENERATION_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;
