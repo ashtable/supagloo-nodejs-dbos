@@ -60,7 +60,7 @@ export interface GenerationSeedCreds {
 }
 
 /**
- * Resolve the three real provider credentials from the environment, failing FAST with an
+ * Resolve the four real provider credentials from the environment, failing FAST with an
  * actionable message naming any missing/empty var (empty/whitespace === missing). Pure +
  * env-injectable for unit testing. These vars are NOT part of the validated `Env` schema —
  * read directly (api-side precedent).
