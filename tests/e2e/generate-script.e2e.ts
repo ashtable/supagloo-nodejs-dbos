@@ -3,11 +3,16 @@ import { randomUUID } from "node:crypto";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import {
   createPrismaClient,
+  GeneratedScriptSchema,
   GeneratedStoryboardSchema,
 } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
+import {
+  getProviderConfig,
+  setProviderConfig,
+} from "../../src/providers/config";
 import {
   resolveGenerationSeedCreds,
   seedOpenRouterConnection,
@@ -56,6 +61,10 @@ const env: Env = loadEnv({
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
   OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
+  // Task 34-E5: the passage-kind case hits the LIVE YouVersion host — thread the real app key
+  // through so launchDbos → setProviderConfig carries it. YOUVERSION_BASE_URL is deliberately
+  // NOT passed, so it defaults to the real https://api.youversion.com (never the stub).
+  YOUVERSION_APP_KEY: process.env.YOUVERSION_APP_KEY,
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
@@ -104,6 +113,50 @@ async function seedStoryboardGeneration(): Promise<{
     },
   });
   return { genId, payload: { generationId: genId } };
+}
+
+/**
+ * Seed a passage-kind (`script`) generation whose input carries a `scripture` block, so the
+ * workflow runs `fetchScripturePassage` against the LIVE YouVersion host (task 34-E5). Uses
+ * BSB (in the live English collection) + a USFM reference (what the live API requires).
+ */
+async function seedScriptureGeneration(): Promise<{
+  genId: string;
+  userId: string;
+  payload: GenerateScriptPayload;
+}> {
+  const suffix = randomUUID().slice(0, 8);
+  const user = await prisma.user.create({
+    data: {
+      youversionUserId: `yv-scr-${suffix}`,
+      displayName: "Scripture E2E",
+      email: `scr-${suffix}@supagloo.test`,
+      avatarInitials: "SE",
+    },
+  });
+  await seedOpenRouterConnection({
+    prisma,
+    userId: user.id,
+    apiKey: creds.openrouterKey,
+    encryptionKey: ENCRYPTION_KEY,
+  });
+  const genId = `gen-scr-${suffix}`;
+  await prisma.aiGeneration.create({
+    data: {
+      id: genId,
+      userId: user.id,
+      kind: "script",
+      provider: "openrouter",
+      model: textModel,
+      status: "queued",
+      input: {
+        brief: "Write the single-scene narration for this verse of hope.",
+        // Drives the optional fetchScripturePassage step against the live YouVersion host.
+        scripture: { reference: "JHN.3.16", translation: "BSB", language: "eng" },
+      },
+    },
+  });
+  return { genId, userId: user.id, payload: { generationId: genId } };
 }
 
 async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
@@ -187,4 +240,68 @@ describe("generateScriptWorkflow — crash / replay after the successful LLM cal
     const parsed = GeneratedStoryboardSchema.safeParse(row.resultJson);
     expect(parsed.success).toBe(true);
   }, 150_000);
+});
+
+// Task 34-E5 (design-delta §10.4a): the passage-fetch path, flipped to the LIVE YouVersion Data
+// Exchange host (server-to-server x-yvp-app-key auth — no interactive login). Proves (1) a
+// passage-kind generation runs to completion with verse text fetched live, and (2) a wrong app
+// key fails DETERMINISTICALLY. YOUVERSION_BASE_URL defaults to the real host (never the stub).
+describe("generateScriptWorkflow — passage fetch against the LIVE YouVersion host", () => {
+  it("runs a passage-kind script generation to completion with verse text fetched live", async () => {
+    const { genId, payload } = await seedScriptureGeneration();
+
+    const handle = await client.enqueue<GenerateScriptResult>(
+      {
+        workflowName: WORKFLOW_NAMES.generateScript,
+        queueName: WORKFLOW_QUEUE.generateScript,
+        workflowID: genId,
+      },
+      payload,
+    );
+    await handle.getResult();
+
+    // The live YouVersion passage fetch ran exactly once (a live 4xx would have thrown in the
+    // step and failed the generation) — the honest, non-flaky proof the real host served a
+    // passage. Then the LLM produced a schema-valid single-scene script.
+    const passageSteps = await countStepExecutions(client, genId, "fetchScripturePassage");
+    expect(passageSteps).toBe(1);
+
+    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
+    expect(row.status).toBe("succeeded");
+    expect(GeneratedScriptSchema.safeParse(row.resultJson).success).toBe(true);
+  }, 150_000);
+
+  it("fails deterministically when the YouVersion app key is missing/wrong", async () => {
+    const { genId, payload } = await seedScriptureGeneration();
+
+    // Simulate a misconfigured app key by overriding the process provider config (restored in
+    // finally). The fetchScripturePassage step reads getProviderConfig() at execution time, so
+    // the bad key lands on both the collection call (swallowed → KJV/BSB fallback) AND the
+    // passage fetch, which the live host 401s → a permanent ProviderHttpError → fail-fast.
+    const good = getProviderConfig();
+    setProviderConfig({
+      ...good,
+      youversionAppKey: "deadbeef-not-a-real-yvp-app-key-000000000000",
+    });
+    try {
+      const handle = await client.enqueue<GenerateScriptResult>(
+        {
+          workflowName: WORKFLOW_NAMES.generateScript,
+          queueName: WORKFLOW_QUEUE.generateScript,
+          workflowID: genId,
+        },
+        payload,
+      );
+      // The workflow throws (permanent) and marks the row failed BEFORE rethrowing.
+      await expect(handle.getResult()).rejects.toBeDefined();
+
+      const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
+      expect(row.status).toBe("failed");
+      // Deterministic: it failed at the YouVersion step, so the LLM step never ran.
+      const llmSteps = await countStepExecutions(client, genId, "callLlmStructured");
+      expect(llmSteps).toBe(0);
+    } finally {
+      setProviderConfig(good);
+    }
+  }, 60_000);
 });
