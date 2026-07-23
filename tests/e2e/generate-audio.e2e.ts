@@ -168,7 +168,7 @@ afterAll(async () => {
   await prisma.$disconnect().catch(() => {});
 });
 
-describe("generateAudioWorkflow — lands a real mp3 in MinIO", () => {
+describe("generateAudioWorkflow — lands a real wav in MinIO", () => {
   it("narration: synthesizes the combined script, uploads audio to projects/{id}/assets/{genId}, records resultAssetKey", async () => {
     const { genId, projectId, payload } = await seedAudioGeneration("narration");
 

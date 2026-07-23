@@ -8,8 +8,9 @@ const toJson = (v: unknown): Prisma.InputJsonValue => v as unknown as Prisma.Inp
 /**
  * The `AiGeneration` status/result writes for the audio workflow (design-delta §7 workflow 7).
  * This workflow ONLY touches the `AiGeneration` row — status lifecycle + `resultAssetKey`
- * (the S3 key of the uploaded mp3) + a small `resultJson` metadata blob holding the provider's
- * `X-Generation-Id` (decision D6: traceability without a new column). It NEVER writes
+ * (the S3 key of the uploaded WAV audio) + a small `resultJson` metadata blob holding the
+ * provider generation id (parsed from the SSE `delta.audio.id` field — decision D6: traceability
+ * without a new column). It NEVER writes
  * `ProjectVersion` or the manifest. All writes are idempotent (keyed by the generation id =
  * workflow id) so DBOS replay is safe. `providerJobId` is left null (no async-job pattern for
  * audio, unlike video).
