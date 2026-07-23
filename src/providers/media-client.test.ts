@@ -82,6 +82,43 @@ describe("requestSpeech (TTS raw byte stream)", () => {
       ),
     ).rejects.toBeInstanceOf(ProviderHttpError);
   });
+
+  // §10.6 reclassification (task 34-E1): the mid-stream 503-then-200 retry that was proven
+  // only by the now-deleted generateAudio e2e ("failure mid-stream retries cleanly"). The
+  // media step delegates retry to DBOS runStep + MEDIA_RETRY; requestSpeech itself is a
+  // single-shot fetch that throws a transient ProviderHttpError on a 503. We reproduce the
+  // SEQUENCE at the call-function level: the first call throws (classified retryable), the
+  // re-invocation against the 200 returns the audio bytes cleanly — no DBOS needed.
+  it("503-then-200: throws a retryable ProviderHttpError on the 503, then returns the mp3 bytes on the re-invoked 200", async () => {
+    const audio = Buffer.from([0xff, 0xfb, 0x90, 0x64, 0x01, 0x02]);
+    const queue: Array<() => Response> = [
+      () => new Response("busy", { status: 503 }),
+      () =>
+        new Response(audio, {
+          status: 200,
+          headers: { "content-type": "audio/mpeg", "x-generation-id": "gen_stub_7" },
+        }),
+    ];
+    const rec = recorder(() => queue.shift()!());
+    const args = { modelId: "resolved/speech-model", input: "In the beginning" };
+
+    // Attempt 1 consumes the 503: transient ProviderHttpError the step retries.
+    const transient = await requestSpeech(
+      { ...CFG, fetchImpl: rec.fetch },
+      args,
+    ).catch((e) => e);
+    expect(transient).toBeInstanceOf(ProviderHttpError);
+    expect((transient as ProviderHttpError).status).toBe(503);
+    expect(retryUnlessPermanent(transient)).toBe(true);
+
+    // Attempt 2 (the runStep re-invocation) consumes the 200 and returns the bytes.
+    const result = await requestSpeech({ ...CFG, fetchImpl: rec.fetch }, args);
+    expect(result.bytes.equals(audio)).toBe(true);
+    expect(result.generationId).toBe("gen_stub_7");
+
+    // The speech endpoint was hit exactly twice (503 → 200) — the e2e's `speechRequests===2`.
+    expect(rec.reqs).toHaveLength(2);
+  });
 });
 
 describe("requestImage (Task #32 — OpenAI-Images-compatible URL response)", () => {
