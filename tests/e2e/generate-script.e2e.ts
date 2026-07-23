@@ -16,12 +16,16 @@ import {
 // serves the "Get a Bible collection" + passage fetch. DBOS is launched IN-PROCESS
 // (consuming the uncommitted db-lib via the file: dep). No mocks.
 //
-// The openrouter-stub's chat responses are PROGRAMMED per test via POST /__admin/chat-script
-// so we can drive the exact design-delta §6d sequences deterministically:
-//   A) 503-then-200 — a provider-level step retry (LLM_STRUCTURED_RETRY), not a repair.
-//   B) malformed-then-valid — a schema-validation failure ⇒ a bounded REPAIR, not a step retry.
-//   C) crash/replay after a successful repair — the checkpointed LLM steps replay WITHOUT a
-//      second HTTP call (asserted via the stub's chatCompletions counter staying flat).
+// This spec retains only the crash/replay DURABILITY proof: it scripts a malformed→valid
+// chat sequence (via POST /__admin/chat-script) to reach a successful repair, parks at the
+// persistResult boundary, cancels, resumes, and asserts the checkpointed LLM steps replay
+// WITHOUT a second HTTP call (the stub's chatCompletions counter stays flat).
+//
+// The deterministic-FAILURE cases that used to live here — the 503-then-200 step retry and
+// the malformed-then-valid repair loop — were reclassified to injected-fetch UNIT tests in
+// task 34-E1 (design-delta §10.6): they simulate provider behavior by construction, which is
+// not end-to-end. See src/providers/{generate-object,errors}.test.ts and
+// src/workflows/generate-script/repair.test.ts.
 
 const OPENROUTER_STUB = process.env.OPENROUTER_STUB_URL ?? "http://localhost:4802";
 const YOUVERSION_STUB = process.env.YOUVERSION_STUB_URL ?? "http://localhost:4804";
@@ -160,69 +164,6 @@ afterAll(async () => {
 beforeEach(async () => {
   await resetOpenRouter();
   await resetYouVersion();
-});
-
-describe("generateScriptWorkflow — retry (503 → 200)", () => {
-  it("retries the LLM step on a 503, succeeds on the 200, and fetches the passage once", async () => {
-    await scriptChatResponses([
-      { status: 503 },
-      { status: 200, body: GOOD_STORYBOARD },
-    ]);
-    const { genId, payload } = await seedGeneration("storyboard");
-
-    const handle = await client.enqueue<GenerateScriptResult>(
-      {
-        workflowName: WORKFLOW_NAMES.generateScript,
-        queueName: WORKFLOW_QUEUE.generateScript,
-        workflowID: genId,
-      },
-      payload,
-    );
-    const result = (await handle.getResult()) as GenerateScriptResult;
-    expect(result.generationId).toBe(genId);
-
-    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(row.status).toBe("succeeded");
-    expect(row.completedAt).toBeInstanceOf(Date);
-    expect((row.resultJson as { scenes: unknown[] }).scenes.length).toBeGreaterThan(0);
-    expect(row.tokenUsage).not.toBeNull();
-
-    // The 503 burned a step RETRY (not a repair): exactly two chat calls.
-    const or = await stubState(OPENROUTER_STUB);
-    expect(or.chatCompletions).toBe(2);
-    // The passage was resolved via the live collection + fetched exactly once.
-    const yv = await stubState(YOUVERSION_STUB);
-    expect(yv.collectionLookups).toBeGreaterThanOrEqual(1);
-    expect(yv.passageFetches).toBe(1);
-  }, 120_000);
-});
-
-describe("generateScriptWorkflow — repair (malformed → valid)", () => {
-  it("re-prompts after a schema-validation failure and persists the repaired result", async () => {
-    await scriptChatResponses([
-      { status: 200, body: { stub: true } }, // valid JSON, fails GeneratedStoryboardSchema
-      { status: 200, body: GOOD_STORYBOARD },
-    ]);
-    const { genId, payload } = await seedGeneration("storyboard");
-
-    const handle = await client.enqueue<GenerateScriptResult>(
-      {
-        workflowName: WORKFLOW_NAMES.generateScript,
-        queueName: WORKFLOW_QUEUE.generateScript,
-        workflowID: genId,
-      },
-      payload,
-    );
-    await handle.getResult();
-
-    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(row.status).toBe("succeeded");
-    expect((row.resultJson as { musicStyle?: string }).musicStyle).toBe("swelling strings");
-
-    // A REPAIR, not a step retry: the malformed 200 + the repaired 200 = two chat calls.
-    const or = await stubState(OPENROUTER_STUB);
-    expect(or.chatCompletions).toBe(2);
-  }, 120_000);
 });
 
 describe("generateScriptWorkflow — crash / replay after the successful LLM call", () => {

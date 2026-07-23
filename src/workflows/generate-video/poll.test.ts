@@ -6,6 +6,7 @@ import {
   DEFAULT_VIDEO_POLL_INTERVAL_SECONDS,
 } from "./poll";
 import { VideoJobFailedError, VideoJobTimedOutError } from "./errors";
+import { getVideoJob } from "../../providers/media-client";
 
 // The bounded durable-sleep polling state machine (design-delta §7 workflow 8 — "bounded loop
 // with durable ~30s sleeps between GET {polling_url} calls, through pending → in_progress →
@@ -111,5 +112,87 @@ describe("documented defaults (design D4 judgment call)", () => {
   it("defaults to ~30s interval and a 40-attempt (20-minute) ceiling", () => {
     expect(DEFAULT_VIDEO_POLL_INTERVAL_SECONDS).toBe(30);
     expect(DEFAULT_VIDEO_MAX_POLL_ATTEMPTS).toBe(40);
+  });
+});
+
+// §10.6 fidelity add (task 34-E1): the block above drives the loop with a string-returning
+// callback (the loop-logic requirement — pending→in_progress→completed, terminal failure,
+// bounded attempts — is already met there). Here we bind the REAL getVideoJob HTTP parse to
+// pollUntilComplete over an INJECTED FETCH SEQUENCE, proving the provider JSON `{id,status}`
+// actually feeds the state machine — the "controlled-timing video polling" case, reproduced
+// at unit level with injected fetch (no stub, no DBOS) per the task's injected-fetch mandate.
+describe("pollUntilComplete over the real getVideoJob HTTP parse (injected-fetch, §10.6)", () => {
+  const CFG = { openrouterBaseUrl: "https://openrouter.ai", apiKey: "sk-or-test" };
+  const POLL_URL = "https://openrouter.ai/api/v1/videos/vid_1";
+
+  function statusResponse(status: string): Response {
+    return new Response(JSON.stringify({ id: "vid_1", status }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  function sequenceFetch(statuses: string[]): {
+    fetch: typeof fetch;
+    count: () => number;
+  } {
+    let i = 0;
+    const f = (async () => {
+      const s = statuses[Math.min(i, statuses.length - 1)];
+      i += 1;
+      return statusResponse(s);
+    }) as unknown as typeof fetch;
+    return { fetch: f, count: () => i };
+  }
+  const sleepSpy = () => {
+    const calls: number[] = [];
+    return { calls, sleep: async (ms: number) => void calls.push(ms) };
+  };
+
+  it("walks pending → in_progress → completed via real getVideoJob JSON responses", async () => {
+    const seq = sequenceFetch(["pending", "in_progress", "completed"]);
+    const s = sleepSpy();
+    const res = await pollUntilComplete({
+      poll: async () =>
+        (await getVideoJob({ ...CFG, fetchImpl: seq.fetch }, POLL_URL)).status,
+      sleep: s.sleep,
+      intervalMs: 30_000,
+      maxAttempts: 40,
+      jobId: "vid_1",
+    });
+    expect(res).toEqual({ attempts: 3 });
+    expect(seq.count()).toBe(3);
+    expect(s.calls).toEqual([30_000, 30_000]);
+  });
+
+  it("fails fast on a provider-reported terminal 'failed' status", async () => {
+    const seq = sequenceFetch(["in_progress", "failed"]);
+    const s = sleepSpy();
+    await expect(
+      pollUntilComplete({
+        poll: async () =>
+          (await getVideoJob({ ...CFG, fetchImpl: seq.fetch }, POLL_URL)).status,
+        sleep: s.sleep,
+        intervalMs: 5,
+        maxAttempts: 40,
+        jobId: "vid_1",
+      }),
+    ).rejects.toBeInstanceOf(VideoJobFailedError);
+    expect(seq.count()).toBe(2);
+  });
+
+  it("times out after maxAttempts bounded pending polls", async () => {
+    const seq = sequenceFetch(["pending"]);
+    const s = sleepSpy();
+    await expect(
+      pollUntilComplete({
+        poll: async () =>
+          (await getVideoJob({ ...CFG, fetchImpl: seq.fetch }, POLL_URL)).status,
+        sleep: s.sleep,
+        intervalMs: 7,
+        maxAttempts: 3,
+        jobId: "vid_1",
+      }),
+    ).rejects.toBeInstanceOf(VideoJobTimedOutError);
+    expect(seq.count()).toBe(3);
   });
 });

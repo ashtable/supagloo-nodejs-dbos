@@ -3,6 +3,7 @@ import { APICallError, NoObjectGeneratedError } from "ai";
 import {
   GlooNotConnectedError,
   LLM_STRUCTURED_RETRY,
+  MEDIA_RETRY,
   OpenRouterNotConnectedError,
   ProviderHttpError,
   isPermanentHttpStatus,
@@ -93,5 +94,18 @@ describe("LLM_STRUCTURED_RETRY", () => {
     expect(LLM_STRUCTURED_RETRY.retriesAllowed).toBe(true);
     expect(LLM_STRUCTURED_RETRY.backoffRate).toBeGreaterThan(1);
     expect(LLM_STRUCTURED_RETRY.shouldRetry).toBe(retryUnlessPermanent);
+  });
+});
+
+// §10.6 (task 34-E1): the media retry constant is the config half of the 503-then-200
+// reclassification for the speech/video steps (the LLM half is covered above). The
+// call-function SEQUENCE proof lives in media-client.test.ts; here we pin the policy the
+// step spreads onto DBOS.runStep so the transient-then-succeed re-call actually happens.
+describe("MEDIA_RETRY", () => {
+  it("carries maxAttempts:4 + backoff + the shouldRetry classifier", () => {
+    expect(MEDIA_RETRY.maxAttempts).toBe(4);
+    expect(MEDIA_RETRY.retriesAllowed).toBe(true);
+    expect(MEDIA_RETRY.backoffRate).toBeGreaterThan(1);
+    expect(MEDIA_RETRY.shouldRetry).toBe(retryUnlessPermanent);
   });
 });

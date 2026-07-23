@@ -48,6 +48,48 @@ function errorFetch(status: number): typeof fetch {
     })) as unknown as typeof fetch;
 }
 
+/** A single OpenAI chat-completion `Response` carrying `content` (a 200 body). */
+function chatOk(content: string): Response {
+  return new Response(
+    JSON.stringify({
+      id: "chatcmpl_1",
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        { index: 0, message: { role: "assistant", content }, finish_reason: "stop" },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+/** A non-2xx `Response` (error envelope). */
+function errStatus(status: number): Response {
+  return new Response(JSON.stringify({ error: { message: "boom" } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * A fetch that returns a DIFFERENT response per call (shift-per-invocation), plus a
+ * live call counter. Models the sequence `DBOS.runStep` drives across a retry:
+ * invoke → transient throw → shouldRetry → re-invoke against the next response.
+ */
+function sequenceFetch(steps: Array<() => Response>): {
+  fetch: typeof fetch;
+  count: () => number;
+} {
+  let i = 0;
+  const f = (async () => {
+    const step = steps[Math.min(i, steps.length - 1)];
+    i += 1;
+    return step();
+  }) as unknown as typeof fetch;
+  return { fetch: f, count: () => i };
+}
+
 describe("callLlmStructured", () => {
   it("returns the schema-parsed object (OpenRouter provider hits /api/v1/chat/completions)", async () => {
     const capture: { url?: string; auth?: string | null } = {};
@@ -143,5 +185,42 @@ describe("callLlmStructured", () => {
       transient = e;
     }
     expect(retryUnlessPermanent(transient)).toBe(true);
+  });
+});
+
+// §10.6 reclassification (task 34-E1): the 503-then-200 retry SEQUENCE that was proven
+// only by the now-deleted generateScript e2e ("retry (503 → 200)"). The AI SDK runs with
+// maxRetries:0, so a single call throws on the 503; DBOS's runStep re-invokes the step
+// (its LLM_STRUCTURED_RETRY.shouldRetry classified the 503 as transient). We reproduce
+// that here at the call-function level: invoke twice over a sequenced fetch, proving the
+// classified-transient 503 is followed by a clean success on the 200 — no DBOS needed.
+describe("callLlmStructured — 503-then-200 retry sequence (§10.6, was generateScript e2e)", () => {
+  it("throws a retryable error on the 503, then returns the schema-parsed object on the re-invoked 200", async () => {
+    const seq = sequenceFetch([
+      () => errStatus(503),
+      () => chatOk(JSON.stringify({ headline: "Refuge", scenes: 3 })),
+    ]);
+    const call = () =>
+      callLlmStructured({
+        provider: "openrouter",
+        baseUrl: "https://openrouter.ai",
+        apiKey: "sk-or-test",
+        modelId: "resolved/text-model",
+        schema,
+        prompt: "storyboard please",
+        fetchImpl: seq.fetch,
+      });
+
+    // Attempt 1 consumes the 503: throws, and the step classifier says "retry".
+    const transient = await call().catch((e) => e);
+    expect(transient).toBeDefined();
+    expect(retryUnlessPermanent(transient)).toBe(true);
+
+    // Attempt 2 (the runStep re-invocation) consumes the 200 and succeeds.
+    const object = await call();
+    expect(object).toEqual({ headline: "Refuge", scenes: 3 });
+
+    // The sequence advanced exactly two HTTP calls (503 → 200).
+    expect(seq.count()).toBe(2);
   });
 });

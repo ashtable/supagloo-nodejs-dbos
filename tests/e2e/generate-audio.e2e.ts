@@ -25,8 +25,12 @@ import type {
 // (:4802) serves POST /api/v1/audio/speech as a RAW mp3 byte stream (+ X-Generation-Id header);
 // the workflow buffers the bytes and PUTs a real object into MinIO under
 // projects/{projectId}/assets/{generationId}. We read the object back from the HOST to prove the
-// bytes landed intact. narration + music share the SAME endpoint (decision D2); the failure test
-// scripts a 503-then-200 so the step's MEDIA_RETRY re-calls the endpoint cleanly.
+// bytes landed intact. narration + music share the SAME endpoint (decision D2).
+//
+// The mid-stream 503-then-200 retry case that used to live here was reclassified to an
+// injected-fetch UNIT test in task 34-E1 (design-delta §10.6) — simulated provider
+// misbehavior is not end-to-end. See src/providers/media-client.test.ts (requestSpeech
+// 503-then-200) + src/providers/errors.test.ts (MEDIA_RETRY).
 //
 // The in-process worker reaches MinIO via S3_ENDPOINT=localhost:9000 (host-reachable) — NOT the
 // container-network minio:9000. Infra ensured by tests/e2e/global-setup.ts.
@@ -64,14 +68,6 @@ let s3: S3Client;
 
 async function resetOpenRouter(): Promise<void> {
   await fetch(`${OPENROUTER_STUB}/__stub/reset`, { method: "POST" });
-}
-
-async function scriptSpeech(responses: Array<{ status: number }>): Promise<void> {
-  await fetch(`${OPENROUTER_STUB}/__admin/speech-script`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ responses }),
-  });
 }
 
 async function stubState(baseUrl: string): Promise<Record<string, number>> {
@@ -228,32 +224,6 @@ describe("generateAudioWorkflow — lands a real mp3 in MinIO", () => {
 
     const or = await stubState(OPENROUTER_STUB);
     expect(or.speechRequests).toBe(1);
-
-    const bytes = await readObject(expectedKey);
-    expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfb]));
-
-    await s3
-      .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: expectedKey }))
-      .catch(() => {});
-  }, 120_000);
-
-  it("failure mid-stream retries cleanly: a 503 on the speech endpoint is retried, then succeeds", async () => {
-    const { genId, projectId, payload } = await seedAudioGeneration("narration");
-    // Script the FIRST speech call to fail 503 (transient → MEDIA_RETRY); the second (empty
-    // queue) returns the default 200 mp3.
-    await scriptSpeech([{ status: 503 }]);
-
-    const result = await runAudio(genId, payload);
-    expect(result.generationId).toBe(genId);
-
-    const expectedKey = buildAssetKey(projectId, genId);
-    const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
-    expect(row.status).toBe("succeeded");
-    expect(row.resultAssetKey).toBe(expectedKey);
-
-    // The speech endpoint was hit TWICE (the 503 attempt + the 200 retry) — clean retry.
-    const or = await stubState(OPENROUTER_STUB);
-    expect(or.speechRequests).toBe(2);
 
     const bytes = await readObject(expectedKey);
     expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfb]));
