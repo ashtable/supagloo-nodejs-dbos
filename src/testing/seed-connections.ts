@@ -28,15 +28,22 @@ import { mintGlooToken, type MintGlooTokenArgs, type GlooToken } from "../provid
 export const OPENROUTER_E2E_KEY_VAR = "OPENROUTER_E2E_TEST_API_KEY";
 export const GLOO_CLIENT_ID_VAR = "GLOO_CLIENT_ID";
 export const GLOO_CLIENT_SECRET_VAR = "GLOO_CLIENT_SECRET";
+export const YOUVERSION_APP_KEY_VAR = "YOUVERSION_APP_KEY";
 
 /**
  * The environment variables the real-provider e2e seeding requires, in a stable order.
  * Single source of truth for the fail-fast validation.
+ *
+ * `YOUVERSION_APP_KEY` (task 34-E5) is required here too: the reintroduced passage-kind
+ * generate-script e2e hits the LIVE YouVersion Data Exchange host (both endpoints 401
+ * without it), so a missing key must fail e2e setup loudly rather than silently degrade —
+ * per plan.md's global "a missing secret fails e2e setup fast" policy.
  */
 export const GENERATION_SEED_ENV_VARS = [
   OPENROUTER_E2E_KEY_VAR,
   GLOO_CLIENT_ID_VAR,
   GLOO_CLIENT_SECRET_VAR,
+  YOUVERSION_APP_KEY_VAR,
 ] as const;
 
 type EnvSource = Record<string, string | undefined>;
@@ -48,6 +55,8 @@ export interface GenerationSeedCreds {
   glooClientId: string;
   /** Real, live-verifiable Gloo OAuth2 client secret (`GLOO_CLIENT_SECRET`). */
   glooClientSecret: string;
+  /** Real YouVersion Platform app key (`YOUVERSION_APP_KEY`) — the live `x-yvp-app-key`. */
+  youversionAppKey: string;
 }
 
 /**
@@ -76,6 +85,7 @@ export function resolveGenerationSeedCreds(
     openrouterKey: read(OPENROUTER_E2E_KEY_VAR),
     glooClientId: read(GLOO_CLIENT_ID_VAR),
     glooClientSecret: read(GLOO_CLIENT_SECRET_VAR),
+    youversionAppKey: read(YOUVERSION_APP_KEY_VAR),
   };
 }
 

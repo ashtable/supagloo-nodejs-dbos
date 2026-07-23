@@ -8,6 +8,7 @@ import {
   GLOO_CLIENT_ID_VAR,
   GLOO_CLIENT_SECRET_VAR,
   OPENROUTER_E2E_KEY_VAR,
+  YOUVERSION_APP_KEY_VAR,
   resolveGenerationSeedCreds,
   seedGlooConnection,
   seedOpenRouterConnection,
@@ -41,13 +42,15 @@ describe("resolveGenerationSeedCreds", () => {
     [OPENROUTER_E2E_KEY_VAR]: "sk-or-v1-real",
     [GLOO_CLIENT_ID_VAR]: "gloo-client",
     [GLOO_CLIENT_SECRET_VAR]: "gloo-secret",
+    [YOUVERSION_APP_KEY_VAR]: "yvp-app-key-real",
   };
 
-  it("returns the three real creds when all are present", () => {
+  it("returns the real creds when all are present", () => {
     expect(resolveGenerationSeedCreds(present)).toEqual({
       openrouterKey: "sk-or-v1-real",
       glooClientId: "gloo-client",
       glooClientSecret: "gloo-secret",
+      youversionAppKey: "yvp-app-key-real",
     });
   });
 
