@@ -80,16 +80,18 @@ export const envSchema = z.object({
   // Task #29 provider-call layer (design-delta §7). The outbound LLM/media provider
   // hosts + the application-secrets key. Names/defaults/validation copied VERBATIM
   // from supagloo-nodejs-api's env loader so the two services agree (memory
-  // openrouter-gloo-connections-built). Real defaults ⇒ prod needs zero config; the
-  // test Compose overlay overrides the base URLs to the openrouter-stub (:4802) /
-  // gloo-stub (:4803).
+  // openrouter-gloo-connections-built). Real defaults ⇒ prod needs zero config; since
+  // task 34-E8 (design-delta §10.7) these base URLs are NOT overridden in test — the
+  // OpenRouter/Gloo providers are exercised for real by the e2e suites (the openrouter/
+  // gloo/youversion stubs were deleted).
   OPENROUTER_BASE_URL: providerBaseUrl("OPENROUTER_BASE_URL", "https://openrouter.ai"),
   GLOO_BASE_URL: providerBaseUrl("GLOO_BASE_URL", "https://platform.ai.gloo.com"),
   // Task #30 YouVersion Data Exchange (design-delta §7 workflow 5 / §9-Q10). The base URL
   // fetchScripturePassage resolves the Bible collection + passages from (real host default ⇒
-  // prod needs zero config; the test Compose overlay overrides it to the youversion-stub
-  // :4804). YOUVERSION_APP_KEY is the real API's `X-YVP-App-Key` — OPTIONAL (the stub ignores
-  // it, and public-domain KJV/BSB fallback works without it), sent as a header when present.
+  // prod needs zero config; since task 34-E8 the e2e hits the LIVE host, no stub). The passage
+  // e2e (34-E5) requires YOUVERSION_APP_KEY; it is the real API's `X-YVP-App-Key` — OPTIONAL at
+  // the schema level (public-domain KJV/BSB fallback works without it), sent as a header when
+  // present.
   YOUVERSION_BASE_URL: providerBaseUrl("YOUVERSION_BASE_URL", "https://api.youversion.com"),
   YOUVERSION_APP_KEY: z.string().min(1).optional(),
   // The single AES-256-GCM key that decrypts per-user provider secrets (OpenRouter

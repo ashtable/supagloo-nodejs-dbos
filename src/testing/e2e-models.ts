@@ -299,3 +299,79 @@ async function fetchVideoModels(
 export async function resolveVideoModel(env: E2eModelEnv): Promise<ResolvedVideoModel> {
   return selectTextToVideoModel(await fetchVideoModels(env));
 }
+
+// --- Gloo (task 34-E8) --------------------------------------------------------------------
+// Gloo is NOT on OpenRouter's discovery endpoints — it exposes its OWN authenticated model
+// catalogue at `GET {GLOO_BASE_URL}/platform/v2/models` (nextjs CLAUDE.md "LLM Provider: Gloo
+// AI Studio"), ids namespaced like `gloo-openai-gpt-5-mini`. The reworked providers.e2e.ts uses
+// this to resolve a Gloo model id at RUN TIME for a real `.chat()` round-trip — never hardcoded
+// (§10.9). Gloo's catalogue carries no reliable per-model pricing, so "cheapest ADEQUATE"
+// degrades to a cheap-tier id heuristic (mini/nano/…), with a safe fallback to the first entry.
+
+/** The subset of a Gloo `/platform/v2/models` entry the resolver reads. */
+export interface GlooModelInfo {
+  id: string;
+}
+
+interface RawGlooModel {
+  id?: unknown;
+}
+
+/** Normalize one raw Gloo catalogue entry into a {@link GlooModelInfo}. */
+export function toGlooModelInfo(raw: RawGlooModel): GlooModelInfo {
+  return { id: typeof raw.id === "string" ? raw.id : "" };
+}
+
+// Substrings that signal a cheaper/smaller tier when no real pricing metadata is available.
+const GLOO_CHEAP_TIER = ["mini", "nano", "small", "lite", "flash", "haiku"];
+
+/**
+ * Pick a Gloo chat model at run time: prefer a cheap-tier id (to minimize live cost, §10.9),
+ * else fall back to the first non-empty catalogue id. Throws (actionable) if the catalogue is
+ * empty — a Gloo round-trip with no discoverable model would force a hardcode, which §10.9
+ * forbids.
+ */
+export function selectGlooChatModel(models: GlooModelInfo[]): string {
+  const ids = models.map((m) => m.id).filter((id) => id.length > 0);
+  const cheap = ids.find((id) => {
+    const lower = id.toLowerCase();
+    return GLOO_CHEAP_TIER.some((tier) => lower.includes(tier));
+  });
+  const pick = cheap ?? ids[0];
+  if (!pick) {
+    throw new Error(
+      "no Gloo model found via the /platform/v2/models catalogue — cannot resolve an adequate " +
+        "Gloo chat model at run time without hardcoding one (design-delta §10.9).",
+    );
+  }
+  return pick;
+}
+
+export interface GlooModelEnv {
+  GLOO_BASE_URL: string;
+}
+
+/**
+ * Resolve a live Gloo chat model id from the authenticated catalogue
+ * (`GET {GLOO_BASE_URL}/platform/v2/models`, `Authorization: Bearer <token>`). The catalogue path
+ * prefix is `/platform/v2` (NOT the `/ai/v2` chat surface). Tolerant of the response shape
+ * (`data`/`models` array). Requires a freshly-minted Gloo bearer token.
+ */
+export async function resolveGlooModel(
+  env: GlooModelEnv,
+  bearerToken: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const res = await fetchImpl(`${trimSlash(env.GLOO_BASE_URL)}/platform/v2/models`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearerToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Gloo model discovery failed: GET /platform/v2/models -> ${res.status}`,
+    );
+  }
+  const body = (await res.json()) as { data?: RawGlooModel[]; models?: RawGlooModel[] };
+  const raw = body.data ?? body.models ?? [];
+  return selectGlooChatModel(raw.map(toGlooModelInfo));
+}
