@@ -3,11 +3,14 @@ import {
   selectAudioModel,
   selectCheapestImageModel,
   selectCheapestStructuredTextModel,
+  selectGlooChatModel,
   selectTextToVideoModel,
   toAudioModelInfo,
+  toGlooModelInfo,
   toModelInfo,
   toVideoModelInfo,
   type AudioModelInfo,
+  type GlooModelInfo,
   type OpenRouterModelInfo,
   type VideoModelInfo,
 } from "./e2e-models";
@@ -219,5 +222,52 @@ describe("selectTextToVideoModel (video — must be text-to-video capable, min d
     expect(() =>
       selectTextToVideoModel([v("vendor/i2v", [1], false)]),
     ).toThrow(/text-to-video/i);
+  });
+});
+
+// Task 34-E8: the reworked providers.e2e.ts exercises a REAL Gloo `.chat()` round-trip and
+// must resolve the Gloo model id at run time (§10.9 — never hardcode). Gloo exposes an
+// authenticated model catalogue at `GET {GLOO_BASE_URL}/platform/v2/models` (nextjs CLAUDE.md),
+// ids namespaced like `gloo-openai-gpt-5-mini`. Gloo's catalogue carries no reliable pricing
+// metadata, so "cheapest ADEQUATE" degrades to a cheap-tier id heuristic (mini/nano/…), with a
+// safe fallback to the first catalogue entry — a runtime pick, not a hardcode.
+describe("toGlooModelInfo", () => {
+  it("reads the id off a raw Gloo catalogue entry", () => {
+    expect(toGlooModelInfo({ id: "gloo-openai-gpt-5-mini" })).toEqual({
+      id: "gloo-openai-gpt-5-mini",
+    });
+  });
+
+  it("is tolerant of a missing/non-string id", () => {
+    expect(toGlooModelInfo({})).toEqual({ id: "" });
+    expect(toGlooModelInfo({ id: 42 })).toEqual({ id: "" });
+  });
+});
+
+describe("selectGlooChatModel (runtime pick — cheap-tier heuristic, else first)", () => {
+  const g = (id: string): GlooModelInfo => ({ id });
+
+  it("prefers a cheap-tier id (mini/nano/small/lite/flash/haiku) over a heavier one", () => {
+    const models = [
+      g("gloo-anthropic-claude-sonnet-4.5"),
+      g("gloo-openai-gpt-5-mini"),
+      g("gloo-openai-gpt-5"),
+    ];
+    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5-mini");
+  });
+
+  it("falls back to the first catalogue entry when no cheap-tier id is present", () => {
+    const models = [g("gloo-openai-gpt-5"), g("gloo-anthropic-claude-sonnet-4.5")];
+    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5");
+  });
+
+  it("ignores empty ids when falling back", () => {
+    const models = [g(""), g("gloo-openai-gpt-5")];
+    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5");
+  });
+
+  it("throws an actionable error when the catalogue is empty", () => {
+    expect(() => selectGlooChatModel([])).toThrow(/gloo/i);
+    expect(() => selectGlooChatModel([g("")])).toThrow(/gloo/i);
   });
 });
