@@ -58,4 +58,20 @@ describe("countStepExecutions", () => {
   it("returns 0 when the workflow has no steps (undefined)", async () => {
     expect(await countStepExecutions(lister(undefined), "missing", "callLlmStructured")).toBe(0);
   });
+
+  it("scopes to the given workflowID (forwards it to listWorkflowSteps)", async () => {
+    // Real workflowID-scoping happens server-side in DBOSClient.listWorkflowSteps(workflowID); the
+    // helper's job is only to FORWARD the id. A fake keyed by workflowID pins that it does — a
+    // helper that dropped/hardcoded the id would return the wrong workflow's step rows.
+    const byWorkflow: Record<string, StepInfo[]> = {
+      "wf-a": [step("submitVideoJob", 0)],
+      "wf-b": [step("submitVideoJob", 0), step("submitVideoJob:retry", 1)],
+    };
+    const scoped: StepLister = {
+      listWorkflowSteps: async (id: string) => byWorkflow[id] ?? [],
+    };
+    expect(await countStepExecutions(scoped, "wf-a", "submitVideoJob")).toBe(1);
+    expect(await countStepExecutions(scoped, "wf-b", "submitVideoJob")).toBe(2);
+    expect(await countStepExecutions(scoped, "wf-unknown", "submitVideoJob")).toBe(0);
+  });
 });
