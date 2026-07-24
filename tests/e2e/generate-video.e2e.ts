@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { DBOSClient } from "@dbos-inc/dbos-sdk";
+import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -21,6 +21,8 @@ import {
   type ResolvedVideoModel,
 } from "../../src/testing/e2e-models";
 import { countStepExecutions } from "../../src/testing/step-introspection";
+import { isProviderJobIdStable } from "../../src/testing/provider-job-id-stability";
+import { __setGenerateVideoBoundaryHook } from "../../src/workflows/generate-video";
 import type {
   GenerateVideoPayload,
   GenerateVideoResult,
@@ -147,6 +149,19 @@ async function readObject(key: string): Promise<Buffer> {
   return Buffer.from(bytes);
 }
 
+// Per-file crash/replay helper (the established convention — no shared module; mirrors
+// generate-script.e2e.ts): poll the DBOS system DB until the cancelled workflow settles, so the
+// resume in the test lands after the interruption is durably recorded.
+async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const [wf] = await DBOS.listWorkflows({ workflowIDs: [jobId] });
+    if (wf && statuses.includes(wf.status)) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`workflow ${jobId} did not reach ${statuses.join("/")} in time`);
+}
+
 beforeAll(async () => {
   creds = resolveGenerationSeedCreds();
   await launchDbos(env);
@@ -162,6 +177,7 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
+  __setGenerateVideoBoundaryHook(undefined);
   s3?.destroy();
   await client?.destroy().catch(() => {});
   await shutdownDbos();
@@ -213,9 +229,95 @@ describe("generateVideoClipWorkflow — lands a real mp4 in MinIO", () => {
 });
 
 describe("generateVideoClipWorkflow — crash / replay (the flagship recovery case)", () => {
-  // Reworked in 34-E7: the crash/replay proof (park at the first poll boundary → cancel →
-  // resume → exactly-once submit across recovery, asserted via the shared system-DB
-  // step-introspection helper introduced in THIS task) is 34-E7's scope per plan.md. The old
-  // body depended on the openrouter-stub's /__stub introspection, which is removed here.
-  it.todo("cancels between submit and completion, resumes, and NEVER re-submits — reworked in 34-E7");
+  // Reworked in 34-E7 (design-delta §10.5): the flagship recovery proof, HOST-INTROSPECTION-FREE.
+  // Park at the FIRST pollVideoJob boundary (submit committed providerJobId, polling not yet
+  // completed — the #34 crash window) → "kill the worker" (the in-process cancel idiom every
+  // crash/replay e2e in this repo uses; NOT a child_process kill) → "restart" (DBOS recovery via
+  // resumeWorkflow) → run to completion against REAL generation latency. Two assertions replace
+  // the retired openrouter-stub videoJobsCreated counter (§10.7):
+  //   (1) providerJobId STABILITY — the final row carries the SAME id captured pre-crash (the
+  //       memoized submit step replayed, never re-issued), and the clip was downloaded from it; and
+  //   (2) EXACTLY ONE recorded submitVideoJob step execution in the DBOS system DB for this
+  //       workflowID, both before AND after recovery (`countStepExecutions`, §10.5).
+  // ACCEPTED (not tested, task brief / §10.5): the sub-second window between the real submit HTTP
+  // succeeding and the step checkpoint committing is unprovable without provider introspection; the
+  // Idempotency-Key header is unverified defense-in-depth, not asserted on.
+  it(
+    "cancels between submit and completion, resumes with the SAME providerJobId, and NEVER re-submits",
+    async () => {
+      const { genId, projectId, payload } = await seedVideoGeneration();
+
+      // Park at the FIRST pollVideoJob boundary. The `parked` guard makes only the first fire
+      // block; all other labels (loadRequestAndCredentials, submitVideoJob, …) are no-ops. Because
+      // the first fire blocks, the workflow never reaches a second poll in the pre-crash run.
+      let release!: () => void;
+      let parked = false;
+      const reached = new Promise<void>((resolve) => {
+        __setGenerateVideoBoundaryHook(async (label) => {
+          if (label === "pollVideoJob" && !parked) {
+            parked = true;
+            resolve();
+            await new Promise<void>((r) => {
+              release = r;
+            });
+          }
+        });
+      });
+
+      const handle = await client.enqueue<GenerateVideoResult>(
+        {
+          workflowName: WORKFLOW_NAMES.generateVideo,
+          queueName: WORKFLOW_QUEUE.generateVideo,
+          workflowID: genId,
+        },
+        payload,
+      );
+      const settled = handle.getResult().then(
+        () => "ok",
+        () => "interrupted",
+      );
+
+      await reached;
+      // Submit has committed. Capture the pre-crash providerJobId + assert exactly one submit step.
+      const preRow = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
+      const capturedJobId = preRow.providerJobId;
+      expect(typeof capturedJobId).toBe("string");
+      expect((capturedJobId ?? "").length).toBeGreaterThan(0);
+      expect(await countStepExecutions(client, genId, "submitVideoJob")).toBe(1);
+
+      // Kill the worker (figurative, in-process): cancel, release the hook, await the interruption.
+      await DBOS.cancelWorkflow(genId);
+      release();
+      const outcome = await settled;
+      expect(outcome).toBe("interrupted");
+
+      // Restart the worker → DBOS recovery. Clear the hook so the resumed run polls to completion.
+      __setGenerateVideoBoundaryHook(undefined);
+      await waitForStatus(genId, ["CANCELLED", "ERROR"]);
+      const resumeHandle = await DBOS.resumeWorkflow<GenerateVideoResult>(genId);
+      const result = (await resumeHandle.getResult()) as GenerateVideoResult;
+
+      // §10.5 assertion 1 — providerJobId STABLE across the crash (the memoized submit replayed).
+      const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
+      expect(row.status).toBe("succeeded");
+      expect(row.completedAt).toBeInstanceOf(Date);
+      expect(row.providerJobId).toBe(capturedJobId);
+      expect(isProviderJobIdStable(capturedJobId, row.providerJobId)).toBe(true);
+      expect(result.providerJobId).toBe(capturedJobId);
+
+      // §10.5 assertion 2 — STILL exactly one recorded submitVideoJob execution after recovery.
+      expect(await countStepExecutions(client, genId, "submitVideoJob")).toBe(1);
+
+      // The clip completed into MinIO, downloaded from THAT job (non-empty bytes at the asset key).
+      const expectedKey = buildAssetKey(projectId, genId);
+      expect(row.resultAssetKey).toBe(expectedKey);
+      const bytes = await readObject(expectedKey);
+      expect(bytes.length).toBeGreaterThan(0);
+
+      await s3
+        .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: expectedKey }))
+        .catch(() => {});
+    },
+    VIDEO_TEST_TIMEOUT_MS,
+  );
 });
