@@ -9,6 +9,8 @@ import {
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
+  RENDER_QUEUE_NAME,
+  RENDER_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
 import { QUEUE_CONFIG, WORKFLOW_NAMES, WORKFLOW_QUEUE } from "./registry";
@@ -52,6 +54,7 @@ describe("static workflow registry", () => {
       "importProject",
       "noopProof",
       "publishVersion",
+      "render",
       "scaffoldProject",
     ]);
   });
@@ -66,6 +69,8 @@ describe("static workflow registry", () => {
     expect(WORKFLOW_QUEUE.generateImage).toBe("ai-generation");
     expect(WORKFLOW_QUEUE.generateAudio).toBe("ai-generation");
     expect(WORKFLOW_QUEUE.generateVideo).toBe("ai-generation");
+    // Task #36: render is the ONLY workflow on the dedicated `render` queue.
+    expect(WORKFLOW_QUEUE.render).toBe("render");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
@@ -96,6 +101,17 @@ describe("static workflow registry", () => {
     // Task #34: the generateVideo name + ai-generation queue are the shared db-lib constants.
     expect(WORKFLOW_NAMES.generateVideo).toBe(GENERATE_VIDEO_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.generateVideo).toBe(AI_GENERATION_QUEUE_NAME);
+    // Task #36: the render name + the dedicated render queue are the shared db-lib
+    // constants — the API's render-enqueue path (task 37) imports the SAME values.
+    expect(WORKFLOW_NAMES.render).toBe(RENDER_WORKFLOW_NAME);
+    expect(WORKFLOW_QUEUE.render).toBe(RENDER_QUEUE_NAME);
+  });
+
+  // Task #36: the render queue is the one queue whose concurrency is FIRM rather than a
+  // design-time approximation — Remotion/Chromium is CPU + memory heavy, so exactly one
+  // render per worker (design-delta §7; sizing validation deferred to task 45).
+  it("keeps the render queue at exactly one render per worker", () => {
+    expect(QUEUE_CONFIG[WORKFLOW_QUEUE.render].workerConcurrency).toBe(1);
   });
 });
 

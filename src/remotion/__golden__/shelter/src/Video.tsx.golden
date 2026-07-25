@@ -1,12 +1,18 @@
 // Supagloo-generated composition body — DO NOT EDIT.
 // Regenerated from supagloo.project.json.
-import { AbsoluteFill, Sequence } from "remotion";
+import { AbsoluteFill, Audio, Sequence } from "remotion";
+import { getAssetUrl } from "./lib/assets";
 import { Shelter } from "./scenes/Shelter";
 import { Refuge } from "./scenes/Refuge";
 
+const musicAssetKey = "projects/demo/music/bed.mp3";
+
 export const VideoComposition = () => {
+  const musicAssetKeySrc = getAssetUrl(musicAssetKey);
+
   return (
     <AbsoluteFill style={{ backgroundColor: "#000000" }}>
+      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} /> : null}
       <Sequence name="Shelter" from={0} durationInFrames={150}>
         <Shelter />
       </Sequence>

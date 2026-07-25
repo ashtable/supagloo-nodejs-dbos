@@ -17,6 +17,7 @@ import {
   clearVideoPollConfig,
   setVideoPollConfig,
 } from "../workflows/generate-video/config";
+import { clearRenderConfig, setRenderConfig } from "../workflows/render/config";
 // Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
@@ -28,6 +29,7 @@ import "../workflows/generate-script";
 import "../workflows/generate-image";
 import "../workflows/generate-audio";
 import "../workflows/generate-video";
+import "../workflows/render";
 
 let appDb: PrismaClient | undefined;
 
@@ -95,6 +97,19 @@ export async function launchDbos(env: Env): Promise<void> {
     maxPollAttempts: env.VIDEO_MAX_POLL_ATTEMPTS,
   });
 
+  // Inject the render config (task #36): the child-process kill deadlines that stand in
+  // for DBOS's non-existent per-step timeout (design's "generous renderMedia timeout";
+  // real tuning is task 45 / §9-Q8), the cooperative-cancel poll interval, and the OPTIONAL
+  // fallback audio models. The workflow's steps read getRenderConfig(), never process.env.
+  setRenderConfig({
+    mediaTimeoutMs: Math.round(env.RENDER_MEDIA_TIMEOUT_SECONDS * 1000),
+    bundleTimeoutMs: Math.round(env.RENDER_BUNDLE_TIMEOUT_SECONDS * 1000),
+    installTimeoutMs: Math.round(env.RENDER_INSTALL_TIMEOUT_SECONDS * 1000),
+    cancelPollMs: Math.round(env.RENDER_CANCEL_POLL_SECONDS * 1000),
+    narrationModel: env.RENDER_NARRATION_MODEL,
+    musicModel: env.RENDER_MUSIC_MODEL,
+  });
+
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
@@ -114,6 +129,7 @@ export async function shutdownDbos(): Promise<void> {
   clearProviderConfig();
   clearS3Config();
   clearVideoPollConfig();
+  clearRenderConfig();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;

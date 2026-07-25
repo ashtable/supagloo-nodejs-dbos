@@ -68,8 +68,37 @@ ENV NODE_ENV=production
 # out to the `git` CLI to clone/commit/push (house style — no npm git dep). git is in
 # the deps stage (to clone database-lib at build time) but that stage is not copied
 # into the runner, so it must be installed here or the workflow fails in production.
+#
+# Task #36 (renderWorkflow) adds the Chrome Headless Shell system libraries. The list is
+# taken VERBATIM from Remotion's own Docker guide (remotion.dev/docs/docker) — without
+# them Chromium fails to start and every render dies at frame 0. The two Noto font
+# packages are Remotion's documented additions for emoji and CJK glyphs, which scene
+# captions can easily contain. (Remotion's guide also explicitly warns AGAINST Alpine;
+# node:22-slim/Debian is already what we use.)
+#
+# Remotion passes --no-sandbox/--disable-setuid-sandbox itself (verified in
+# @remotion/renderer 4.0.490 open-browser.js), so running as root here needs no extra
+# flag. The render child additionally executes `npm install` for the CLONED project, which
+# is why `npm` (bundled with the node image) must remain on PATH at runtime.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends openssl git ca-certificates \
+  && apt-get install -y --no-install-recommends \
+    openssl git ca-certificates \
+    libnss3 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libgbm-dev \
+    libasound2 \
+    libxrandr2 \
+    libxkbcommon-dev \
+    libxfixes3 \
+    libxcomposite1 \
+    libxdamage1 \
+    libatk-bridge2.0-0 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libcups2 \
+    fonts-noto-color-emoji \
+    fonts-noto-cjk \
   && rm -rf /var/lib/apt/lists/*
 
 # node_modules carries the db-lib symlink; the copied submodule is what that
@@ -78,6 +107,14 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/supagloo-database-lib ./supagloo-database-lib
 COPY --from=builder /app/dist ./dist
 COPY package.json ./
+
+# Download Chrome Headless Shell into the image so the FIRST render doesn't pay for it
+# (and so a network-restricted runtime still works). This is the programmatic equivalent
+# of `npx remotion browser ensure` from Remotion's Docker guide — we call the
+# @remotion/renderer API directly because we deliberately do NOT install @remotion/cli in
+# the worker. The render child calls ensureBrowser() too, so this is a warm cache, not a
+# hard requirement.
+RUN node -e "require('@remotion/renderer').ensureBrowser().then(s=>console.log('remotion browser:',s.type))"
 
 # No EXPOSE: the worker has no public HTTP surface. It connects out to Postgres
 # (system + app dbs) and picks up enqueued work.

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { buildAssetKey } from "@supagloo/database-lib";
-import { makeInternalS3Client, uploadAsset } from "./s3-client";
+import { downloadAsset, makeInternalS3Client, uploadAsset } from "./s3-client";
 
 // Task #32 — the FIRST real S3 WRITE in the codebase. The DBOS image/audio/video
 // workflows upload generated assets against the INTERNAL endpoint (`S3_ENDPOINT`,
@@ -57,5 +57,49 @@ describe("uploadAsset", () => {
     expect(input.ContentType).toBe("image/png");
     expect(Buffer.isBuffer(input.Body)).toBe(true);
     expect((input.Body as Buffer).equals(bytes)).toBe(true);
+  });
+});
+
+// Task #36 — dbos becomes an S3 READER too. renderWorkflow's `downloadSceneAssets`
+// pulls each manifest-referenced object into the workspace `public/` dir so the
+// Remotion bundle can snapshot it (plan D1): our buckets are private, so a
+// bundle-baked remote URL is not an option. Still the INTERNAL endpoint / internal
+// role — the API remains the only presigner.
+describe("downloadAsset", () => {
+  it("sends a GetObjectCommand for the bucket+key and returns the object bytes", async () => {
+    const bytes = Buffer.from([1, 2, 3, 4]);
+    const sent: GetObjectCommand[] = [];
+    const fakeClient = {
+      send: (cmd: GetObjectCommand) => {
+        sent.push(cmd);
+        return Promise.resolve({
+          Body: {
+            transformToByteArray: async () => new Uint8Array(bytes),
+          },
+          ContentType: "image/jpeg",
+        });
+      },
+    } as unknown as S3Client;
+
+    const result = await downloadAsset(fakeClient, {
+      bucket: "supagloo-dev",
+      key: "projects/proj-1/assets/gen-1",
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toBeInstanceOf(GetObjectCommand);
+    expect(sent[0].input.Bucket).toBe("supagloo-dev");
+    expect(sent[0].input.Key).toBe("projects/proj-1/assets/gen-1");
+    expect(result.bytes.equals(bytes)).toBe(true);
+    expect(result.contentType).toBe("image/jpeg");
+  });
+
+  it("surfaces a missing object as an error rather than an empty buffer", async () => {
+    const fakeClient = {
+      send: () => Promise.resolve({ Body: undefined }),
+    } as unknown as S3Client;
+    await expect(
+      downloadAsset(fakeClient, { bucket: "b", key: "missing" }),
+    ).rejects.toThrow();
   });
 });
