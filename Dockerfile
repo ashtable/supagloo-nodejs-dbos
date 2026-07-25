@@ -30,7 +30,7 @@ RUN apt-get update \
 # lands, update this default to that same SHA in the same commit (the
 # dockerfile-database-lib-pin test enforces this).
 # DO NOT "simplify" this back to a COPY of the submodule dir — it breaks Railway.
-ARG DATABASE_LIB_REF=2a9a1b6f366e49d8cfa578714a36751dcd54f00b
+ARG DATABASE_LIB_REF=954342d2b09e1bfb6aaf20118d9829a516e62cb9
 RUN git clone https://github.com/ashtable/supagloo-database-lib.git supagloo-database-lib \
   && git -C supagloo-database-lib checkout "${DATABASE_LIB_REF}" \
   && rm -rf supagloo-database-lib/.git
