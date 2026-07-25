@@ -121,25 +121,44 @@ export function buildIndexSource(): string {
 }
 
 /**
- * Asset-key → URL resolver. Assets live in S3 (design-delta §2), referenced by key,
- * never committed — so we build a REMOTE URL (guide-endorsed: `<Img>` accepts remote
- * URLs directly) rather than using `staticFile()`/`public/`. The base URL comes from
- * REMOTION_ASSET_BASE_URL, which Remotion injects into the bundle (all REMOTION_-
- * prefixed env vars are readable via process.env inside a composition). The render
- * workflow (a later task) points it at the S3 public endpoint or a static origin.
- * This is the single documented seam between manifest asset keys and media URLs.
+ * Asset-key → URL resolver: the single documented seam between manifest asset keys and
+ * media URLs.
+ *
+ * Assets live in S3 (design-delta §2), referenced by key, never committed. Task #36's
+ * `renderWorkflow` DOWNLOADS every referenced object into the project's `public/`
+ * directory before bundling, so the DEFAULT resolution is `staticFile(assetKey)` — the
+ * asset key's `/`-separated shape simply becomes subdirectories under `public/`, which
+ * `staticFile()` handles (it splits on `/` and encodes each segment).
+ *
+ * Why local files and not a remote URL (plan D1): our S3 buckets are PRIVATE, so a
+ * bundle-baked remote URL would need either a public-read bucket policy (a security
+ * regression) or per-object presigned URLs (which a single base URL cannot express). And
+ * `bundle()` SNAPSHOTS `public/` into the bundle — verified in @remotion/bundler 4.0.490,
+ * which copies `<root>/public` to `<outDir>/public` and serves it at `/public` — which is
+ * exactly why the design requires audio to be synthesized BEFORE bundling.
+ *
+ * `REMOTION_ASSET_BASE_URL` remains as an explicit opt-in override for anyone serving
+ * assets from a reachable origin (Remotion exposes every `REMOTION_`-prefixed env var to
+ * the composition via `process.env`). The render workflow deliberately leaves it unset.
  */
 export function buildAssetsSource(): string {
   return [
     "// Supagloo-generated asset resolver — DO NOT EDIT.",
+    'import { staticFile } from "remotion";',
+    "",
     "export function getAssetUrl(",
     "  assetKey: string | null | undefined,",
     "): string | null {",
     "  if (!assetKey) {",
     "    return null;",
     "  }",
+    "  // Explicit remote-origin override (opt-in).",
     '  const base = (process.env.REMOTION_ASSET_BASE_URL ?? "").replace(/\\/+$/, "");',
-    "  return base ? `${base}/${assetKey}` : `/${assetKey}`;",
+    "  if (base) {",
+    "    return `${base}/${assetKey}`;",
+    "  }",
+    "  // Default: the asset was materialized into public/ before the bundle was built.",
+    "  return staticFile(assetKey);",
     "}",
     "",
   ].join("\n");
@@ -187,7 +206,30 @@ export function buildVideoSource(
     "// Regenerated from supagloo.project.json.",
   ];
 
-  if (assigned.length === 0) {
+  // Task #36: the whole-video audio beds. Emitted ONLY when the manifest carries the
+  // corresponding asset key, because that key is what `getAssetUrl` resolves. This is the
+  // half that makes "synthesize audio BEFORE bundling" (design-delta §7 workflow 9)
+  // meaningful — without a reference in the composition, an audio file snapshotted into
+  // the bundle is never played. The render workflow patches a freshly-synthesized track's
+  // (workspace-local) key into the manifest and re-materializes these sources, so both the
+  // cached-ref and the synthesized-fallback paths land here identically.
+  const narrationKey = manifest.narratorVoice.assetKey ?? null;
+  const musicKey = manifest.music?.assetKey ?? null;
+  const audioKeys: Array<{ name: string; key: string }> = [];
+  if (narrationKey) audioKeys.push({ name: "narrationAssetKey", key: narrationKey });
+  if (musicKey) audioKeys.push({ name: "musicAssetKey", key: musicKey });
+
+  const audioConsts = audioKeys.map(
+    (a) => `const ${a.name} = ${JSON.stringify(a.key)};`,
+  );
+  const audioSrcs = audioKeys.map(
+    (a) => `  const ${a.name}Src = getAssetUrl(${a.name});`,
+  );
+  const audioElements = audioKeys.flatMap((a) => [
+    `      {${a.name}Src ? <Audio src={${a.name}Src} /> : null}`,
+  ]);
+
+  if (assigned.length === 0 && audioKeys.length === 0) {
     return [
       ...header,
       'import { AbsoluteFill } from "remotion";',
@@ -199,18 +241,26 @@ export function buildVideoSource(
     ].join("\n");
   }
 
+  const remotionImports = ["AbsoluteFill"];
+  if (audioKeys.length > 0) remotionImports.push("Audio");
+  if (assigned.length > 0) remotionImports.push("Sequence");
+
   const imports = [
-    'import { AbsoluteFill, Sequence } from "remotion";',
+    `import { ${remotionImports.join(", ")} } from "remotion";`,
+    ...(audioKeys.length > 0
+      ? ['import { getAssetUrl } from "./lib/assets";']
+      : []),
     ...assigned.map(
       (a) => `import { ${a.component} } from "./scenes/${a.component}";`,
     ),
   ];
 
-  const body: string[] = [
-    "export const VideoComposition = () => {",
-    "  return (",
-    '    <AbsoluteFill style={{ backgroundColor: "#000000" }}>',
-  ];
+  const body: string[] = [];
+  if (audioConsts.length > 0) body.push(...audioConsts, "");
+  body.push("export const VideoComposition = () => {");
+  if (audioSrcs.length > 0) body.push(...audioSrcs, "");
+  body.push("  return (", '    <AbsoluteFill style={{ backgroundColor: "#000000" }}>');
+  body.push(...audioElements);
   let from = 0;
   for (const a of assigned) {
     const frames = frameCount(a.scene.durationSeconds, manifest.composition.fps);

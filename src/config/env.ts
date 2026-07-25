@@ -54,6 +54,19 @@ const providerBaseUrl = (label: string, defaultUrl: string) =>
     })
     .default(defaultUrl);
 
+/**
+ * An OPTIONAL model id. Empty/whitespace is treated as absent (see the RENDER_*_MODEL
+ * comment below); anything else must be a non-empty id.
+ */
+const optionalModelId = () =>
+  z
+    .preprocess(
+      (value) =>
+        typeof value === "string" && value.trim() === "" ? undefined : value,
+      z.string().min(1).optional(),
+    )
+    .optional();
+
 export const envSchema = z.object({
   // App database (`supagloo`) — the workflow's app-DB writes go here.
   DATABASE_URL: postgresUrl("DATABASE_URL"),
@@ -144,6 +157,48 @@ export const envSchema = z.object({
     .int("VIDEO_MAX_POLL_ATTEMPTS must be a positive integer")
     .positive("VIDEO_MAX_POLL_ATTEMPTS must be a positive integer")
     .default(40),
+
+  // Task #36 renderWorkflow (design-delta §7 workflow 9). Three child-process kill
+  // deadlines: DBOS has no per-step timeout (only workflow-level `timeoutMS`), so the
+  // design's "generous step timeout" for renderMedia is implemented as the deadline after
+  // which the render child is killed — which doubles as the bound on the untrusted user
+  // code we execute. Deliberately generous; real tuning is the load-testing task 45
+  // (§9-Q8), which is why they are env vars at all. Coerced so string env vars parse.
+  RENDER_MEDIA_TIMEOUT_SECONDS: z.coerce
+    .number()
+    .positive("RENDER_MEDIA_TIMEOUT_SECONDS must be a positive number of seconds")
+    .default(3600),
+  RENDER_BUNDLE_TIMEOUT_SECONDS: z.coerce
+    .number()
+    .positive("RENDER_BUNDLE_TIMEOUT_SECONDS must be a positive number of seconds")
+    .default(900),
+  RENDER_INSTALL_TIMEOUT_SECONDS: z.coerce
+    .number()
+    .positive("RENDER_INSTALL_TIMEOUT_SECONDS must be a positive number of seconds")
+    .default(900),
+  // How often the long render/still steps poll their own DBOS workflow status so a
+  // `DBOS.cancelWorkflow` can COOPERATIVELY abort the in-flight Chromium render. Without
+  // this, DBOS's own cancellation (which preempts only at the NEXT step boundary) would
+  // let a cancelled render burn CPU to completion.
+  RENDER_CANCEL_POLL_SECONDS: z.coerce
+    .number()
+    .positive("RENDER_CANCEL_POLL_SECONDS must be a positive number of seconds")
+    .default(2),
+
+  // The models the render workflow falls back to when the manifest carries NO cached
+  // narration/music asset ref. OPTIONAL WITH NO DEFAULT, deliberately:
+  //   - model ids are never hardcoded in source (design §7 / §10.9), so they arrive as
+  //     configuration, exactly like the BFF injects provider/model for the studio's
+  //     AI actions (task 35);
+  //   - unset means the render simply proceeds WITHOUT that track rather than failing —
+  //     the normal path is that the studio already generated + committed the refs, so
+  //     render-time synthesis is a fallback, not a requirement.
+  //
+  // Empty string is normalized to `undefined` rather than rejected: Compose's
+  // `${RENDER_NARRATION_MODEL:-}` substitution sets the key to "" when the operator has
+  // not defined it, and an empty optional model must mean "no fallback", not "fail boot".
+  RENDER_NARRATION_MODEL: optionalModelId(),
+  RENDER_MUSIC_MODEL: optionalModelId(),
 });
 
 export type Env = z.infer<typeof envSchema>;

@@ -8,6 +8,8 @@ import {
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
+  RENDER_QUEUE_NAME,
+  RENDER_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
 } from "@supagloo/database-lib";
 
@@ -82,6 +84,11 @@ export const WORKFLOW_NAMES = {
   // download → upload. Same shared-constant discipline — the API enqueues to this name on the
   // ai-generation queue. This is the LAST AI-generation kind wired.
   generateVideo: GENERATE_VIDEO_WORKFLOW_NAME,
+  // Task #36: the ONLY workflow on the dedicated `render` queue (Remotion drives a headless
+  // Chromium + an FFmpeg encode — far too heavy to share a worker slot with the light
+  // git-ops/ai-generation work). Same shared-constant discipline: the API's render-enqueue
+  // path (task 37) imports this exact name from db-lib.
+  render: RENDER_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -110,4 +117,6 @@ export const WORKFLOW_QUEUE = {
   generateAudio: AI_GENERATION_QUEUE_NAME,
   // generateVideo (task 34) rides the same ai-generation queue.
   generateVideo: AI_GENERATION_QUEUE_NAME,
+  // render (task 36) is alone on the dedicated `render` queue at 1/worker.
+  render: RENDER_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;

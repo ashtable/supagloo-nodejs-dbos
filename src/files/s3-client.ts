@@ -1,4 +1,4 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 /**
  * The FIRST real S3 WRITER in the codebase (design-delta §4/§8, task #32). Unlike the API
@@ -61,4 +61,47 @@ export async function uploadAsset(
       ContentType: args.contentType,
     }),
   );
+}
+
+export interface DownloadAssetArgs {
+  bucket: string;
+  /** The object key — the same shared db-lib layout the writer used. */
+  key: string;
+}
+
+export interface DownloadedAsset {
+  bytes: Buffer;
+  contentType?: string;
+}
+
+/**
+ * GET an object's bytes. Task #36 makes dbos an S3 READER as well as a writer:
+ * `renderWorkflow`'s `downloadSceneAssets` pulls every manifest-referenced object into
+ * the render workspace's `public/` dir so `@remotion/bundler` can snapshot it INTO the
+ * bundle (verified: bundle() copies `<root>/public` → `<outDir>/public`). Our buckets are
+ * private, so a bundle-baked remote URL is not an option — see the plan's decision D1.
+ *
+ * Still internal-role, internal-endpoint: the API remains the only presigner.
+ * A missing/!empty body throws rather than yielding an empty buffer, so a vanished object
+ * surfaces as a step failure instead of a silently blank frame.
+ */
+export async function downloadAsset(
+  client: S3Client,
+  args: DownloadAssetArgs,
+): Promise<DownloadedAsset> {
+  const res = await client.send(
+    new GetObjectCommand({ Bucket: args.bucket, Key: args.key }),
+  );
+  const body = res.Body as
+    | { transformToByteArray: () => Promise<Uint8Array> }
+    | undefined;
+  if (!body || typeof body.transformToByteArray !== "function") {
+    throw new Error(
+      `S3 object ${args.bucket}/${args.key} returned no readable body`,
+    );
+  }
+  return {
+    bytes: Buffer.from(await body.transformToByteArray()),
+    contentType: res.ContentType,
+  };
 }

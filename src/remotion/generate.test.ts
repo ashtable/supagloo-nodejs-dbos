@@ -93,9 +93,25 @@ describe("generateProjectFiles — static file spec checks", () => {
     expect(files.get("src/index.ts")).toContain("registerRoot(RemotionRoot)");
   });
 
-  it("src/lib/assets.ts exports getAssetUrl over REMOTION_ASSET_BASE_URL", () => {
+  // Task #36 (plan D1): the renderWorkflow downloads every manifest-referenced asset
+  // into the workspace `public/` dir, because our S3 buckets are PRIVATE (a bundle-baked
+  // remote URL would need a public-read policy or per-object presigned URLs, neither of
+  // which a single base URL can express) and because `bundle()` snapshots `public/` INTO
+  // the bundle. So the default resolution path is `staticFile()`, with the
+  // REMOTION_ASSET_BASE_URL remote origin kept as an explicit opt-in escape hatch.
+  //
+  // Verified against the pinned 4.0.490 sources: @remotion/bundler copies `<root>/public`
+  // to `<outDir>/public` and serves it at `/public`, so the old bare `/${assetKey}`
+  // fallback did NOT resolve to a bundled public file.
+  it("src/lib/assets.ts resolves assets with staticFile by default", () => {
     const assets = files.get("src/lib/assets.ts") ?? "";
     expect(assets).toContain("export function getAssetUrl");
+    expect(assets).toContain("staticFile");
+    expect(assets).toContain('from "remotion"');
+  });
+
+  it("src/lib/assets.ts keeps REMOTION_ASSET_BASE_URL as an explicit remote override", () => {
+    const assets = files.get("src/lib/assets.ts") ?? "";
     expect(assets).toContain("REMOTION_ASSET_BASE_URL");
   });
 
@@ -105,6 +121,40 @@ describe("generateProjectFiles — static file spec checks", () => {
     expect(pkg.dependencies["@remotion/cli"]).toBe(REMOTION_VERSION);
     expect(pkg.dependencies.react).toBe(REACT_VERSION);
     expect(pkg.dependencies["react-dom"]).toBe(REACT_VERSION);
+  });
+});
+
+// Task #36: the composition must actually REFERENCE the narration/music tracks, or
+// "synthesize audio before bundling" (design-delta §7 workflow 9) is theatre — the audio
+// would be snapshotted into the bundle and never played. <Audio> is emitted only when the
+// manifest carries the corresponding asset key; the render workflow patches a
+// freshly-synthesized track's key into the manifest before re-materializing the sources.
+describe("audio tracks in the generated composition (task #36)", () => {
+  it("emits <Audio> for a cached music bed", () => {
+    const video = fileMap(generateProjectFiles(shelterManifest)).get("src/Video.tsx") ?? "";
+    expect(video).toContain("Audio");
+    expect(video).toContain("projects/demo/music/bed.mp3");
+  });
+
+  it("emits <Audio> for the narrator track when narratorVoice.assetKey is present", () => {
+    const withNarration = {
+      ...shelterManifest,
+      narratorVoice: { ...shelterManifest.narratorVoice, assetKey: "render-audio/narration.wav" },
+    };
+    const video = fileMap(generateProjectFiles(withNarration)).get("src/Video.tsx") ?? "";
+    expect(video).toContain("render-audio/narration.wav");
+    expect(video.match(/<Audio/g) ?? []).toHaveLength(2);
+  });
+
+  it("emits NO <Audio> when the manifest carries neither audio key", () => {
+    const noAudio = { ...shelterManifest, music: { style: "ambient" } };
+    const video = fileMap(generateProjectFiles(noAudio)).get("src/Video.tsx") ?? "";
+    expect(video).not.toContain("<Audio");
+  });
+
+  it("resolves audio through the same getAssetUrl seam as visuals", () => {
+    const video = fileMap(generateProjectFiles(shelterManifest)).get("src/Video.tsx") ?? "";
+    expect(video).toContain("getAssetUrl");
   });
 });
 

@@ -214,3 +214,74 @@ describe("loadEnv", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task #36 — renderWorkflow tuning + the render-time audio fallback models.
+//
+// Timeouts are "generous" by design (design-delta §9-Q8 defers real tuning to the
+// load-testing task 45); they exist as env vars so task 45 can tune them without a
+// code change. DBOS has no per-step timeout, so these are CHILD-PROCESS kill
+// deadlines — which is also what bounds the untrusted user code.
+//
+// RENDER_NARRATION_MODEL / RENDER_MUSIC_MODEL are OPTIONAL WITH NO DEFAULT: model ids
+// are never hardcoded (design §7 / §10.9), and an unset model means the render simply
+// proceeds without that track rather than failing.
+//
+// Note the deliberate ABSENCE of REMOTION_ASSET_BASE_URL: the render workflow
+// downloads assets into the workspace `public/` dir and resolves them with
+// `staticFile()`, so no remote asset origin is needed (plan D1).
+// ---------------------------------------------------------------------------
+
+describe("Task #36 render env", () => {
+  it("defaults the three render timeouts to generous values", () => {
+    const env = loadEnv(validEnv());
+    expect(env.RENDER_MEDIA_TIMEOUT_SECONDS).toBe(3600);
+    expect(env.RENDER_BUNDLE_TIMEOUT_SECONDS).toBe(900);
+    expect(env.RENDER_INSTALL_TIMEOUT_SECONDS).toBe(900);
+  });
+
+  it("coerces string overrides to numbers", () => {
+    const env = loadEnv(
+      validEnv({
+        RENDER_MEDIA_TIMEOUT_SECONDS: "120",
+        RENDER_BUNDLE_TIMEOUT_SECONDS: "60",
+        RENDER_INSTALL_TIMEOUT_SECONDS: "45",
+      }),
+    );
+    expect(env.RENDER_MEDIA_TIMEOUT_SECONDS).toBe(120);
+    expect(env.RENDER_BUNDLE_TIMEOUT_SECONDS).toBe(60);
+    expect(env.RENDER_INSTALL_TIMEOUT_SECONDS).toBe(45);
+  });
+
+  it("rejects a non-positive timeout", () => {
+    expect(() => loadEnv(validEnv({ RENDER_MEDIA_TIMEOUT_SECONDS: "0" }))).toThrow();
+    expect(() => loadEnv(validEnv({ RENDER_BUNDLE_TIMEOUT_SECONDS: "-1" }))).toThrow();
+  });
+
+  it("leaves the render audio models undefined when unset (fallback synthesis is opt-in)", () => {
+    const env = loadEnv(validEnv());
+    expect(env.RENDER_NARRATION_MODEL).toBeUndefined();
+    expect(env.RENDER_MUSIC_MODEL).toBeUndefined();
+  });
+
+  it("treats an EMPTY render model as absent (compose ${VAR:-} substitution)", () => {
+    const env = loadEnv(
+      validEnv({ RENDER_NARRATION_MODEL: "", RENDER_MUSIC_MODEL: "   " }),
+    );
+    expect(env.RENDER_NARRATION_MODEL).toBeUndefined();
+    expect(env.RENDER_MUSIC_MODEL).toBeUndefined();
+  });
+
+  it("accepts render audio model ids when supplied", () => {
+    const env = loadEnv(
+      validEnv({ RENDER_NARRATION_MODEL: "a/b", RENDER_MUSIC_MODEL: "c/d" }),
+    );
+    expect(env.RENDER_NARRATION_MODEL).toBe("a/b");
+    expect(env.RENDER_MUSIC_MODEL).toBe("c/d");
+  });
+
+  it("does NOT introduce REMOTION_ASSET_BASE_URL (assets resolve via staticFile, plan D1)", () => {
+    const env = loadEnv(validEnv()) as Record<string, unknown>;
+    expect(env.REMOTION_ASSET_BASE_URL).toBeUndefined();
+  });
+});
