@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,31 +15,39 @@ import {
   type ImportProjectPayload,
   type ImportProjectResult,
 } from "../../src/workflows/import-project";
+import {
+  authenticatedRemoteUrl,
+  provisionFixtureRepo,
+  resolveGithubE2eContext,
+  resolveGithubE2eSecrets,
+  type FixtureRepo,
+} from "../../src/testing/github-e2e";
+import { countStepExecutions } from "../../src/testing/step-introspection";
 
-// End-to-end proof of importProjectWorkflow against the REAL provider-stub harness: the
-// GitHub REST stub (localhost:4801) mints the installation token, and the local git
-// smart-HTTP server (localhost:4805) serves a REAL clone of an existing repo. The DBOS
-// runtime is launched IN-PROCESS (consuming the uncommitted db-lib via the file: dep —
-// the containerized worker can't, per the in-flight-dblib-e2e constraint). No mocks.
+// End-to-end proof of importProjectWorkflow against **REAL GitHub**: api.github.com mints
+// the installation token (real App PEM, runtime-DISCOVERED installation) and github.com
+// serves a REAL authenticated clone of an existing repo. The DBOS runtime is launched
+// IN-PROCESS (consuming the uncommitted db-lib via the file: dep — the containerized
+// worker can't, per the in-flight-dblib-e2e constraint). No mocks.
 //
-// The git-server's admin route only seeds a single README on the default branch, so the
-// VALID fixture (remotion.config.ts + supagloo.project.json + multiple vN.N.N branches)
-// is constructed IN-TEST with the host `git` CLI — the stub is NOT edited.
+// Task 62 (design-delta §11) deleted the github-stub (:4801) + git-server (:4805). Each
+// test provisions its own per-run PRIVATE repo
+// (the shared e2e prefix + `import-<case>` + the run id, `auto_init: true`), never torn down
+// in-suite — reclaim with root's interactive `npm run cleanup:github-e2e`, which archives
+// rather than deletes. A fresh fixture repo carries only GitHub's `auto_init` README (which
+// is exactly what the "not a Supagloo project" case needs), so the VALID fixture
+// (remotion.config.ts + supagloo.project.json + multiple vN.N.N branches) is constructed
+// IN-TEST with the host `git` CLI.
 //
 // Three proofs: (1) import a valid Supagloo repo → resolves the highest version by REAL
 // semver, records finalized; (2) import a non-Supagloo repo → fails fast with the
 // "NOT A SUPAGLOO PROJECT" stage state, single execution; (3) crash/replay — cancel
 // before parseManifest, delete the workspace (fresh worker), resume → completes once.
 
-const GITHUB_STUB = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
-const INSTALLATION_ID = "42";
-
-// The reused Compose git-server persists repos across runs, and the import fixture
-// commits are NOT byte-deterministic (unlike scaffold's), so re-pushing fixed version
-// branches would be a non-fast-forward. A fresh, unique repo name per test keeps every
-// run hermetic.
-const uniqueRepo = (base: string): string => `${base}-${randomUUID().slice(0, 8)}`;
+// Per-run repo names are inherent to `provisionFixtureRepo` (D6/D7), which is what keeps
+// every run hermetic: the import fixture commits are NOT byte-deterministic (unlike
+// scaffold's), so re-pushing fixed version branches into a reused repo would be a
+// non-fast-forward.
 
 const HERMETIC_GIT = {
   GIT_TERMINAL_PROMPT: "0",
@@ -58,11 +66,9 @@ const VALID_MANIFEST = {
   narratorVoice: { description: "Calm, measured narrator" },
 };
 
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
+// Real GitHub App credentials from the root `.env` (loaded per-worker by
+// `tests/e2e/load-root-env.ts`); fails fast by name if any is missing.
+const githubSecrets = resolveGithubE2eSecrets();
 
 const env: Env = loadEnv({
   DATABASE_URL:
@@ -71,10 +77,10 @@ const env: Env = loadEnv({
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
   NODE_ENV: "test",
-  GITHUB_API_BASE_URL: GITHUB_STUB,
-  GITHUB_GIT_BASE_URL: GIT_SERVER,
-  GITHUB_APP_ID: "123456",
-  GITHUB_APP_PRIVATE_KEY: privateKey,
+  // No GITHUB_*_BASE_URL override — the env schema already defaults to the real hosts
+  // (finding F1: dbos was always real-by-default; only these specs pointed it at a stub).
+  GITHUB_APP_ID: githubSecrets.appId,
+  GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
   SECRETS_ENCRYPTION_KEY: "0".repeat(64),
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
@@ -87,25 +93,17 @@ const env: Env = loadEnv({
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
 
-async function resetGithubStub(): Promise<void> {
-  await fetch(`${GITHUB_STUB}/__stub/reset`, { method: "POST" });
-}
+/**
+ * The installation token this file's fixture git operations authenticate with, minted once
+ * in `beforeAll` through the PRODUCT path (db-lib `mintInstallationToken`). Fixture repos
+ * are private, so the fixture clone/push needs it; the retired git-server needed none.
+ */
+let installationToken = "";
 
-async function githubState(): Promise<Record<string, number>> {
-  const res = await fetch(`${GITHUB_STUB}/__stub/calls`);
-  const body = (await res.json()) as { state: Record<string, number> };
-  return body.state;
-}
-
-async function provisionRepo(fullName: string): Promise<void> {
-  const res = await fetch(`${GIT_SERVER}/__admin/repos`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: fullName, seed: true, defaultBranch: "main" }),
-  });
-  if (!res.ok && res.status !== 409) {
-    throw new Error(`provisionRepo(${fullName}) failed: ${res.status}`);
-  }
+/** `https://x-access-token:<token>@github.com/<owner>/<repo>.git` for a fixture repo. */
+function authRemote(fullName: string): string {
+  const [owner, repo] = fullName.split("/");
+  return authenticatedRemoteUrl({ token: installationToken, owner, repo });
 }
 
 /** Build a REAL Supagloo project on the origin: remotion.config.ts + manifest on main,
@@ -115,7 +113,7 @@ function seedSupaglooRepo(fullName: string, branches: string[]): void {
   const g = (args: string[]) =>
     execFileSync("git", args, { cwd: work, env: { ...process.env, ...HERMETIC_GIT } });
   try {
-    execFileSync("git", ["clone", `${GIT_SERVER}/${fullName}.git`, work], {
+    execFileSync("git", ["clone", authRemote(fullName), work], {
       env: { ...process.env, ...HERMETIC_GIT },
     });
     writeFileSync(
@@ -138,11 +136,12 @@ function seedSupaglooRepo(fullName: string, branches: string[]): void {
   }
 }
 
-async function seedImportProjectJob(repoName: string): Promise<{
+async function seedImportProjectJob(fixture: FixtureRepo): Promise<{
   projectId: string;
   jobId: string;
   payload: ImportProjectPayload;
 }> {
+  const github = await resolveGithubE2eContext();
   const suffix = randomUUID().slice(0, 8);
   const user = await prisma.user.create({
     data: {
@@ -158,8 +157,8 @@ async function seedImportProjectJob(repoName: string): Promise<{
       slug: `import-${suffix}`,
       ownerId,
       name: "Import E2E",
-      repoOwner: "acme",
-      repoName,
+      repoOwner: fixture.owner,
+      repoName: fixture.repo,
       repoVisibility: "private",
       createdFrom: "import",
       currentBranch: "main",
@@ -180,9 +179,10 @@ async function seedImportProjectJob(repoName: string): Promise<{
     projectId: project.id,
     userId: ownerId,
     ownerId,
-    installationId: INSTALLATION_ID,
-    repoOwner: "acme",
-    repoName,
+    // DISCOVERED at runtime (D5) — never the fabricated `"42"` real GitHub 404s on.
+    installationId: github.installationId,
+    repoOwner: fixture.owner,
+    repoName: fixture.repo,
     repoVisibility: "private",
     slug: project.slug,
     name: project.name,
@@ -201,6 +201,7 @@ async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  installationToken = (await resolveGithubE2eContext()).token;
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
 }, 120_000);
@@ -214,12 +215,10 @@ afterAll(async () => {
 
 describe("importProjectWorkflow — happy path", () => {
   it("imports a valid Supagloo repo: resolves the highest vN.N.N, finalizes records", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("import-valid");
-    await provisionRepo(`acme/${repo}`);
+    const fixture = await provisionFixtureRepo("import-valid");
     // Lexically v0.2.3 > v0.10.0; the resolver must pick v0.10.0 (numeric semver).
-    seedSupaglooRepo(`acme/${repo}`, ["v0.1.0", "v0.2.3", "v0.10.0"]);
-    const { projectId, jobId, payload } = await seedImportProjectJob(repo);
+    seedSupaglooRepo(fixture.fullName, ["v0.1.0", "v0.2.3", "v0.10.0"]);
+    const { projectId, jobId, payload } = await seedImportProjectJob(fixture);
 
     const handle = await client.enqueue<ImportProjectResult>(
       {
@@ -236,15 +235,17 @@ describe("importProjectWorkflow — happy path", () => {
     expect(result.version.semver).toBe("0.10.0");
     expect(result.version.headCommitSha).toMatch(/^[0-9a-f]{40}$/);
 
-    // Token minted at least once; import performs no PR open/merge.
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBeGreaterThanOrEqual(1);
+    // Exactly-once, DURABILITY axis only (D9). `importProjectWorkflow` is READ-ONLY on
+    // GitHub — `import-project/workspace.ts` checks out and never pushes, opens no PR and
+    // creates no ref — so there is deliberately NO real-host artifact half here. The
+    // missing second axis is a property of the workflow, not an oversight.
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
 
     // Project advanced to the resolved version branch.
     const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
     expect(project.currentBranch).toBe("v0.10.0");
-    expect(project.repoOwner).toBe("acme");
-    expect(project.repoName).toBe(repo);
+    expect(project.repoOwner).toBe(fixture.owner);
+    expect(project.repoName).toBe(fixture.repo);
 
     // Exactly ONE ProjectVersion (the resolved latest), working.
     const versions = await prisma.projectVersion.findMany({ where: { projectId } });
@@ -265,12 +266,11 @@ describe("importProjectWorkflow — happy path", () => {
 
 describe("importProjectWorkflow — non-Supagloo repo fails fast", () => {
   it("fails with the NOT A SUPAGLOO PROJECT stage state, no retries burned", async () => {
-    await resetGithubStub();
-    // Provisioned + seeded with only a README on main — no remotion.config.ts, no
-    // version branch: NOT a Supagloo project.
-    const repo = uniqueRepo("import-invalid");
-    await provisionRepo(`acme/${repo}`);
-    const { projectId, jobId, payload } = await seedImportProjectJob(repo);
+    // Left exactly as `auto_init` created it — a single README on main, no
+    // remotion.config.ts, no version branch: NOT a Supagloo project. (Real GitHub's
+    // auto-init README plays the role the git-server's `seed: true` used to.)
+    const fixture = await provisionFixtureRepo("import-invalid");
+    const { projectId, jobId, payload } = await seedImportProjectJob(fixture);
 
     const handle = await client.enqueue<ImportProjectResult>(
       {
@@ -298,19 +298,18 @@ describe("importProjectWorkflow — non-Supagloo repo fails fast", () => {
     expect(versions).toHaveLength(0);
 
     // Single execution — the non-retryable verify failure did not re-run the workflow
-    // (step-level non-retry is pinned deterministically by retry.test.ts).
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBe(1);
+    // (step-level non-retry is pinned deterministically by retry.test.ts). Counted in the
+    // DBOS system DB and attributed to THIS workflow, which the stub's global counter
+    // could not do.
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
   }, 90_000);
 });
 
 describe("importProjectWorkflow — crash / replay", () => {
   it("cancels before parseManifest, deletes the workspace, then resumes to completion once", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("import-replay");
-    await provisionRepo(`acme/${repo}`);
-    seedSupaglooRepo(`acme/${repo}`, ["v0.0.1", "v0.3.0"]);
-    const { projectId, jobId, payload } = await seedImportProjectJob(repo);
+    const fixture = await provisionFixtureRepo("import-replay");
+    seedSupaglooRepo(fixture.fullName, ["v0.0.1", "v0.3.0"]);
+    const { projectId, jobId, payload } = await seedImportProjectJob(fixture);
 
     // Park at the boundary just before parseManifest (after resolveLatestVersionBranch
     // has checkpointed) so the cancel lands at a step boundary.
@@ -354,9 +353,9 @@ describe("importProjectWorkflow — crash / replay", () => {
     expect(result.workflowId).toBe(jobId);
     expect(result.version.branchName).toBe("v0.3.0");
 
-    // Exactly-once: one token minted (completed mint step not re-run), one version.
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBe(1);
+    // Exactly-once across the resume: the completed mint step was NOT re-run, one version.
+    // Durability axis only — import pushes nothing (see the happy-path note above).
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
     const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
     expect(job.status).toBe("succeeded");
     const versions = await prisma.projectVersion.findMany({ where: { projectId } });

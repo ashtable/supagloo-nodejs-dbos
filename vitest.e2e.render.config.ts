@@ -12,8 +12,16 @@ import { defineConfig } from "vitest/config";
 // hostage to Chromium. `plan.md` row 36 calls this suite "tagged slow"; the tag here is
 // the dedicated `*.render.e2e.ts` filename + this config + the `test:e2e:render` script.
 //
-// It DOES need the Compose infra (Postgres app+system DBs, MinIO, github-stub,
-// git-server), so unlike the bundle config it keeps the shared globalSetup.
+// Required infra (task 62): the Compose Postgres (app + system DBs) and MinIO, plus the
+// root `.env` GitHub App credentials + `GITHUB_E2E_PAT_TOKEN` and real network egress —
+// the clone this spec renders from is a REAL clone of a per-run fixture repo on
+// github.com. The github-stub + git-server fixtures this header used to name are DELETED
+// (design-delta §11): the render lane's git path is now the real one, which is what
+// finally retires the stale-git-server-fixture trap (tech-lead memory
+// `render-workflow-gotchas`) by deletion rather than by documentation.
+//
+// `setupFiles` loads the root `.env` into each worker (D24) — globalSetup runs in the
+// main process and cannot reach the specs.
 export default defineConfig({
   test: {
     environment: "node",
@@ -24,5 +32,6 @@ export default defineConfig({
     hookTimeout: 600_000,
     fileParallelism: false,
     globalSetup: ["tests/e2e/global-setup.ts"],
+    setupFiles: ["tests/e2e/load-root-env.ts"],
   },
 });

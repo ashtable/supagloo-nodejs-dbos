@@ -83,11 +83,17 @@ export const envSchema = z.object({
   GITHUB_APP_PRIVATE_KEY: z.string().min(1),
 
   // GitHub REST API host (installation tokens, reachability, PRs). Verbatim from api.
+  // Since task 62 (design-delta §11) this is NEVER overridden anywhere in the system: the
+  // github-stub is deleted, `docker-compose.test.yml` overrides no GitHub var, and every
+  // e2e spec reaches real api.github.com through this default. `providers.e2e.ts`'s
+  // no-stub guard asserts exactly that, so the override path below survives only for a
+  // future self-hosted (GitHub Enterprise) deployment.
   GITHUB_API_BASE_URL: providerBaseUrl("GITHUB_API_BASE_URL", "https://api.github.com"),
-  // Git clone/push host. In prod this is github.com (same host as the OAuth flow);
-  // in test it must point at the LOCAL git-server, NOT the REST stub, so it is its
-  // OWN var (dbos is the only git client — the API never clones). Default matches
-  // prod git-over-HTTPS: `https://github.com/<owner>/<repo>.git`.
+  // Git clone/push host — its OWN var because dbos is the only git client (the API never
+  // clones), and because a self-hosted deployment splits the git host from the REST host.
+  // It used to point at the LOCAL git-server in test; that fixture is deleted, so the
+  // default IS the test value now: `https://github.com/<owner>/<repo>.git`, cloned with an
+  // `x-access-token:<installation token>@` credential.
   GITHUB_GIT_BASE_URL: providerBaseUrl("GITHUB_GIT_BASE_URL", "https://github.com"),
 
   // Task #29 provider-call layer (design-delta §7). The outbound LLM/media provider

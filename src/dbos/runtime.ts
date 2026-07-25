@@ -53,8 +53,14 @@ export async function launchDbos(env: Env): Promise<void> {
   await ensureNoopProofTable(appDb);
 
   // Inject the app-level GitHub config the git-ops workflows read (mirrors setAppDb:
-  // steps never touch process.env). App id/key sign App JWTs; base URLs are
-  // env-overridable (real hosts in prod, stub URLs in test).
+  // steps never touch process.env). App id/key sign App JWTs.
+  //
+  // The two base URLs stay env-overridable (real-by-default zod defaults in
+  // ../config/env.ts) purely so a GitHub Enterprise host could be pointed at. Since
+  // task 62 NOTHING overrides them: the github-stub and the local git-server are
+  // deleted, no Compose file and no spec injects a GitHub base URL, so every lane —
+  // unit, e2e and production alike — resolves https://api.github.com /
+  // https://github.com. Do not reintroduce a test-time override here.
   setScaffoldConfig({
     githubApiBaseUrl: env.GITHUB_API_BASE_URL,
     githubGitBaseUrl: env.GITHUB_GIT_BASE_URL,

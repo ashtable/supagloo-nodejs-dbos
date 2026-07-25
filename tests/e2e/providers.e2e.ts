@@ -42,6 +42,10 @@ const env: Env = loadEnv({
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
   NODE_ENV: "test",
+  // Dummy App credentials: this spec makes ZERO GitHub calls, they exist only to satisfy
+  // `loadEnv`'s fail-fast. Kept dummy deliberately — a real PEM here would buy nothing and
+  // would put a live credential in a spec that has no use for one. The GitHub BASE URLs
+  // below are the interesting part, and they are left at their real-host defaults.
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
@@ -69,9 +73,17 @@ const GREETING_PROMPT =
  * Now we assert the opposite — each base URL points at a real host and carries NO stub override
  * (neither a `localhost`/host-port form nor a Compose-internal `*-stub:` name). A guard against
  * the stub pattern silently creeping back.
+ *
+ * Task 62 extends it to the two GITHUB base URLs. That is the STRUCTURAL guarantee that stub
+ * wiring cannot creep back for GitHub either: `github-stub` (`:4801`) and `git-server`
+ * (`:4805`) are deleted, `docker-compose.test.yml` no longer overrides
+ * `GITHUB_API_BASE_URL`/`GITHUB_OAUTH_BASE_URL`, and no spec injects a base URL any more —
+ * so `src/config/env.ts`'s real-host zod defaults are the only source. This guard is
+ * verified to go red when a stub URL is injected (the 34-E8 pattern), and it lives here
+ * rather than in a unit test because only an e2e sees the env a real run actually loads.
  */
 function assertNoStubOverride(name: string, url: string): void {
-  expect(url, `${name} must point at a real https provider host`).toMatch(/^https:\/\//);
+  expect(url, `${name} must point at a real https host`).toMatch(/^https:\/\//);
   expect(url, `${name} must not carry a stub override`).not.toMatch(
     /localhost|127\.0\.0\.1|-stub|:480\d/,
   );
@@ -81,13 +93,24 @@ beforeEach(() => {
   clearDiscoveryCache();
 });
 
-describe("no-stub guard (§10.7): provider base URLs carry no stub override", () => {
+describe("no-stub guard (§10.7 / task 62 §11): every outbound base URL carries no stub override", () => {
   it.each([
     ["OPENROUTER_BASE_URL", env.OPENROUTER_BASE_URL],
     ["GLOO_BASE_URL", env.GLOO_BASE_URL],
     ["YOUVERSION_BASE_URL", env.YOUVERSION_BASE_URL],
+    // Task 62: GitHub joins the guard. `GITHUB_GIT_BASE_URL` is dbos-specific (dbos is the
+    // only git client — the api never clones), so this spec is the only place it is guarded.
+    ["GITHUB_API_BASE_URL", env.GITHUB_API_BASE_URL],
+    ["GITHUB_GIT_BASE_URL", env.GITHUB_GIT_BASE_URL],
   ])("%s points at a real host, not a stub", (name, url) => {
     assertNoStubOverride(name, url);
+  });
+
+  it("resolves the GitHub hosts to github.com / api.github.com by DEFAULT, with nothing injected", () => {
+    // The positive half: not merely "not a stub", but the exact real hosts. If a future
+    // overlay or spec re-introduces an override, this is the assertion that names it.
+    expect(env.GITHUB_API_BASE_URL).toBe("https://api.github.com");
+    expect(env.GITHUB_GIT_BASE_URL).toBe("https://github.com");
   });
 });
 

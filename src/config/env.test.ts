@@ -115,15 +115,21 @@ describe("loadEnv", () => {
     expect(env.GITHUB_GIT_BASE_URL).toBe("https://github.com");
   });
 
-  it("accepts overridden (stub) GitHub base URLs", () => {
+  // The override MECHANISM still exists (a self-hosted GitHub Enterprise host is the
+  // legitimate reason), but since task 62 nothing in this repo uses it: the github-stub +
+  // git-server are deleted and no spec or Compose file injects a GitHub base URL any more,
+  // so the real-host defaults above are the only values a run ever sees. Kept as a
+  // schema test, deliberately using a NEUTRAL host rather than the retired stub ports, so
+  // nobody reads this as evidence that stub wiring is still supported.
+  it("accepts an explicitly overridden GitHub base URL (e.g. GitHub Enterprise)", () => {
     const env = loadEnv(
       validEnv({
-        GITHUB_API_BASE_URL: "http://localhost:4801",
-        GITHUB_GIT_BASE_URL: "http://localhost:4805",
+        GITHUB_API_BASE_URL: "https://github.example.com/api/v3",
+        GITHUB_GIT_BASE_URL: "https://github.example.com",
       }),
     );
-    expect(env.GITHUB_API_BASE_URL).toBe("http://localhost:4801");
-    expect(env.GITHUB_GIT_BASE_URL).toBe("http://localhost:4805");
+    expect(env.GITHUB_API_BASE_URL).toBe("https://github.example.com/api/v3");
+    expect(env.GITHUB_GIT_BASE_URL).toBe("https://github.example.com");
   });
 
   it("rejects a non-http GitHub base URL", () => {

@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 
 /**
  * Thin, hermetic wrappers over the system `git` CLI (house style: shell out to git,
- * zero npm git deps — matches the task-9 stub git-server itself). Every invocation
+ * zero npm git deps). Every invocation
  * runs with a hermetic environment so the host's user/system git config cannot
  * perturb behaviour, and commits use a FIXED identity + date so the base commit is
  * byte-deterministic (see {@link commitAll}) — the property the workflow's
