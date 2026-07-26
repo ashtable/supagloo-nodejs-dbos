@@ -11,11 +11,14 @@ import {
   mergePullRequest,
   openPullRequest,
 } from "./scaffold-project/github-rest";
-import { retryUnlessPermanent } from "./scaffold-project/retry";
+import { isPermanentScaffoldFailure, retryUnlessPermanent } from "./scaffold-project/retry";
 import {
   BASE_BRANCH,
+  DEFAULT_BASE_BRANCH,
   WORKING_BRANCH,
+  baseRefOf,
   cutWorkingBranchLocal,
+  ensureBaseRef,
   ensureClone,
   ensureScaffold,
   materializeBaseVersion,
@@ -23,7 +26,11 @@ import {
   removeWorkspace,
   type ScaffoldContext,
 } from "./scaffold-project/workspace";
-import { markJobRunning, markStageDone } from "./scaffold-project/stages";
+import {
+  markJobFailed,
+  markJobRunning,
+  markStageDone,
+} from "./scaffold-project/stages";
 import { finalizeRecords } from "./scaffold-project/finalize";
 
 /**
@@ -123,175 +130,233 @@ async function scaffoldProjectFn(
   const cfg = getScaffoldConfig();
   const rest = (token: string) => ({ apiBaseUrl: cfg.githubApiBaseUrl, token });
 
-  // 0) markJobRunning — flip the job lifecycle status queued → running so the polling
-  //    UI observes progress before any stage completes. Status ONLY (no stage change).
-  await boundary("markJobRunning");
-  await DBOS.runStep(
-    async () => {
-      await markJobRunning(prisma, jobId);
-    },
-    { name: "markJobRunning" },
-  );
-
-  // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
-  await boundary("mintInstallationToken");
-  const token = await DBOS.runStep(
-    async () => {
-      const minted = await mintInstallationToken({
-        appId: cfg.githubAppId,
-        privateKey: cfg.githubAppPrivateKey,
-        installationId: payload.installationId,
-        apiBaseUrl: cfg.githubApiBaseUrl,
-      });
-      await markStageDone(prisma, jobId, "mintInstallationToken");
-      return minted.token;
-    },
-    { name: "mintInstallationToken", ...NETWORK_RETRY },
-  );
-
-  // 2) ensureRepoAccessible — idempotent reachability (NOT repo creation).
-  await boundary("ensureRepoAccessible");
-  await DBOS.runStep(
-    async () => {
-      await ensureRepoReachable(rest(token), payload.repoOwner, payload.repoName);
-      await markStageDone(prisma, jobId, "ensureRepoAccessible");
-    },
-    {
-      name: "ensureRepoAccessible",
-      ...NETWORK_RETRY,
-      // Fail fast on typed permanent failures (unreachable repo, permanent 4xx);
-      // retry transient ones. Shared classifier — see `retry.ts`.
-      shouldRetry: retryUnlessPermanent,
-    },
-  );
-
-  const ctx: ScaffoldContext = {
-    jobId,
-    cloneUrl: authenticatedCloneUrl(
-      cfg.githubGitBaseUrl,
-      payload.repoOwner,
-      payload.repoName,
-      token,
-    ),
-    manifest: payload.manifest,
-    defaultBranch: "main",
+  // Which stage is in flight, for the terminal-failure record below (D63.7). Free:
+  // `boundary(label)` already receives EXACTLY the stage key at every step, so `at()`
+  // just remembers it on the way past. A workflow-LOCAL variable (never module state),
+  // deterministically re-derived on replay, and safe under the git-ops queue's
+  // worker_concurrency > 1.
+  let currentStage = "markJobRunning";
+  const at = async (label: string): Promise<void> => {
+    currentStage = label;
+    await boundary(label);
   };
 
-  // 3) cloneToWorkspace — clone into the ephemeral, deterministic workspace.
-  await boundary("cloneToWorkspace");
-  await DBOS.runStep(
-    async () => {
-      await ensureClone(ctx);
-      await markStageDone(prisma, jobId, "cloneToWorkspace");
-    },
-    // Clone shells out to git; a redacted, classified GitCommandError lets a
-    // permanent auth/not-found failure fail fast (see `git.ts` / `retry.ts`).
-    { name: "cloneToWorkspace", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+  try {
+    // 0) markJobRunning — flip the job lifecycle status queued → running so the polling
+    //    UI observes progress before any stage completes. Status ONLY (no stage change).
+    await at("markJobRunning");
+    await DBOS.runStep(
+      async () => {
+        await markJobRunning(prisma, jobId);
+      },
+      { name: "markJobRunning" },
+    );
 
-  // 4) writeRemotionScaffold — template + supagloo.project.json (task-16 fn).
-  await boundary("writeRemotionScaffold");
-  const filesWritten = await DBOS.runStep(
-    async () => {
-      const { filesWritten } = await ensureScaffold(ctx);
-      await markStageDone(prisma, jobId, "writeRemotionScaffold");
-      return filesWritten;
-    },
-    { name: "writeRemotionScaffold" },
-  );
+    // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
+    //
+    // NO `shouldRetry` HERE, DELIBERATELY (plan row 64 / D64.5). Every one of the six
+    // `mintInstallationToken` steps in this repo omits it — `import-project.ts`,
+    // `publish-version.ts`, `commit-version.ts` and `render.ts` x2 — and row 64 leaves
+    // all six alone on purpose. Adding `shouldRetry: retryUnlessPermanent` here would
+    // classify a `GithubAppError` as permanent and fail fast, which sounds like an
+    // improvement and is the opposite: a **secondary-limit `403 + Retry-After` is
+    // survivable**, and db-lib's `mintInstallationToken` already honours it in-process
+    // (row 64's db-lib half). A strict classifier at this layer would turn that
+    // survivable throttle into an immediate FATAL at step 1 of every git-ops workflow —
+    // the one place row 64's nominal fix would make things strictly worse. The cost of
+    // leaving it is bounded and known: a genuinely bad private key burns the 4-attempt
+    // NETWORK_RETRY budget (~7s) before failing, which is cheap insurance.
+    await at("mintInstallationToken");
+    const token = await DBOS.runStep(
+      async () => {
+        const minted = await mintInstallationToken({
+          appId: cfg.githubAppId,
+          privateKey: cfg.githubAppPrivateKey,
+          installationId: payload.installationId,
+          apiBaseUrl: cfg.githubApiBaseUrl,
+        });
+        await markStageDone(prisma, jobId, "mintInstallationToken");
+        return minted.token;
+      },
+      { name: "mintInstallationToken", ...NETWORK_RETRY },
+    );
 
-  // 5) commitBaseVersion — deterministic v0.0.0 commit.
-  await boundary("commitBaseVersion");
-  const baseSha = await DBOS.runStep(
-    async () => {
-      const { baseSha } = await materializeBaseVersion(ctx);
-      await markStageDone(prisma, jobId, "commitBaseVersion");
-      return baseSha;
-    },
-    { name: "commitBaseVersion" },
-  );
+    // 2) ensureRepoAccessible — idempotent reachability (NOT repo creation).
+    await at("ensureRepoAccessible");
+    await DBOS.runStep(
+      async () => {
+        await ensureRepoReachable(rest(token), payload.repoOwner, payload.repoName);
+        await markStageDone(prisma, jobId, "ensureRepoAccessible");
+      },
+      {
+        name: "ensureRepoAccessible",
+        ...NETWORK_RETRY,
+        // Fail fast on typed permanent failures (unreachable repo, permanent 4xx);
+        // retry transient ones. Shared classifier — see `retry.ts`.
+        shouldRetry: retryUnlessPermanent,
+      },
+    );
 
-  // 6) pushOpenMergeBasePr — push v0.0.0, open the base PR, merge it. Self-heals the
-  //    workspace first so a crash-recovered run (workspace lost) rebuilds v0.0.0.
-  await boundary("pushOpenMergeBasePr");
-  const pr = await DBOS.runStep(
-    async () => {
-      await materializeBaseVersion(ctx);
-      await pushBranchFromWorkspace(ctx, BASE_BRANCH);
-      const opened = await openPullRequest(rest(token), {
-        owner: payload.repoOwner,
-        repo: payload.repoName,
-        head: BASE_BRANCH,
-        base: "main",
-        title: PR_TITLE,
-        body: PR_BODY,
-      });
-      const merged = await mergePullRequest(rest(token), {
-        owner: payload.repoOwner,
-        repo: payload.repoName,
-        number: opened.number,
-      });
-      await markStageDone(prisma, jobId, "pushOpenMergeBasePr");
-      return {
-        number: opened.number,
-        url: opened.url,
-        // The merge sha (base version's recorded head); falls back to the local
-        // base sha on the idempotent 405-already-merged replay path.
-        mergeSha: merged.sha ?? baseSha,
-      };
-    },
-    // Push (git) + PR open/merge (REST): fail fast on a permanent git auth failure
-    // or a permanent 4xx from GitHub; retry transient 5xx/429/network.
-    { name: "pushOpenMergeBasePr", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+    const ctx: ScaffoldContext = {
+      jobId,
+      cloneUrl: authenticatedCloneUrl(
+        cfg.githubGitBaseUrl,
+        payload.repoOwner,
+        payload.repoName,
+        token,
+      ),
+      manifest: payload.manifest,
+      defaultBranch: DEFAULT_BASE_BRANCH,
+    };
 
-  // 7) cutWorkingBranch — cut v0.0.1 from the base and push it.
-  await boundary("cutWorkingBranch");
-  const workingSha = await DBOS.runStep(
-    async () => {
-      const { workingSha } = await cutWorkingBranchLocal(ctx);
-      await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
-      await markStageDone(prisma, jobId, "cutWorkingBranch");
-      return workingSha;
-    },
-    // Pushes the working branch (git); fail fast on a permanent git auth/push failure.
-    { name: "cutWorkingBranch", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+    // 3) cloneToWorkspace — clone into the ephemeral, deterministic workspace, then
+    //    BOOTSTRAP the base ref if the repository turns out to have no commits at all
+    //    (plan row 63). A commit-less repo clones with exit 0 and an unborn HEAD, so
+    //    without this the failure only surfaces three steps later as an unattributable
+    //    422 on the base PR, with `v0.0.0` already pushed and promoted to the repo's
+    //    default branch. Deliberately INSIDE this existing step, not a new one: db-lib's
+    //    `SCAFFOLD_STAGES` is pinned key-for-key to these `runStep` names and must keep
+    //    mirroring wireframe 12a's designed log row-for-row (D63.2).
+    await at("cloneToWorkspace");
+    await DBOS.runStep(
+      async () => {
+        await ensureClone(ctx);
+        await ensureBaseRef(ctx);
+        await markStageDone(prisma, jobId, "cloneToWorkspace");
+      },
+      // Clone shells out to git; a redacted, classified GitCommandError lets a
+      // permanent auth/not-found failure fail fast (see `git.ts` / `retry.ts`).
+      { name: "cloneToWorkspace", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
 
-  // 8) finalizeRecords — Project + 2 ProjectVersion rows + job stages/status.
-  await boundary("finalizeRecords");
-  await DBOS.runStep(
-    async () => {
-      await finalizeRecords(prisma, jobId, {
-        projectId: payload.projectId,
-        repoOwner: payload.repoOwner,
-        repoName: payload.repoName,
-        repoVisibility: payload.repoVisibility,
-        base: { headCommitSha: pr.mergeSha, prNumber: pr.number, prUrl: pr.url },
-        working: { headCommitSha: workingSha },
-        changedFiles: filesWritten,
-      });
-      await removeWorkspace(ctx);
-    },
-    { name: "finalizeRecords", retriesAllowed: true, maxAttempts: 3 },
-  );
+    // 4) writeRemotionScaffold — template + supagloo.project.json (task-16 fn).
+    await at("writeRemotionScaffold");
+    const filesWritten = await DBOS.runStep(
+      async () => {
+        const { filesWritten } = await ensureScaffold(ctx);
+        await markStageDone(prisma, jobId, "writeRemotionScaffold");
+        return filesWritten;
+      },
+      { name: "writeRemotionScaffold" },
+    );
 
-  return {
-    workflowId: jobId,
-    projectId: payload.projectId,
-    baseVersion: {
-      semver: "0.0.0",
-      branchName: "v0.0.0",
-      headCommitSha: pr.mergeSha,
-      prNumber: pr.number,
-      prUrl: pr.url,
-    },
-    workingVersion: {
-      semver: "0.0.1",
-      branchName: "v0.0.1",
-      headCommitSha: workingSha,
-    },
-  };
+    // 5) commitBaseVersion — deterministic v0.0.0 commit.
+    await at("commitBaseVersion");
+    const baseSha = await DBOS.runStep(
+      async () => {
+        const { baseSha } = await materializeBaseVersion(ctx);
+        await markStageDone(prisma, jobId, "commitBaseVersion");
+        return baseSha;
+      },
+      { name: "commitBaseVersion" },
+    );
+
+    // 6) pushOpenMergeBasePr — push v0.0.0, open the base PR, merge it. Self-heals the
+    //    workspace first so a crash-recovered run (workspace lost) rebuilds v0.0.0.
+    await at("pushOpenMergeBasePr");
+    const pr = await DBOS.runStep(
+      async () => {
+        await materializeBaseVersion(ctx);
+        await pushBranchFromWorkspace(ctx, BASE_BRANCH);
+        const opened = await openPullRequest(rest(token), {
+          owner: payload.repoOwner,
+          repo: payload.repoName,
+          head: BASE_BRANCH,
+          // The PR base, read from the context instead of a bare literal (plan row 63).
+          // `ScaffoldContext.defaultBranch` had been dead code since task 17 — written
+          // once, never read — which is precisely why nothing noticed that the base ref
+          // might not exist. `ensureBaseRef` guarantees it does by this point.
+          base: baseRefOf(ctx),
+          title: PR_TITLE,
+          body: PR_BODY,
+        });
+        const merged = await mergePullRequest(rest(token), {
+          owner: payload.repoOwner,
+          repo: payload.repoName,
+          number: opened.number,
+        });
+        await markStageDone(prisma, jobId, "pushOpenMergeBasePr");
+        return {
+          number: opened.number,
+          url: opened.url,
+          // The merge sha (base version's recorded head); falls back to the local
+          // base sha on the idempotent 405-already-merged replay path.
+          mergeSha: merged.sha ?? baseSha,
+        };
+      },
+      // Push (git) + PR open/merge (REST): fail fast on a permanent git auth failure
+      // or a permanent 4xx from GitHub; retry transient 5xx/429/network.
+      { name: "pushOpenMergeBasePr", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
+
+    // 7) cutWorkingBranch — cut v0.0.1 from the base and push it.
+    await at("cutWorkingBranch");
+    const workingSha = await DBOS.runStep(
+      async () => {
+        const { workingSha } = await cutWorkingBranchLocal(ctx);
+        await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
+        await markStageDone(prisma, jobId, "cutWorkingBranch");
+        return workingSha;
+      },
+      // Pushes the working branch (git); fail fast on a permanent git auth/push failure.
+      { name: "cutWorkingBranch", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
+
+    // 8) finalizeRecords — Project + 2 ProjectVersion rows + job stages/status.
+    await at("finalizeRecords");
+    await DBOS.runStep(
+      async () => {
+        await finalizeRecords(prisma, jobId, {
+          projectId: payload.projectId,
+          repoOwner: payload.repoOwner,
+          repoName: payload.repoName,
+          repoVisibility: payload.repoVisibility,
+          base: { headCommitSha: pr.mergeSha, prNumber: pr.number, prUrl: pr.url },
+          working: { headCommitSha: workingSha },
+          changedFiles: filesWritten,
+        });
+        await removeWorkspace(ctx);
+      },
+      { name: "finalizeRecords", retriesAllowed: true, maxAttempts: 3 },
+    );
+
+    return {
+      workflowId: jobId,
+      projectId: payload.projectId,
+      baseVersion: {
+        semver: "0.0.0",
+        branchName: "v0.0.0",
+        headCommitSha: pr.mergeSha,
+        prNumber: pr.number,
+        prUrl: pr.url,
+      },
+      workingVersion: {
+        semver: "0.0.1",
+        branchName: "v0.0.1",
+        headCommitSha: workingSha,
+      },
+    };
+  } catch (err) {
+    // Plan row 63 / D63.7. Until now this function had NO try/catch and no
+    // `markJobFailed`, so a PERMANENT failure — row 63's own `422 field:base
+    // code:invalid` among them — left `ProjectJob.status` at `"running"` with the
+    // offending stage `pending` forever while DBOS reported ERROR. The user-visible
+    // face of the defect was an ETERNAL WIZARD SPINNER instead of a failure.
+    //
+    // Only PERMANENT failures are recorded (same shape as `import-project.ts`):
+    // transient ones are still owned by DBOS retry/recovery, and writing `failed` for
+    // one would lie about a job that is about to succeed. Re-thrown either way, so the
+    // DBOS workflow status is unchanged.
+    if (isPermanentScaffoldFailure(err)) {
+      await DBOS.runStep(
+        async () => {
+          await markJobFailed(prisma, jobId, currentStage, (err as Error).message);
+        },
+        { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },
+      );
+    }
+    throw err;
+  }
 }
 
 export const scaffoldProjectWorkflow = DBOS.registerWorkflow(scaffoldProjectFn, {

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { DEFAULT_GITHUB_MAX_ATTEMPTS } from "@supagloo/database-lib";
 import {
   ensureRepoReachable,
   GithubRestError,
@@ -36,6 +37,23 @@ function jsonResponse(status: number, body: unknown, headers: Record<string, str
     status,
     headers: { "content-type": "application/json", ...headers },
   });
+}
+
+/**
+ * A cfg whose rate-limit backoff RECORDS its sleeps instead of taking them (plan row
+ * 64). Every test that injects a retryable status — `429`, `5xx`, or a `403` carrying a
+ * throttle signal — MUST use this: with the real timer the unit lane would honour a 60s
+ * `Retry-After` for real, which is both a multi-minute suite and forbidden egress-shaped
+ * behaviour (design-delta §10.6). The recorded array is also the assertion surface: it
+ * is how a test proves the delay was HONOURED rather than merely skipped.
+ */
+function cfgWithSleep(fetchImpl: typeof fetch, sleeps: number[]) {
+  return {
+    ...cfgWith(fetchImpl),
+    sleepImpl: async (ms: number) => {
+      sleeps.push(ms);
+    },
+  };
 }
 
 describe("ensureRepoReachable", () => {
@@ -87,12 +105,17 @@ describe("ensureRepoReachable", () => {
   });
 
   it("throws (retryable, not RepoUnreachableError) on a 5xx list failure", async () => {
+    // plan row 64: a 5xx is retryable in-client, so this MUST use `cfgWithSleep` — with
+    // the real timer it would spend ~3.5s actually waiting inside a unit test.
+    const sleeps: number[] = [];
     const fetchImpl = (async () =>
       jsonResponse(503, { message: "unavailable" })) as unknown as typeof fetch;
 
-    const err = await ensureRepoReachable(cfgWith(fetchImpl), "acme", "empty-one").catch(
-      (e) => e,
-    );
+    const err = await ensureRepoReachable(
+      cfgWithSleep(fetchImpl, sleeps),
+      "acme",
+      "empty-one",
+    ).catch((e) => e);
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toBeInstanceOf(RepoUnreachableError);
   });
@@ -188,6 +211,18 @@ describe("mergePullRequest", () => {
 // 405-already-merged idempotent paths above are unaffected — they are NOT failures.
 describe("failure classification (permanent vs transient)", () => {
   it("isPermanentHttpStatus: 4xx except 429 are permanent; 5xx and 429 are transient", () => {
+    // plan row 64 / D64.1 — THIS TABLE IS UNCHANGED ON PURPOSE, and `403 ⇒ permanent`
+    // in particular is the load-bearing entry. The client now honours a secondary-limit
+    // `403 + Retry-After` in-process (see `withGithubRetry` below), so by the time an
+    // error reaches this classifier the delay has ALREADY been waited out up to the
+    // client's bounded budget. Re-classifying 403 as transient here would stack the DBOS
+    // step budget on top of that — and it structurally cannot help anyway: the step
+    // budget is `{maxAttempts: 4, intervalSeconds: 1, backoffRate: 2}` ≈ 7s total,
+    // against a secondary-limit `Retry-After` that is typically 60s. Four more attempts
+    // in 7s honour nothing; they just burn the budget and fail anyway.
+    //
+    // `429` stays TRANSIENT because a primary rate limit is worth a durable, out-of-
+    // process re-attempt that a workflow can survive a crash across.
     expect(isPermanentHttpStatus(400)).toBe(true);
     expect(isPermanentHttpStatus(401)).toBe(true);
     expect(isPermanentHttpStatus(403)).toBe(true);
@@ -199,10 +234,18 @@ describe("failure classification (permanent vs transient)", () => {
     expect(isPermanentHttpStatus(503)).toBe(false);
   });
 
-  it("openPullRequest throws a PERMANENT GithubRestError on 403 (shouldRetry → false)", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse(403, { message: "Forbidden" })) as unknown as typeof fetch;
-    const err = await openPullRequest(cfgWith(fetchImpl), {
+  it("openPullRequest throws a PERMANENT GithubRestError on a BARE 403, with no retry (shouldRetry → false)", async () => {
+    // plan row 64: a 403 with NO throttle header is a genuine permission denial, and
+    // §11.3:1832-1834 makes that an EXPECTED behaviour of the credential split (the
+    // installation deliberately holds no `administration` scope). It must fail on the
+    // first attempt — no sleep, no second request.
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(403, { message: "Forbidden" });
+    }) as unknown as typeof fetch;
+    const err = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), {
       owner: "acme",
       repo: "empty-one",
       head: "v0.0.0",
@@ -213,12 +256,21 @@ describe("failure classification (permanent vs transient)", () => {
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(403);
     expect(retryUnlessPermanent(err)).toBe(false);
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
   });
 
-  it("openPullRequest throws a TRANSIENT GithubRestError on 500 (shouldRetry → true)", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse(500, { message: "boom" })) as unknown as typeof fetch;
-    const err = await openPullRequest(cfgWith(fetchImpl), {
+  it("openPullRequest throws a TRANSIENT GithubRestError on 500, after the client's own bounded backoff", async () => {
+    // plan row 64: a 5xx is retryable in-client too, so the COUNT here moved from 1 to
+    // the client budget. The CLASSIFICATION did not: an upstream outage that outlives
+    // the client's ~3.5s of backoff is still worth a durable DBOS step retry.
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(500, { message: "boom" });
+    }) as unknown as typeof fetch;
+    const err = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), {
       owner: "acme",
       repo: "empty-one",
       head: "v0.0.0",
@@ -229,6 +281,9 @@ describe("failure classification (permanent vs transient)", () => {
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(500);
     expect(retryUnlessPermanent(err)).toBe(true);
+    expect(calls).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    // No throttle headers ⇒ the blind exponential fallback, capped at 30s.
+    expect(sleeps).toEqual([500, 1_000, 2_000]);
   });
 
   it("mergePullRequest throws a PERMANENT GithubRestError on 404 (shouldRetry → false)", async () => {
@@ -245,26 +300,80 @@ describe("failure classification (permanent vs transient)", () => {
   });
 
   it("mergePullRequest throws a TRANSIENT GithubRestError on 503 (shouldRetry → true)", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse(503, { message: "unavailable" })) as unknown as typeof fetch;
-    const err = await mergePullRequest(cfgWith(fetchImpl), {
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(503, { message: "unavailable" });
+    }) as unknown as typeof fetch;
+    const err = await mergePullRequest(cfgWithSleep(fetchImpl, sleeps), {
       owner: "acme",
       repo: "empty-one",
       number: 7,
     }).catch((e) => e);
     expect(err).toBeInstanceOf(GithubRestError);
     expect(retryUnlessPermanent(err)).toBe(true);
+    expect(calls).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
   });
 
-  it("ensureRepoReachable throws a PERMANENT GithubRestError on a 401 list failure", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse(401, { message: "Bad credentials" })) as unknown as typeof fetch;
-    const err = await ensureRepoReachable(cfgWith(fetchImpl), "acme", "empty-one").catch(
-      (e) => e,
-    );
+  it("ensureRepoReachable throws a PERMANENT GithubRestError on a 401 list failure, first attempt", async () => {
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(401, { message: "Bad credentials" });
+    }) as unknown as typeof fetch;
+    const err = await ensureRepoReachable(
+      cfgWithSleep(fetchImpl, sleeps),
+      "acme",
+      "empty-one",
+    ).catch((e) => e);
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(401);
     expect(retryUnlessPermanent(err)).toBe(false);
+    // A bad credential is deterministic: retrying it is pure latency.
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("ensureRepoReachable retries a 403 + Retry-After mid-pagination and completes the walk", async () => {
+    // plan row 64: the reachability check walks `Link: rel=next`, and a throttle can
+    // land on ANY page. Backing off must resume the walk, not restart or truncate it —
+    // a truncated walk would report a perfectly reachable repo as unreachable, which
+    // `retryUnlessPermanent` classifies PERMANENT and would kill the workflow.
+    const sleeps: number[] = [];
+    let page2Attempts = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (!u.includes("page=2")) {
+        return jsonResponse(
+          200,
+          { total_count: 2, repositories: [{ full_name: "acme/other" }] },
+          { link: `<${API}/installation/repositories?per_page=100&page=2>; rel="next"` },
+        );
+      }
+      page2Attempts += 1;
+      if (page2Attempts === 1) {
+        return jsonResponse(
+          403,
+          { message: "You have exceeded a secondary rate limit" },
+          { "retry-after": "9" },
+        );
+      }
+      return jsonResponse(200, {
+        total_count: 2,
+        repositories: [{ full_name: "acme/empty-one" }],
+      });
+    }) as unknown as typeof fetch;
+
+    const res = await ensureRepoReachable(
+      cfgWithSleep(fetchImpl, sleeps),
+      "acme",
+      "empty-one",
+    );
+    expect(res.fullName).toBe("acme/empty-one");
+    expect(page2Attempts).toBe(2);
+    expect(sleeps).toEqual([9_000]);
   });
 });
 
@@ -354,10 +463,22 @@ describe("openPullRequest — idempotent replay against REAL GitHub (D18-1)", ()
     expect(retryUnlessPermanent(err)).toBe(false);
   });
 
-  it("surfaces a real 403 + Retry-After as a PERMANENT typed error with NO client-side retry (plan row N2)", async () => {
-    // Real GitHub answers a secondary-rate-limit trip with 403 + Retry-After. Today the
-    // CLIENT does not honour it (deferred to plan row N2 — the e2e HARNESS backs off
-    // instead), so the contract this pins is: one request, one typed error, fail fast.
+  it("honours a real 403 + Retry-After IN-CLIENT, and — if it never clears — still surfaces a PERMANENT typed error", async () => {
+    // TOMBSTONE REPLACED (plan row 64 / D64.8). This test used to be
+    // *"surfaces a real 403 + Retry-After as a PERMANENT typed error with NO client-side
+    // retry (plan row N2)"* with `expect(calls).toBe(1)`; its body named row N2 as the
+    // future contract change. This IS row N2 (plan row 64), so the body is replaced
+    // rather than extended, and the row-N2 note is gone.
+    //
+    // The new contract is the TWO-LAYER RULE (D64.1), and both halves are asserted here
+    // because they only make sense together:
+    //   1. the CLIENT sleeps — it honours GitHub's own `Retry-After` with a bounded,
+    //      capped budget, which is the only layer that CAN honour a 60s delay; and
+    //   2. the CLASSIFIER still says PERMANENT — so the DBOS step budget (~7s) does not
+    //      stack four more useless attempts on top of the delay the client already
+    //      waited out.
+    // Weakening either half re-opens the bug the other half exists to prevent.
+    const sleeps: number[] = [];
     let calls = 0;
     const fetchImpl = (async () => {
       calls += 1;
@@ -368,24 +489,166 @@ describe("openPullRequest — idempotent replay against REAL GitHub (D18-1)", ()
       );
     }) as unknown as typeof fetch;
 
-    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    const err = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), openArgs).catch(
+      (e) => e,
+    );
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(403);
+    // (1) the delay was honoured, once per gap in the budget, at GitHub's own value.
+    expect(calls).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toEqual([37_000, 37_000, 37_000]);
+    // (2) and the two layers still do not multiply.
     expect(retryUnlessPermanent(err)).toBe(false);
-    expect(calls).toBe(1);
+  });
+
+  it("honours a 403 + Retry-After that CLEARS, and opens the PR on the retry", async () => {
+    // The other half of the acceptance: "honors the delay then retries" has to actually
+    // SUCCEED, not merely delay the same failure.
+    const sleeps: number[] = [];
+    let calls = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method !== "POST") return jsonResponse(200, []);
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(
+          403,
+          { message: "You have exceeded a secondary rate limit" },
+          { "retry-after": "12" },
+        );
+      }
+      return jsonResponse(201, {
+        number: 11,
+        html_url: "https://github.com/acme/empty-one/pull/11",
+      });
+    }) as unknown as typeof fetch;
+
+    const pr = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), openArgs);
+    expect(pr.number).toBe(11);
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([12_000]);
+  });
+
+  it("retries the 422 fallback LOOKUP too, so a throttle cannot fake 'no existing PR'", async () => {
+    // The D18-1 replay path depends on `findPrByHead` ANSWERING. A throttled lookup
+    // returns `null` (it fails soft by design), which makes an idempotent replay look
+    // like a genuine "No commits between" 422 — a PERMANENT error that kills a fully
+    // recoverable workflow. That is precisely the bug D18-1 fixed, re-introduced by a
+    // rate limit. So the lookup gets the same bounded backoff as everything else.
+    const sleeps: number[] = [];
+    let lookups = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return jsonResponse(422, {
+          message: "Validation Failed",
+          errors: [{ message: "A pull request already exists for acme:v0.0.0." }],
+        });
+      }
+      lookups += 1;
+      if (lookups === 1) {
+        return jsonResponse(429, { message: "Too Many Requests" }, { "retry-after": "4" });
+      }
+      return jsonResponse(200, [
+        { number: 7, html_url: "https://github.com/acme/empty-one/pull/7" },
+      ]);
+    }) as unknown as typeof fetch;
+
+    const pr = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), openArgs);
+    expect(pr.number).toBe(7);
+    expect(lookups).toBe(2);
+    expect(sleeps).toEqual([4_000]);
+  });
+
+  // ------------------------------------------------------------- plan row 63 / D63.5
+  // Until now `openPullRequest` threw `open pull request failed: 422` WITHOUT ever
+  // reading the response body, so three completely different real-GitHub 422s —
+  // "base is invalid" (an unborn `main`), "No commits between <base> and <head>", and
+  // "A pull request already exists" — produced byte-identical messages and were
+  // therefore unattributable in a log or a job's `error` column.
+  //
+  // Discrimination is on the BODY (`errors[].field` / `errors[].code`), never on the
+  // status: the standing invariant above ("widening the lookup state must never
+  // swallow the no-commits-between 422") means status alone cannot tell them apart.
+  it("openPullRequest surfaces a typed unborn-base-ref error when GitHub 422s with field=base, code=invalid", async () => {
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return jsonResponse(422, {
+          message: "Validation Failed",
+          errors: [{ resource: "PullRequest", field: "base", code: "invalid" }],
+          documentation_url:
+            "https://docs.github.com/rest/pulls/pulls#create-a-pull-request",
+        });
+      }
+      return jsonResponse(200, []); // findPrByHead resolves nothing
+    }) as unknown as typeof fetch;
+
+    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(422);
+    expect(err.code).toBe("base_ref_unborn");
+    expect(err.message).toContain("main");
+  });
+
+  it("does NOT classify the 'No commits between' 422 as unborn-base, and surfaces GitHub's own message", async () => {
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return jsonResponse(422, {
+          message: "Validation Failed",
+          errors: [
+            {
+              resource: "PullRequest",
+              field: "base",
+              code: "custom",
+              message: "No commits between main and v0.0.0",
+            },
+          ],
+        });
+      }
+      return jsonResponse(200, []);
+    }) as unknown as typeof fetch;
+
+    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(422);
+    expect(err.code).toBeUndefined();
+    expect(err.message).toContain("No commits between main and v0.0.0");
+    expect(retryUnlessPermanent(err)).toBe(false);
   });
 
   it("classifies a real 429 as TRANSIENT so the DBOS step retries it with backoff", async () => {
+    // plan row 64: the COUNT moved (1 → the client's bounded budget) because the client
+    // now backs off first; the CLASSIFICATION is unchanged and deliberate. A primary
+    // rate limit that outlives the in-process budget is worth a durable, crash-safe
+    // DBOS step retry — unlike a 403, where the two layers would stack for nothing.
+    const sleeps: number[] = [];
     let calls = 0;
     const fetchImpl = (async () => {
       calls += 1;
       return jsonResponse(429, { message: "Too Many Requests" }, { "retry-after": "60" });
     }) as unknown as typeof fetch;
 
-    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    const err = await openPullRequest(cfgWithSleep(fetchImpl, sleeps), openArgs).catch(
+      (e) => e,
+    );
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(429);
     expect(retryUnlessPermanent(err)).toBe(true);
-    expect(calls).toBe(1);
+    expect(calls).toBe(DEFAULT_GITHUB_MAX_ATTEMPTS);
+    expect(sleeps).toEqual([60_000, 60_000, 60_000]);
+  });
+
+  it("caps the honoured delay at 60s even when GitHub asks for an hour (D64.6)", async () => {
+    // A `Retry-After: 3600` taken literally would hold a `ProjectJob` in `running` for an
+    // hour per attempt, and §2.9's git-ops guard 409s any retry-from-UI for that whole
+    // window. The cap is what bounds it.
+    const sleeps: number[] = [];
+    const fetchImpl = (async () =>
+      jsonResponse(
+        429,
+        { message: "Too Many Requests" },
+        { "retry-after": "3600" },
+      )) as unknown as typeof fetch;
+
+    await openPullRequest(cfgWithSleep(fetchImpl, sleeps), openArgs).catch(() => {});
+    expect(sleeps).toEqual([60_000, 60_000, 60_000]);
   });
 });

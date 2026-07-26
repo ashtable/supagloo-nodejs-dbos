@@ -434,6 +434,35 @@ describe("provisionFixtureRepo (D6)", () => {
     expect(a.repo).toContain("runid42");
   });
 
+  // ------------------------------------------------------------------- plan row 63
+  // Row 63's e2e acceptance provisions a repo with NO initial commit — the shape the
+  // product's own create-new path produced before this row, and the shape wireframe
+  // 13a's "Empty · created just now" existing repo has. Both harness knobs have to
+  // travel together: `auto_init:false` AND skipping the branch readiness gate, because
+  // a commit-less repo has no `main` for that gate to observe.
+  it("provisionFixtureRepo forwards autoInit:false to createFixtureRepo and skips the branch readiness gate", async () => {
+    const { harness, calls } = makeFakeHarness();
+    await provisionFixtureRepo(
+      "scaffold-unborn",
+      { env: baseEnv(), harness, fetchImpl: mintFetch().impl },
+      { autoInit: false },
+    );
+    expect(calls.create[0].autoInit).toBe(false);
+    expect(calls.repoReady[0].requireBranch).toBe(false);
+  });
+
+  it("provisionFixtureRepo defaults to auto_init and the full branch gate", async () => {
+    // GUARD: the default is what every other spec in every lane gets.
+    const { harness, calls } = makeFakeHarness();
+    await provisionFixtureRepo("scaffold", {
+      env: baseEnv(),
+      harness,
+      fetchImpl: mintFetch().impl,
+    });
+    expect(calls.create[0].autoInit).not.toBe(false);
+    expect(calls.repoReady[0].requireBranch).not.toBe(false);
+  });
+
   it("exports NO teardown/archive/delete helper — the cleanup script is the only lifecycle end (D6)", () => {
     const names = Object.keys(adapter);
     expect(names.filter((n) => /archive|delete|teardown|destroyRepo/i.test(n))).toEqual(

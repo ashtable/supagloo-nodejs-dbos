@@ -172,6 +172,38 @@ export async function commitAll(dir: string): Promise<string> {
   return revParse(dir, "HEAD");
 }
 
+/**
+ * The base-ref bootstrap commit (plan row 63). Same fixed identity + fixed date as
+ * {@link SCAFFOLD_COMMIT} for the same reason: an EMPTY commit with a fixed message,
+ * identity, date and (empty) tree hashes to the IDENTICAL SHA on every re-run, so two
+ * concurrent replays that both reach the bootstrap converge instead of forking history.
+ */
+export const BOOTSTRAP_COMMIT = {
+  ...SCAFFOLD_COMMIT,
+  message: "Initialize repository (Supagloo)",
+} as const;
+
+/**
+ * Make an EMPTY commit (no tree contents) with the deterministic bootstrap identity.
+ * Used only to give a commit-less repository a real base ref before `v0.0.0` branches
+ * from it — deliberately empty so the base branch carries no file the scaffold did not
+ * write, and so `git add -A` in {@link commitAll} has nothing extra to sweep in.
+ */
+export async function commitEmpty(dir: string, message: string): Promise<string> {
+  await git(["commit", "--allow-empty", "-m", message], {
+    cwd: dir,
+    env: {
+      GIT_AUTHOR_NAME: BOOTSTRAP_COMMIT.authorName,
+      GIT_AUTHOR_EMAIL: BOOTSTRAP_COMMIT.authorEmail,
+      GIT_COMMITTER_NAME: BOOTSTRAP_COMMIT.authorName,
+      GIT_COMMITTER_EMAIL: BOOTSTRAP_COMMIT.authorEmail,
+      GIT_AUTHOR_DATE: BOOTSTRAP_COMMIT.date,
+      GIT_COMMITTER_DATE: BOOTSTRAP_COMMIT.date,
+    },
+  });
+  return revParse(dir, "HEAD");
+}
+
 /** Resolve a ref to a full 40-char SHA. */
 export async function revParse(dir: string, ref: string): Promise<string> {
   return (await git(["rev-parse", ref], { cwd: dir })).trim();

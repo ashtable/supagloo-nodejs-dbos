@@ -6,8 +6,10 @@ import { join } from "node:path";
 import { emptyManifest } from "../../remotion/__fixtures__/manifests";
 import {
   BASE_BRANCH,
+  DEFAULT_BASE_BRANCH,
   WORKING_BRANCH,
   cutWorkingBranchLocal,
+  ensureBaseRef,
   ensureClone,
   ensureScaffold,
   materializeBaseVersion,
@@ -53,6 +55,27 @@ function seedBareOrigin(): string {
   git(["-C", work, "remote", "add", "origin", bare]);
   git(["-C", work, "push", "origin", "main"]);
   return bare;
+}
+
+/** A bare origin with NO commits at all — a genuinely unborn `main` (plan row 63). */
+function emptyBareOrigin(): string {
+  const bare = join(root, "empty-origin.git");
+  git(["init", "--bare", "--initial-branch=main", bare]);
+  git(["-C", bare, "config", "http.receivepack", "true"]);
+  return bare;
+}
+
+function remoteSha(bare: string, branch: string): string | null {
+  try {
+    return execFileSync("git", ["-C", bare, "rev-parse", "--verify", `refs/heads/${branch}`], {
+      env: { ...process.env, ...HERMETIC },
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
 }
 
 function remoteBranches(bare: string): string[] {
@@ -128,6 +151,86 @@ describe("materializeBaseVersion", () => {
     const second = await materializeBaseVersion(ctx);
     expect(second.baseSha).toBe(first.baseSha);
     expect(existsSync(join(workspacePath(ctx), ".git"))).toBe(true);
+  });
+});
+
+// --------------------------------------------------------------------- plan row 63
+// `ensureBaseRef` is the dbos half of the unborn-`main` defect. A repo with no commits
+// clones with exit 0 and an UNBORN HEAD, so every later step "works" right up until
+// `openPullRequest(base: "main")`, which real GitHub answers `422 Validation Failed
+// (field: base, code: invalid)`. It is not only the create-new path: wireframe 13a's
+// selectable "Empty · created just now" existing repo has no `auto_init` to send at all.
+//
+// The bootstrap runs INSIDE the existing `cloneToWorkspace` step (D63.2 — adding a
+// `runStep` would break db-lib's `SCAFFOLD_STAGES` key-for-key pin), and it must be
+// self-healing/idempotent because the workspace is ephemeral and the step can replay.
+describe("ensureBaseRef", () => {
+  it("creates and pushes an initial commit on main when the clone has an unborn HEAD", async () => {
+    originDir = emptyBareOrigin();
+    const ctx = ctxFor("job-unborn");
+    expect(remoteSha(originDir, DEFAULT_BASE_BRANCH)).toBeNull();
+
+    const path = await ensureClone(ctx);
+    await ensureBaseRef(ctx);
+
+    // The durable fix lives on the REMOTE — that is what makes it survive the
+    // ephemeral workspace being thrown away between steps.
+    expect(remoteSha(originDir, DEFAULT_BASE_BRANCH)).toMatch(/^[0-9a-f]{40}$/);
+    // …and the local clone is left on the base branch, so `checkout -B v0.0.0` next
+    // branches FROM the base tip rather than creating a parentless root commit.
+    expect(
+      execFileSync("git", ["-C", path, "symbolic-ref", "HEAD"], {
+        env: { ...process.env, ...HERMETIC },
+      })
+        .toString()
+        .trim(),
+    ).toBe(`refs/heads/${DEFAULT_BASE_BRANCH}`);
+  });
+
+  it("is a no-op when the remote already has the base ref", async () => {
+    // The auto_init / existing-project case: the clone has commits, so the bootstrap
+    // must not touch the remote at all.
+    const before = remoteSha(originDir, DEFAULT_BASE_BRANCH);
+    expect(before).toMatch(/^[0-9a-f]{40}$/);
+
+    const ctx = ctxFor("job-noop");
+    await ensureClone(ctx);
+    await ensureBaseRef(ctx);
+
+    expect(remoteSha(originDir, DEFAULT_BASE_BRANCH)).toBe(before);
+  });
+
+  it("is idempotent across a second invocation on a rebuilt workspace", async () => {
+    // Crash-replay safety: `cloneToWorkspace` can re-run after the ephemeral workspace
+    // is gone. The second run must adopt the ref the first run pushed, never re-create
+    // (and therefore never re-parent) it.
+    originDir = emptyBareOrigin();
+    const ctx = ctxFor("job-replay");
+    await ensureClone(ctx);
+    await ensureBaseRef(ctx);
+    const first = remoteSha(originDir, DEFAULT_BASE_BRANCH);
+
+    await removeWorkspace(ctx);
+    await ensureClone(ctx);
+    await ensureBaseRef(ctx);
+
+    expect(remoteSha(originDir, DEFAULT_BASE_BRANCH)).toBe(first);
+  });
+
+  it("lets the full base-version sequence reach a PR-able v0.0.0 on a commit-less origin", async () => {
+    // The whole point: after the bootstrap, `main` and `v0.0.0` are two DISTINCT refs
+    // with commits between them, which is exactly what `POST /pulls` needs.
+    originDir = emptyBareOrigin();
+    const ctx = ctxFor("job-full");
+    await ensureClone(ctx);
+    await ensureBaseRef(ctx);
+    const { baseSha } = await materializeBaseVersion(ctx);
+    await pushBranchFromWorkspace(ctx, BASE_BRANCH);
+
+    const branches = remoteBranches(originDir);
+    expect(branches).toContain(DEFAULT_BASE_BRANCH);
+    expect(branches).toContain(BASE_BRANCH);
+    expect(baseSha).not.toBe(remoteSha(originDir, DEFAULT_BASE_BRANCH));
   });
 });
 
