@@ -36,6 +36,12 @@ const SECRET_VALUES = {
   YOUVERSION_APP_KEY: "yvp-app-key-value",
   AWS_SECRET_ACCESS_KEY: "aws-secret-value",
   OPENROUTER_E2E_TEST_API_KEY: "sk-or-e2e-key-value",
+  // Task 62 risk 12: the real-GitHub e2e harness introduces a REAL user-scoped PAT
+  // (`GITHUB_E2E_PAT_TOKEN`, the credential that can create/archive repos on the
+  // account holding the user's real repos). It is host-side harness-only and must
+  // never reach untrusted cloned project code. The allowlist is a closed set, so this
+  // holds by construction — pinned here so it stays true.
+  GITHUB_E2E_PAT_TOKEN: "ghp_e2e_pat_token_value",
   SOME_FUTURE_TOKEN: "a-var-nobody-has-thought-of-yet",
 };
 

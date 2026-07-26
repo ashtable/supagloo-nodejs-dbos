@@ -111,7 +111,20 @@ export interface OpenedPr {
   url: string;
 }
 
-async function findOpenPrByHead(
+/**
+ * Resolve an existing PR for `head`, in ANY state.
+ *
+ * `state=all` is load-bearing, not a widening for its own sake (task 62 D18-1). The
+ * caller reaches this only after real GitHub 422'd a duplicate open. On a
+ * crash/replay of `pushOpenMergeBasePr` AFTER the base PR was opened *and merged* —
+ * precisely what `scaffold-project.e2e.ts`'s crash/replay proof exercises, and what
+ * any retried step can hit — the PR is `closed`, so a `state=open` lookup returned
+ * nothing and the 422 was re-thrown as a PERMANENT {@link GithubRestError}, killing a
+ * fully recoverable workflow. Querying every state makes the open genuinely
+ * idempotent. The `head=<owner>:<branch>` filter keeps it precise, so widening the
+ * state cannot resolve an unrelated PR.
+ */
+async function findPrByHead(
   cfg: GithubRestConfig,
   owner: string,
   repo: string,
@@ -120,7 +133,7 @@ async function findOpenPrByHead(
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const url =
     `${trimSlash(cfg.apiBaseUrl)}/repos/${owner}/${repo}/pulls` +
-    `?head=${owner}:${head}&state=open`;
+    `?head=${owner}:${head}&state=all`;
   const res = await fetchImpl(url, { headers: authHeaders(cfg.token) });
   if (!res.ok) return null;
   const list = (await res.json()) as Array<{ number: number; html_url: string }>;
@@ -129,10 +142,16 @@ async function findOpenPrByHead(
 }
 
 /**
- * Open the base PR (`head` → `base`). On real GitHub a duplicate head returns 422
- * "A pull request already exists"; we treat that as idempotent and resolve the
- * existing PR via a lookup (the stub never emits 422, so this path is production-
- * only — documented gap: a fully idempotent open needs a stub "get PR by head" route).
+ * Open the base PR (`head` → `base`). Real GitHub returns 422 for a duplicate head
+ * ("A pull request already exists"); we treat that as idempotent and resolve the
+ * existing PR via {@link findPrByHead}.
+ *
+ * Since task 62 the e2e lanes run against REAL github.com (the github-stub is
+ * deleted), so this path is exercised for real on every replay — it is NOT
+ * production-only any more, and the old "the stub never emits 422" caveat is gone.
+ * The OTHER real 422 — "No commits between <base> and <head>" — resolves no PR and
+ * therefore still surfaces as a permanent, attributable {@link GithubRestError};
+ * widening the lookup state must never swallow it.
  */
 export async function openPullRequest(
   cfg: GithubRestConfig,
@@ -165,17 +184,18 @@ export async function openPullRequest(
     return { number: b.number, url: b.html_url };
   }
   if (res.status === 422) {
-    const existing = await findOpenPrByHead(cfg, args.owner, args.repo, args.head);
+    const existing = await findPrByHead(cfg, args.owner, args.repo, args.head);
     if (existing) return existing;
   }
   throw new GithubRestError(`open pull request failed: ${res.status}`, res.status);
 }
 
 /**
- * Merge the base PR (squash). The task-9 stub returns 405 on a DOUBLE-merge (and
- * real GitHub returns 405 for an already-merged PR); we treat 405 as an idempotent
- * "already merged" success so a replayed merge is safe. (Scaffold merges are clean
- * fast-forwards, so a FIRST-attempt 405-for-conflict cannot occur.)
+ * Merge the base PR (squash). Real GitHub returns 405 for an already-merged PR (the
+ * retired task-9 stub returned 405 on a DOUBLE-merge for the same reason); we treat
+ * 405 as an idempotent "already merged" success so a replayed merge is safe.
+ * (Scaffold merges are clean fast-forwards, so a FIRST-attempt 405-for-conflict
+ * cannot occur; a genuine 409 conflict would surface as a permanent GithubRestError.)
  */
 export async function mergePullRequest(
   cfg: GithubRestConfig,

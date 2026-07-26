@@ -10,12 +10,19 @@ import {
 import { retryUnlessPermanent } from "./retry";
 
 // GitHub REST half of the git-ops flow, driven by an INJECTED fetch (the only
-// thing mocked at the unit level — real network is unavailable in unit tests).
+// thing mocked at the unit level — real network is unavailable in unit tests, and
+// task 62 keeps it that way: the e2e lanes moved to REAL github.com, the unit lane
+// keeps every mock/stub, per HARD RULE 5 / design-delta §10.6).
 // Exercises: idempotent reachability across paginated Link pages; a typed,
 // non-retryable RepoUnreachableError when the installation cannot reach the repo;
 // PR open (incl. the 422-already-exists idempotent fallback that production hits
-// but the stub never emits); and merge with the stub's 405-on-double-merge treated
-// as an idempotent already-merged success.
+// but the retired github-stub never emitted); and merge with the 405-on-double-merge
+// treated as an idempotent already-merged success.
+//
+// Task 62 / D18-1 adds the `state=all` block at the bottom: the failure modes that
+// only REAL GitHub produces (a replayed open after the PR was already merged, the
+// "No commits between" 422 variant, 403 + Retry-After, 429) are covered HERE with an
+// injected fetch, never by pushing egress into a unit test.
 
 const API = "http://github.test";
 const cfgWith = (fetchImpl: typeof fetch) => ({
@@ -258,5 +265,127 @@ describe("failure classification (permanent vs transient)", () => {
     expect(err).toBeInstanceOf(GithubRestError);
     expect(err.status).toBe(401);
     expect(retryUnlessPermanent(err)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 62 / D18-1: the real-GitHub replay path.
+//
+// `openPullRequest`'s 422 fallback looked the existing PR up with `state=open`. On a
+// crash/replay AFTER the base PR was opened AND merged (exactly what
+// `scaffold-project.e2e.ts`'s crash/replay proof does, and what any retried
+// `pushOpenMergeBasePr` does), real GitHub 422s the re-open, the `state=open` lookup
+// finds NOTHING (the PR is closed), and the 422 is re-thrown as a PERMANENT
+// GithubRestError — killing an otherwise recoverable workflow. The retired
+// github-stub never emitted 422, so this was invisible.
+//
+// The fix is `state=all`. These tests pin it.
+// ---------------------------------------------------------------------------
+describe("openPullRequest — idempotent replay against REAL GitHub (D18-1)", () => {
+  /** A fetch that behaves like real GitHub for an already-opened-and-MERGED head. */
+  function alreadyMergedFetch(record: { lookupUrls: string[] }) {
+    return (async (url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return jsonResponse(422, {
+          message: "Validation Failed",
+          errors: [{ message: "A pull request already exists for acme:v0.0.0." }],
+        });
+      }
+      const u = String(url);
+      record.lookupUrls.push(u);
+      const state = new URL(u).searchParams.get("state");
+      // Real GitHub: a MERGED pr is `closed`, so a state=open query returns [].
+      if (state === "open") return jsonResponse(200, []);
+      return jsonResponse(200, [
+        {
+          number: 7,
+          html_url: "https://github.com/acme/empty-one/pull/7",
+          state: "closed",
+          merged_at: "2026-07-25T00:00:00Z",
+        },
+      ]);
+    }) as unknown as typeof fetch;
+  }
+
+  const openArgs = {
+    owner: "acme",
+    repo: "empty-one",
+    head: "v0.0.0",
+    base: "main",
+    title: "Initial Supagloo scaffold (v0.0.0)",
+    body: "scaffold",
+  };
+
+  it("looks the existing PR up with state=all, never state=open", async () => {
+    const record = { lookupUrls: [] as string[] };
+    await openPullRequest(cfgWith(alreadyMergedFetch(record)), openArgs).catch(() => {});
+    expect(record.lookupUrls.length).toBeGreaterThan(0);
+    const params = new URL(record.lookupUrls[0]).searchParams;
+    expect(params.get("state")).toBe("all");
+    expect(record.lookupUrls[0]).not.toContain("state=open");
+    // The head filter must survive the change — it is what makes the lookup precise.
+    expect(params.get("head")).toBe("acme:v0.0.0");
+  });
+
+  it("resolves the ALREADY-MERGED pull request instead of throwing (crash/replay safe)", async () => {
+    const record = { lookupUrls: [] as string[] };
+    const pr = await openPullRequest(cfgWith(alreadyMergedFetch(record)), openArgs);
+    expect(pr.number).toBe(7);
+    expect(pr.url).toBe("https://github.com/acme/empty-one/pull/7");
+  });
+
+  it("still throws a typed 422 when the 422 is the 'No commits between' variant (no PR exists)", async () => {
+    // Real GitHub's other 422 on POST /pulls: head == base content-wise. There is no
+    // PR to resolve, so this must stay a permanent, attributable failure — the
+    // state=all widening must NOT swallow it.
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return jsonResponse(422, {
+          message: "Validation Failed",
+          errors: [{ message: "No commits between main and v0.0.0" }],
+        });
+      }
+      return jsonResponse(200, []);
+    }) as unknown as typeof fetch;
+
+    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(422);
+    expect(retryUnlessPermanent(err)).toBe(false);
+  });
+
+  it("surfaces a real 403 + Retry-After as a PERMANENT typed error with NO client-side retry (plan row N2)", async () => {
+    // Real GitHub answers a secondary-rate-limit trip with 403 + Retry-After. Today the
+    // CLIENT does not honour it (deferred to plan row N2 — the e2e HARNESS backs off
+    // instead), so the contract this pins is: one request, one typed error, fail fast.
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(
+        403,
+        { message: "You have exceeded a secondary rate limit" },
+        { "retry-after": "37" },
+      );
+    }) as unknown as typeof fetch;
+
+    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(403);
+    expect(retryUnlessPermanent(err)).toBe(false);
+    expect(calls).toBe(1);
+  });
+
+  it("classifies a real 429 as TRANSIENT so the DBOS step retries it with backoff", async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return jsonResponse(429, { message: "Too Many Requests" }, { "retry-after": "60" });
+    }) as unknown as typeof fetch;
+
+    const err = await openPullRequest(cfgWith(fetchImpl), openArgs).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(429);
+    expect(retryUnlessPermanent(err)).toBe(true);
+    expect(calls).toBe(1);
   });
 });

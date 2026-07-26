@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
@@ -17,31 +16,43 @@ import {
 } from "../../src/workflows/publish-version";
 import { writeRemotionScaffold } from "../../src/remotion";
 import { emptyManifest } from "../../src/remotion/__fixtures__/manifests";
+import {
+  authenticatedRemoteUrl,
+  gitFixtureExec,
+  githubReaders,
+  provisionFixtureRepo,
+  resolveGithubE2eContext,
+  resolveGithubE2eSecrets,
+  type FixtureRepo,
+} from "../../src/testing/github-e2e";
+import { countStepExecutions } from "../../src/testing/step-introspection";
 
-// End-to-end proof of publishVersionWorkflow against the REAL provider-stub harness: the
-// GitHub REST stub (:4801) mints the installation token, opens + merges the PR, and creates
-// the release tag; the local git smart-HTTP server (:4805) serves a REAL clone/push. DBOS is
-// launched IN-PROCESS (consuming the uncommitted db-lib via the file: dep). No mocks.
+// End-to-end proof of publishVersionWorkflow against **REAL GitHub**: api.github.com mints
+// the installation token, opens + merges the PR, and creates the release tag; github.com
+// serves a REAL authenticated clone/push. DBOS is launched IN-PROCESS (consuming the
+// uncommitted db-lib via the file: dep). No mocks.
 //
-// A realistic WORKING BRANCH (a full Remotion scaffold on `main` + a `v0.0.1` branch) is
-// built IN-TEST with the host git CLI + task-16 writeRemotionScaffold — the git-server admin
-// route only seeds a README. Publish then merges v0.0.1 → main, tags v0.0.1, and cuts v0.0.2.
+// Task 62 (design-delta §11) deleted the github-stub (:4801) + git-server (:4805). Each
+// test provisions its own per-run PRIVATE repo
+// (the shared e2e prefix + `publish-<case>` + the run id, `auto_init: true`), never torn down
+// in-suite — reclaim with root's interactive `npm run cleanup:github-e2e` (archives, never
+// deletes). A fresh fixture repo carries only GitHub's `auto_init` README, so a realistic
+// WORKING BRANCH (a full Remotion scaffold on `main` + a `v0.0.1` branch) is built IN-TEST
+// with the host git CLI + task-16 writeRemotionScaffold. Publish then merges v0.0.1 → main,
+// tags v0.0.1, and cuts v0.0.2.
 //
 // Two proofs: (1) happy path — the PR is opened/merged, the release tag + next branch (v0.0.2)
 // exist, and the ProjectVersion states flip (working 0.0.1 → published, new working 0.0.2);
 // (2) crash/replay MID-MERGE — cancel at the mergePullRequestAndTag boundary (after
 // openPullRequest checkpointed), delete the workspace (fresh worker), resume → completes with
-// NO duplicate PR (pullsOpened stays 1).
+// NO duplicate PR. Both proofs assert on TWO axes (D9): DBOS step counts for durability and
+// real-github.com reads (`listPulls` with `state: "all"`, `listTagRefs`) for
+// non-duplication — replacing the stub's single conflated `/__stub/calls` counter.
 
-const GITHUB_STUB = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
-const INSTALLATION_ID = "42";
 const BRANCH = "v0.0.1";
 const SEMVER = "0.0.1";
 const NEXT_BRANCH = "v0.0.2";
 const NEXT_SEMVER = "0.0.2";
-
-const uniqueRepo = (base: string): string => `${base}-${randomUUID().slice(0, 8)}`;
 
 const HERMETIC_GIT = {
   GIT_TERMINAL_PROMPT: "0",
@@ -53,11 +64,9 @@ const HERMETIC_GIT = {
   GIT_COMMITTER_EMAIL: "fixture@supagloo.test",
 };
 
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
+// Real GitHub App credentials from the root `.env` (loaded per-worker by
+// `tests/e2e/load-root-env.ts`); fails fast by name if any is missing.
+const githubSecrets = resolveGithubE2eSecrets();
 
 const env: Env = loadEnv({
   DATABASE_URL:
@@ -66,10 +75,10 @@ const env: Env = loadEnv({
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
   NODE_ENV: "test",
-  GITHUB_API_BASE_URL: GITHUB_STUB,
-  GITHUB_GIT_BASE_URL: GIT_SERVER,
-  GITHUB_APP_ID: "123456",
-  GITHUB_APP_PRIVATE_KEY: privateKey,
+  // No GITHUB_*_BASE_URL override — the env schema already defaults to the real hosts
+  // (finding F1: dbos was always real-by-default; only these specs pointed it at a stub).
+  GITHUB_APP_ID: githubSecrets.appId,
+  GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
   SECRETS_ENCRYPTION_KEY: "0".repeat(64),
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
@@ -82,45 +91,67 @@ const env: Env = loadEnv({
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
 
-async function resetGithubStub(): Promise<void> {
-  await fetch(`${GITHUB_STUB}/__stub/reset`, { method: "POST" });
+/**
+ * The installation token this file's fixture git operations authenticate with, minted once
+ * in `beforeAll` through the PRODUCT path (db-lib `mintInstallationToken`). Fixture repos
+ * are private, so the fixture clone/push needs it; the retired git-server needed none.
+ */
+let installationToken = "";
+
+/** `https://x-access-token:<token>@github.com/<owner>/<repo>.git` for a fixture repo. */
+function authRemote(fullName: string): string {
+  const [owner, repo] = fullName.split("/");
+  return authenticatedRemoteUrl({ token: installationToken, owner, repo });
 }
 
-async function githubState(): Promise<Record<string, number>> {
-  const res = await fetch(`${GITHUB_STUB}/__stub/calls`);
-  const body = (await res.json()) as { state: Record<string, number> };
-  return body.state;
-}
-
-async function provisionRepo(fullName: string): Promise<void> {
-  const res = await fetch(`${GIT_SERVER}/__admin/repos`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: fullName, seed: true, defaultBranch: "main" }),
-  });
-  if (!res.ok && res.status !== 409) {
-    throw new Error(`provisionRepo(${fullName}) failed: ${res.status}`);
-  }
-}
-
+/**
+ * Fixture `git`, ALWAYS through the redacting seam. `authRemote()` embeds a live
+ * installation token in an argv element, and `execFileSync` synthesises its rejection
+ * message from argv (`Command failed: git clone <url>`) — so a raw call prints the
+ * credential into the vitest failure report. `gitFixtureExec` scrubs URL userinfo out of
+ * the message, stdout and stderr, and supplies the hermetic git env itself.
+ */
 function gitFixture(args: string[], cwd?: string): string {
-  return execFileSync("git", args, {
-    cwd,
-    env: { ...process.env, ...HERMETIC_GIT },
-  }).toString();
+  return gitFixtureExec(args, { cwd, env: HERMETIC_GIT });
 }
+
+/**
+ * The edit that makes the working branch genuinely AHEAD of `main`. Kept in lockstep with
+ * the `ProjectVersion` row `seedPublishProjectJob` writes below
+ * (`changedFiles: ["M src/scenes/Shelter.tsx"]`, `commitMessage: "Edit the shelter scene"`),
+ * so the git fixture and the DB fixture describe the same history.
+ */
+const WORKING_EDIT_PATH = "src/scenes/Shelter.tsx";
+const WORKING_EDIT_MESSAGE = "Edit the shelter scene";
 
 /** Build a REAL working branch on the origin: a full scaffold (empty manifest) on main +
- *  a `v0.0.1` branch. */
+ *  a `v0.0.1` branch carrying one commit of its own. */
 async function seedWorkingBranch(fullName: string): Promise<void> {
   const work = mkdtempSync(join(tmpdir(), "publish-fixture-"));
   try {
-    gitFixture(["clone", `${GIT_SERVER}/${fullName}.git`, work]);
+    gitFixture(["clone", authRemote(fullName), work]);
     await writeRemotionScaffold(emptyManifest, work);
     gitFixture(["add", "-A"], work);
     gitFixture(["commit", "-m", "supagloo scaffold"], work);
     gitFixture(["push", "origin", "main"], work);
-    gitFixture(["branch", BRANCH], work);
+
+    // Cut the working branch and give it a REAL commit of its own. This is load-bearing
+    // against REAL github.com: `POST /repos/{o}/{r}/pulls` 422s with "No commits between
+    // main and v0.0.1" when the head ref is identical to base, and openPullRequest
+    // deliberately does NOT swallow that 422 (only the duplicate-head one resolves to an
+    // existing PR). The retired task-9 github-stub returned 201 unconditionally, so an
+    // identical-SHA working branch went unnoticed until task 62 pointed this lane at the
+    // real host. It is also the only realistic shape: publishing a branch with nothing to
+    // publish is not a scenario the product can reach — scaffold cuts v0.0.1 from v0.0.0
+    // and the user's edits land on it before publish runs.
+    gitFixture(["checkout", "-b", BRANCH], work);
+    mkdirSync(join(work, "src", "scenes"), { recursive: true });
+    writeFileSync(
+      join(work, WORKING_EDIT_PATH),
+      `// ${WORKING_EDIT_MESSAGE}\nexport const Shelter = () => null;\n`,
+    );
+    gitFixture(["add", "-A"], work);
+    gitFixture(["commit", "-m", WORKING_EDIT_MESSAGE], work);
     gitFixture(["push", "origin", BRANCH], work);
   } finally {
     rmSync(work, { recursive: true, force: true });
@@ -129,19 +160,21 @@ async function seedWorkingBranch(fullName: string): Promise<void> {
 
 /** The origin's head SHA for `branch` (via ls-remote), or "" if the ref is absent. */
 function branchHead(fullName: string, branch: string): string {
-  const out = execFileSync(
-    "git",
-    ["ls-remote", "--heads", `${GIT_SERVER}/${fullName}.git`, `refs/heads/${branch}`],
-    { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
-  ).toString();
+  const out = gitFixture([
+    "ls-remote",
+    "--heads",
+    authRemote(fullName),
+    `refs/heads/${branch}`,
+  ]);
   return out.split(/\s+/)[0] ?? "";
 }
 
-async function seedPublishProjectJob(repoName: string): Promise<{
+async function seedPublishProjectJob(fixture: FixtureRepo): Promise<{
   projectId: string;
   jobId: string;
   payload: PublishVersionPayload;
 }> {
+  const github = await resolveGithubE2eContext();
   const suffix = randomUUID().slice(0, 8);
   const user = await prisma.user.create({
     data: {
@@ -157,8 +190,8 @@ async function seedPublishProjectJob(repoName: string): Promise<{
       slug: `publish-${suffix}`,
       ownerId,
       name: "Publish E2E",
-      repoOwner: "acme",
-      repoName,
+      repoOwner: fixture.owner,
+      repoName: fixture.repo,
       repoVisibility: "private",
       createdFrom: "blank",
       currentBranch: BRANCH,
@@ -199,9 +232,10 @@ async function seedPublishProjectJob(repoName: string): Promise<{
   const payload: PublishVersionPayload = {
     projectId: project.id,
     userId: ownerId,
-    installationId: INSTALLATION_ID,
-    repoOwner: "acme",
-    repoName,
+    // DISCOVERED at runtime (D5) — never the fabricated `"42"` real GitHub 404s on.
+    installationId: github.installationId,
+    repoOwner: fixture.owner,
+    repoName: fixture.repo,
     branchName: BRANCH,
     semver: SEMVER,
     message: "Publish the shelter cut",
@@ -220,6 +254,7 @@ async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  installationToken = (await resolveGithubE2eContext()).token;
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
 }, 120_000);
@@ -233,11 +268,10 @@ afterAll(async () => {
 
 describe("publishVersionWorkflow — happy path", () => {
   it("merges + tags the working branch and cuts the next version branch, flipping the version states", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("publish-happy");
-    await provisionRepo(`acme/${repo}`);
-    await seedWorkingBranch(`acme/${repo}`);
-    const { projectId, jobId, payload } = await seedPublishProjectJob(repo);
+    const readers = await githubReaders();
+    const fixture = await provisionFixtureRepo("publish-happy");
+    await seedWorkingBranch(fixture.fullName);
+    const { projectId, jobId, payload } = await seedPublishProjectJob(fixture);
 
     const handle = await client.enqueue<PublishVersionResult>(
       {
@@ -258,16 +292,27 @@ describe("publishVersionWorkflow — happy path", () => {
     expect(result.next.branchName).toBe(NEXT_BRANCH);
 
     // The next version branch exists on the origin, cut at a real commit.
-    const nextHead = branchHead(`acme/${repo}`, NEXT_BRANCH);
+    const nextHead = branchHead(fixture.fullName, NEXT_BRANCH);
     expect(nextHead).toMatch(/^[0-9a-f]{40}$/);
     expect(nextHead).toBe(result.next.headCommitSha);
 
-    // The GitHub REST side effects happened: token minted, PR opened + merged, tag created.
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBeGreaterThanOrEqual(1);
-    expect(state.pullsOpened).toBeGreaterThanOrEqual(1);
-    expect(state.pullsMerged).toBeGreaterThanOrEqual(1);
-    expect(state.refsCreated).toBeGreaterThanOrEqual(1);
+    // (1) DURABILITY — each REST-touching step ran exactly once, attributed to THIS
+    //     workflow id in the DBOS system DB.
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
+    expect(await countStepExecutions(client, jobId, "openPullRequest")).toBe(1);
+    expect(await countStepExecutions(client, jobId, "mergePullRequestAndTag")).toBe(1);
+    expect(await countStepExecutions(client, jobId, "cutNextVersionBranch")).toBe(1);
+    // (2) NON-DUPLICATION — real GitHub holds exactly one MERGED pull request and exactly
+    //     one release tag for this repo. `state: "all"` is mandatory: a merged PR is
+    //     `closed`, so a state=open read would find nothing.
+    const pulls = await readers.listPulls({ repo: fixture.repo });
+    expect(pulls).toHaveLength(1);
+    expect(pulls[0].merged_at).not.toBeNull();
+    const tags = (await readers.listTagRefs({ repo: fixture.repo })) as Array<
+      Record<string, unknown> | string
+    >;
+    const tagRefs = tags.map((t) => (typeof t === "string" ? t : String(t.ref)));
+    expect(tagRefs.filter((r) => r === `refs/tags/v${SEMVER}`)).toHaveLength(1);
 
     // The version records flipped: working(0.0.1) → published; NEW working(0.0.2) created.
     const versions = await prisma.projectVersion.findMany({
@@ -304,11 +349,10 @@ describe("publishVersionWorkflow — happy path", () => {
 
 describe("publishVersionWorkflow — crash / replay (mid-merge, no duplicate PR)", () => {
   it("cancels at the merge boundary, deletes the workspace, then resumes WITHOUT re-opening the PR", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("publish-replay");
-    await provisionRepo(`acme/${repo}`);
-    await seedWorkingBranch(`acme/${repo}`);
-    const { projectId, jobId, payload } = await seedPublishProjectJob(repo);
+    const readers = await githubReaders();
+    const fixture = await provisionFixtureRepo("publish-replay");
+    await seedWorkingBranch(fixture.fullName);
+    const { projectId, jobId, payload } = await seedPublishProjectJob(fixture);
 
     // Park at the boundary just before mergePullRequestAndTag (after openPullRequest has
     // opened the PR + checkpointed), so the cancel lands mid-merge at a step boundary.
@@ -352,17 +396,23 @@ describe("publishVersionWorkflow — crash / replay (mid-merge, no duplicate PR)
 
     expect(result.workflowId).toBe(jobId);
 
-    // The crux: the PR was opened exactly ONCE across both attempts. openPullRequest was
-    // checkpointed on attempt 1 and skipped on resume — no duplicate PR.
-    const state = await githubState();
-    expect(state.pullsOpened).toBe(1);
-    expect(state.pullsMerged).toBe(1);
-    expect(state.refsCreated).toBe(1);
-    // Exactly-once: one token minted (the completed mint step was not re-run on resume).
-    expect(state.installationTokensIssued).toBe(1);
+    // The crux, on BOTH axes: openPullRequest was checkpointed on attempt 1 and skipped
+    // on resume, and real GitHub holds exactly ONE pull request — no duplicate PR.
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
+    expect(await countStepExecutions(client, jobId, "openPullRequest")).toBe(1);
+    const pulls = await readers.listPulls({ repo: fixture.repo });
+    expect(pulls).toHaveLength(1);
+    expect(pulls[0].merged_at).not.toBeNull();
+    // Exactly one release tag survived the replayed `createTag` — its 422
+    // "Reference already exists" branch is no longer production-only (task 62 D18-4).
+    const tags = (await readers.listTagRefs({ repo: fixture.repo })) as Array<
+      Record<string, unknown> | string
+    >;
+    const tagRefs = tags.map((t) => (typeof t === "string" ? t : String(t.ref)));
+    expect(tagRefs.filter((r) => r === `refs/tags/v${SEMVER}`)).toHaveLength(1);
 
     // The publish completed: next branch exists, versions flipped, project advanced.
-    expect(branchHead(`acme/${repo}`, NEXT_BRANCH)).toMatch(/^[0-9a-f]{40}$/);
+    expect(branchHead(fixture.fullName, NEXT_BRANCH)).toMatch(/^[0-9a-f]{40}$/);
     const versions = await prisma.projectVersion.findMany({ where: { projectId } });
     expect(versions.find((v) => v.semver === SEMVER)!.state).toBe("published");
     expect(versions.find((v) => v.semver === NEXT_SEMVER)!.state).toBe("working");

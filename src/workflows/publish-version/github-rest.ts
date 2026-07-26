@@ -59,6 +59,9 @@ export async function createTag(
   }
   if (res.status === 422) {
     // "Reference already exists" — a replayed tag creation. Idempotent success.
+    // Task 62: this is NO LONGER a production-only path. The publish e2e now runs
+    // against REAL github.com (the github-stub, which never emitted 422, is deleted),
+    // so `publish-version.e2e.ts`'s crash/replay proof exercises this branch for real.
     return { ref };
   }
   throw new GithubRestError(`create tag failed: ${res.status}`, res.status);

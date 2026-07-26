@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,29 +19,40 @@ import {
   emptyManifest,
   shelterManifest,
 } from "../../src/remotion/__fixtures__/manifests";
+import {
+  authenticatedRemoteUrl,
+  gitFixtureExec,
+  provisionFixtureRepo,
+  resolveGithubE2eContext,
+  resolveGithubE2eSecrets,
+  type FixtureRepo,
+} from "../../src/testing/github-e2e";
+import { countStepExecutions } from "../../src/testing/step-introspection";
 
-// End-to-end proof of commitVersionWorkflow against the REAL provider-stub harness: the
-// GitHub REST stub (:4801) mints the installation token, and the local git smart-HTTP
-// server (:4805) serves a REAL clone/commit/push of the project's working branch. The
-// DBOS runtime is launched IN-PROCESS (consuming the uncommitted db-lib via the file:
-// dep). No mocks.
+// End-to-end proof of commitVersionWorkflow against **REAL GitHub**: api.github.com mints
+// the installation token (real App PEM, runtime-DISCOVERED installation) and github.com
+// serves a REAL authenticated clone/commit/push of the project's working branch. The DBOS
+// runtime is launched IN-PROCESS (consuming the uncommitted db-lib via the file: dep).
+// No mocks.
 //
-// The git-server admin route only seeds a README, so a realistic WORKING BRANCH (a full
-// Remotion scaffold on a `v0.0.1` branch) is built IN-TEST with the host `git` CLI +
-// task-16 writeRemotionScaffold. Commit then persists the 2-scene shelterManifest.
+// Task 62 (design-delta §11) deleted the github-stub (:4801) + git-server (:4805). Each
+// test provisions its own per-run PRIVATE repo
+// (the shared e2e prefix + `commit-<case>` + the run id, `auto_init: true`) and is never torn
+// down in-suite — reclaim with root's interactive `npm run cleanup:github-e2e`, which
+// archives rather than deletes.
+//
+// A fixture repo starts with only GitHub's `auto_init` README, so a realistic WORKING
+// BRANCH (a full Remotion scaffold on a `v0.0.1` branch) is built IN-TEST with the host
+// `git` CLI + task-16 writeRemotionScaffold. Commit then persists the 2-scene
+// shelterManifest.
 //
 // Two proofs: (1) happy path — the working branch head ADVANCES by EXACTLY ONE commit,
 // the regenerated scene sources are present, the working ProjectVersion is updated in
 // place; (2) crash/replay — cancel after commitAndPush (before updateVersionRecord),
 // delete the workspace (fresh worker), resume → completes with NO double-commit.
 
-const GITHUB_STUB = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
-const INSTALLATION_ID = "42";
 const BRANCH = "v0.0.1";
 const SEMVER = "0.0.1";
-
-const uniqueRepo = (base: string): string => `${base}-${randomUUID().slice(0, 8)}`;
 
 const HERMETIC_GIT = {
   GIT_TERMINAL_PROMPT: "0",
@@ -54,11 +64,9 @@ const HERMETIC_GIT = {
   GIT_COMMITTER_EMAIL: "fixture@supagloo.test",
 };
 
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
+// Real GitHub App credentials from the root `.env` (loaded per-worker by
+// `tests/e2e/load-root-env.ts`); fails fast by name if any is missing.
+const githubSecrets = resolveGithubE2eSecrets();
 
 const env: Env = loadEnv({
   DATABASE_URL:
@@ -67,10 +75,10 @@ const env: Env = loadEnv({
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
   NODE_ENV: "test",
-  GITHUB_API_BASE_URL: GITHUB_STUB,
-  GITHUB_GIT_BASE_URL: GIT_SERVER,
-  GITHUB_APP_ID: "123456",
-  GITHUB_APP_PRIVATE_KEY: privateKey,
+  // No GITHUB_*_BASE_URL override — the env schema already defaults to the real hosts
+  // (finding F1: dbos was always real-by-default; only these specs pointed it at a stub).
+  GITHUB_APP_ID: githubSecrets.appId,
+  GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
   SECRETS_ENCRYPTION_KEY: "0".repeat(64),
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
@@ -83,32 +91,29 @@ const env: Env = loadEnv({
 const prisma = createPrismaClient({ connectionString: env.DATABASE_URL });
 let client: DBOSClient;
 
-async function resetGithubStub(): Promise<void> {
-  await fetch(`${GITHUB_STUB}/__stub/reset`, { method: "POST" });
+/**
+ * The installation token this file's fixture git operations authenticate with, minted once
+ * in `beforeAll` by the PRODUCT path (db-lib `mintInstallationToken`). The fixture repos
+ * are private, so every `git clone`/`push` below needs it — the retired git-server needed
+ * no credential at all, which is why these helpers used bare URLs.
+ */
+let installationToken = "";
+
+/** `https://x-access-token:<token>@github.com/<owner>/<repo>.git` for a fixture repo. */
+function authRemote(fullName: string): string {
+  const [owner, repo] = fullName.split("/");
+  return authenticatedRemoteUrl({ token: installationToken, owner, repo });
 }
 
-async function githubState(): Promise<Record<string, number>> {
-  const res = await fetch(`${GITHUB_STUB}/__stub/calls`);
-  const body = (await res.json()) as { state: Record<string, number> };
-  return body.state;
-}
-
-async function provisionRepo(fullName: string): Promise<void> {
-  const res = await fetch(`${GIT_SERVER}/__admin/repos`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: fullName, seed: true, defaultBranch: "main" }),
-  });
-  if (!res.ok && res.status !== 409) {
-    throw new Error(`provisionRepo(${fullName}) failed: ${res.status}`);
-  }
-}
-
+/**
+ * Fixture `git`, ALWAYS through the redacting seam. `authRemote()` embeds a live
+ * installation token in an argv element, and `execFileSync` synthesises its rejection
+ * message from argv (`Command failed: git clone <url>`) — so a raw call prints the
+ * credential into the vitest failure report. `gitFixtureExec` scrubs URL userinfo out of
+ * the message, stdout and stderr, and supplies the hermetic git env itself.
+ */
 function gitFixture(args: string[], cwd?: string): string {
-  return execFileSync("git", args, {
-    cwd,
-    env: { ...process.env, ...HERMETIC_GIT },
-  }).toString();
+  return gitFixtureExec(args, { cwd, env: HERMETIC_GIT });
 }
 
 /** Build a REAL working branch on the origin: a full scaffold (empty manifest) on main +
@@ -116,7 +121,7 @@ function gitFixture(args: string[], cwd?: string): string {
 async function seedWorkingBranch(fullName: string): Promise<string> {
   const work = mkdtempSync(join(tmpdir(), "commit-fixture-"));
   try {
-    gitFixture(["clone", `${GIT_SERVER}/${fullName}.git`, work]);
+    gitFixture(["clone", authRemote(fullName), work]);
     await writeRemotionScaffold(emptyManifest, work);
     gitFixture(["add", "-A"], work);
     gitFixture(["commit", "-m", "supagloo scaffold"], work);
@@ -131,11 +136,12 @@ async function seedWorkingBranch(fullName: string): Promise<string> {
 
 /** The origin's current head SHA for the working branch (via ls-remote). */
 function branchHead(fullName: string): string {
-  const out = execFileSync(
-    "git",
-    ["ls-remote", "--heads", `${GIT_SERVER}/${fullName}.git`, `refs/heads/${BRANCH}`],
-    { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
-  ).toString();
+  const out = gitFixture([
+    "ls-remote",
+    "--heads",
+    authRemote(fullName),
+    `refs/heads/${BRANCH}`,
+  ]);
   return out.split(/\s+/)[0];
 }
 
@@ -143,7 +149,7 @@ function branchHead(fullName: string): string {
 function commitsBetween(fullName: string, from: string, to: string): number {
   const verify = mkdtempSync(join(tmpdir(), "commit-verify-"));
   try {
-    gitFixture(["clone", "--branch", BRANCH, `${GIT_SERVER}/${fullName}.git`, verify]);
+    gitFixture(["clone", "--branch", BRANCH, authRemote(fullName), verify]);
     return Number(
       gitFixture(["rev-list", "--count", `${from}..${to}`], verify).trim(),
     );
@@ -156,18 +162,19 @@ function commitsBetween(fullName: string, from: string, to: string): number {
 function branchHasSceneSource(fullName: string, sceneFile: string): boolean {
   const verify = mkdtempSync(join(tmpdir(), "commit-scene-"));
   try {
-    gitFixture(["clone", "--branch", BRANCH, `${GIT_SERVER}/${fullName}.git`, verify]);
+    gitFixture(["clone", "--branch", BRANCH, authRemote(fullName), verify]);
     return existsSync(join(verify, "src/scenes", sceneFile));
   } finally {
     rmSync(verify, { recursive: true, force: true });
   }
 }
 
-async function seedCommitProjectJob(repoName: string): Promise<{
+async function seedCommitProjectJob(fixture: FixtureRepo): Promise<{
   projectId: string;
   jobId: string;
   payload: CommitVersionPayload;
 }> {
+  const github = await resolveGithubE2eContext();
   const suffix = randomUUID().slice(0, 8);
   const user = await prisma.user.create({
     data: {
@@ -183,8 +190,8 @@ async function seedCommitProjectJob(repoName: string): Promise<{
       slug: `commit-${suffix}`,
       ownerId,
       name: "Commit E2E",
-      repoOwner: "acme",
-      repoName,
+      repoOwner: fixture.owner,
+      repoName: fixture.repo,
       repoVisibility: "private",
       createdFrom: "blank",
       currentBranch: BRANCH,
@@ -214,9 +221,10 @@ async function seedCommitProjectJob(repoName: string): Promise<{
   const payload: CommitVersionPayload = {
     projectId: project.id,
     userId: ownerId,
-    installationId: INSTALLATION_ID,
-    repoOwner: "acme",
-    repoName,
+    // DISCOVERED at runtime (D5) — never the fabricated `"42"` real GitHub 404s on.
+    installationId: github.installationId,
+    repoOwner: fixture.owner,
+    repoName: fixture.repo,
     branchName: BRANCH,
     semver: SEMVER,
     manifest: shelterManifest,
@@ -236,6 +244,7 @@ async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  installationToken = (await resolveGithubE2eContext()).token;
   await launchDbos(env);
   client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
 }, 120_000);
@@ -249,11 +258,9 @@ afterAll(async () => {
 
 describe("commitVersionWorkflow — happy path", () => {
   it("commits the edited manifest: branch head advances by one commit, sources regenerated, version updated", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("commit-happy");
-    await provisionRepo(`acme/${repo}`);
-    const seededHead = await seedWorkingBranch(`acme/${repo}`);
-    const { projectId, jobId, payload } = await seedCommitProjectJob(repo);
+    const fixture = await provisionFixtureRepo("commit-happy");
+    const seededHead = await seedWorkingBranch(fixture.fullName);
+    const { projectId, jobId, payload } = await seedCommitProjectJob(fixture);
 
     const handle = await client.enqueue<CommitVersionResult>(
       {
@@ -271,17 +278,20 @@ describe("commitVersionWorkflow — happy path", () => {
     expect(result.version.headCommitSha).toMatch(/^[0-9a-f]{40}$/);
 
     // The origin advanced to the recorded head by EXACTLY one commit (no double-commit).
-    const newHead = branchHead(`acme/${repo}`);
+    const newHead = branchHead(fixture.fullName);
     expect(newHead).toBe(result.version.headCommitSha);
     expect(newHead).not.toBe(seededHead);
-    expect(commitsBetween(`acme/${repo}`, seededHead, newHead)).toBe(1);
+    expect(commitsBetween(fixture.fullName, seededHead, newHead)).toBe(1);
 
     // The regenerated scene source for the manifest is present on the branch.
-    expect(branchHasSceneSource(`acme/${repo}`, "Shelter.tsx")).toBe(true);
+    expect(branchHasSceneSource(fixture.fullName, "Shelter.tsx")).toBe(true);
 
-    // Token minted; commit performs no PR open/merge.
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBeGreaterThanOrEqual(1);
+    // Exactly-once, DURABILITY axis (D9): the mint step ran once, attributed to THIS
+    // workflow. The stub's global `installationTokensIssued` counter could not attribute
+    // a call to a workflow at all. The NON-DUPLICATION axis for this workflow is the
+    // one-commit-on-the-real-branch assertion above — commitVersion opens/merges no PR,
+    // so there is deliberately no `listPulls` half here.
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
 
     // The working ProjectVersion (0.0.1) is updated IN PLACE — still exactly one version.
     const versions = await prisma.projectVersion.findMany({ where: { projectId } });
@@ -311,11 +321,9 @@ describe("commitVersionWorkflow — happy path", () => {
 
 describe("commitVersionWorkflow — crash / replay", () => {
   it("cancels after commitAndPush, deletes the workspace, then resumes WITHOUT double-committing", async () => {
-    await resetGithubStub();
-    const repo = uniqueRepo("commit-replay");
-    await provisionRepo(`acme/${repo}`);
-    const seededHead = await seedWorkingBranch(`acme/${repo}`);
-    const { projectId, jobId, payload } = await seedCommitProjectJob(repo);
+    const fixture = await provisionFixtureRepo("commit-replay");
+    const seededHead = await seedWorkingBranch(fixture.fullName);
+    const { projectId, jobId, payload } = await seedCommitProjectJob(fixture);
 
     // Park at the boundary just before updateVersionRecord (after commitAndPush has
     // pushed + checkpointed) so the cancel lands at a step boundary.
@@ -361,12 +369,13 @@ describe("commitVersionWorkflow — crash / replay", () => {
 
     // Exactly ONE commit landed on the branch across both attempts (no double-commit:
     // commitAndPush was checkpointed on attempt 1 and skipped on resume).
-    const newHead = branchHead(`acme/${repo}`);
-    expect(commitsBetween(`acme/${repo}`, seededHead, newHead)).toBe(1);
+    const newHead = branchHead(fixture.fullName);
+    expect(commitsBetween(fixture.fullName, seededHead, newHead)).toBe(1);
 
-    // Exactly-once: one token minted (the completed mint step was not re-run on resume).
-    const state = await githubState();
-    expect(state.installationTokensIssued).toBe(1);
+    // Exactly-once across the resume: the completed mint step was NOT re-run. Counted in
+    // the DBOS system DB, so an internal `retriesAllowed` retry cannot inflate it either
+    // (one StepInfo row per functionID).
+    expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
 
     // The working version is updated once; still exactly one version.
     const versions = await prisma.projectVersion.findMany({ where: { projectId } });

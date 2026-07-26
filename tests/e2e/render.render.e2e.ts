@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +29,14 @@ import {
   type GenerationSeedCreds,
 } from "../../src/testing/seed-connections";
 import { resolveAudioModel } from "../../src/testing/e2e-models";
+import {
+  authenticatedRemoteUrl,
+  gitFixtureExec,
+  provisionFixtureRepo,
+  resolveGithubE2eSecrets,
+  seedGithubConnection,
+  type FixtureRepo,
+} from "../../src/testing/github-e2e";
 import { countStepExecutions } from "../../src/testing/step-introspection";
 import {
   __setRenderBoundaryHook,
@@ -41,12 +48,23 @@ import {
 /**
  * END-TO-END proof of `renderWorkflow` (design-delta §6c, §7 workflow 9; plan row 36).
  *
- * Everything here is real: the local git smart-HTTP server serves a real clone of a real
- * scaffolded Remotion project; `npm install --ignore-scripts` really installs Remotion
- * from the public registry into the clone; the manifest's assets are really downloaded
- * out of the Compose MinIO into the workspace `public/` dir; `@remotion/bundler` really
- * bundles; `@remotion/renderer` really drives a headless Chromium and really encodes
- * H.264; and the mp4 + thumbnail really land in MinIO. No mocks anywhere.
+ * Everything here is real: **real github.com** serves a real clone of a real scaffolded
+ * Remotion project over HTTPS, authenticated with an installation token minted by the
+ * product's own code; `npm install --ignore-scripts` really installs Remotion from the
+ * public registry into the clone; the manifest's assets are really downloaded out of the
+ * Compose MinIO into the workspace `public/` dir; `@remotion/bundler` really bundles;
+ * `@remotion/renderer` really drives a headless Chromium and really encodes H.264; and
+ * the mp4 + thumbnail really land in MinIO. No mocks anywhere.
+ *
+ * Task 62 (design-delta §11): the github-stub (:4801) and the local git smart-HTTP
+ * server (:4805) are DELETED. Each spec provisions its own per-run throwaway repo
+ * (the shared e2e prefix + `render-<label>` + the run id, private, `auto_init`) on the real
+ * account and pushes its fixture branch there. That makes this the spec where the render
+ * lane's **real network clone from github.com** is proven — retiring the
+ * stale-git-server-fixture trap (tech-lead memory `render-workflow-gotchas`) by deletion
+ * rather than by documentation. The repos are NEVER torn down in-suite; reclaim them with
+ * root's interactive `npm run cleanup:github-e2e`, which archives (never deletes) and
+ * confirms per repo.
  *
  * Four proofs:
  *   1. happy path — playable mp4 (probed with `getVideoMetadata`) + thumbnail in MinIO
@@ -61,19 +79,15 @@ import {
  * deterministic provider misbehaviour is a unit concern, not an e2e one.
  */
 
-const GITHUB_STUB = process.env.GITHUB_STUB_URL ?? "http://localhost:4801";
-const GIT_SERVER = process.env.GIT_SERVER_URL ?? "http://localhost:4805";
 const S3_PUBLIC = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 const S3_BUCKET = process.env.S3_BUCKET ?? "supagloo-dev";
 const ENCRYPTION_KEY = "0".repeat(64);
-const INSTALLATION_ID = "42";
-const REPO_OWNER = "acme";
 
-const { privateKey } = generateKeyPairSync("rsa", {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: "spki", format: "pem" },
-  privateKeyEncoding: { type: "pkcs8", format: "pem" },
-});
+// Real GitHub App credentials from the root `.env` (loaded into this worker by
+// `tests/e2e/load-root-env.ts`). Fails fast, by name, if any is missing — never a
+// generated throwaway keypair with `appId: "123456"`, which could only ever have worked
+// against a stub.
+const githubSecrets = resolveGithubE2eSecrets();
 
 function makeEnv(overrides: Record<string, string | undefined> = {}): Env {
   return loadEnv({
@@ -83,10 +97,12 @@ function makeEnv(overrides: Record<string, string | undefined> = {}): Env {
       process.env.DBOS_DATABASE_URL ??
       "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
     NODE_ENV: "test",
-    GITHUB_API_BASE_URL: GITHUB_STUB,
-    GITHUB_GIT_BASE_URL: GIT_SERVER,
-    GITHUB_APP_ID: "123456",
-    GITHUB_APP_PRIVATE_KEY: privateKey,
+    // NO GITHUB_API_BASE_URL / GITHUB_GIT_BASE_URL: `src/config/env.ts` defaults them to
+    // https://api.github.com and https://github.com, so real-by-default is achieved by
+    // NOT overriding them (synthesis finding F1 — the worker was always real; only the
+    // specs pointed it at the stub).
+    GITHUB_APP_ID: githubSecrets.appId,
+    GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
     OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
     SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
     // The in-process worker reaches MinIO at the HOST-reachable endpoint.
@@ -131,41 +147,49 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+/**
+ * Fixture `git`, ALWAYS through the redacting seam. The clone below authenticates with a
+ * live installation token embedded in an argv element, and `execFileSync` synthesises its
+ * rejection message from argv (`Command failed: git clone <url>`) — so a raw call prints
+ * the credential into the vitest failure report; `stdio: "pipe"` does nothing about it,
+ * because that string never came from the child's streams. `gitFixtureExec` scrubs URL
+ * userinfo out of the message, stdout and stderr, and supplies the hermetic git env.
+ */
 function git(args: string[], cwd?: string): void {
-  execFileSync("git", args, {
+  gitFixtureExec(args, {
     cwd,
     env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
       GIT_AUTHOR_NAME: "Render E2E",
       GIT_AUTHOR_EMAIL: "render@supagloo.test",
       GIT_COMMITTER_NAME: "Render E2E",
       GIT_COMMITTER_EMAIL: "render@supagloo.test",
     },
-    stdio: "pipe",
   });
 }
 
-async function provisionRepo(fullName: string): Promise<void> {
-  const res = await fetch(`${GIT_SERVER}/__admin/repos`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: fullName, seed: true, defaultBranch: "main" }),
-  });
-  if (!res.ok && res.status !== 409) {
-    throw new Error(`provisionRepo(${fullName}) failed: ${res.status}`);
-  }
-}
-
-/** Push a REAL scaffolded Remotion project to `branch` of the provisioned repo. */
+/**
+ * Push a REAL scaffolded Remotion project to `branch` of a freshly provisioned,
+ * per-run, PRIVATE fixture repo on real github.com.
+ *
+ * The fixture push uses an `x-access-token:<installation token>@github.com/...` remote —
+ * the same authenticated shape the product builds — because the repo is private and the
+ * retired git-server needed no credential at all. `provisionFixtureRepo` has already
+ * gated on the repo being readable AND visible to the installation, so the workflow's
+ * own `ensureRepoReachable` (which classifies absence as PERMANENT) cannot lose a race
+ * with GitHub's eventual consistency.
+ */
 async function pushScaffoldedProject(
-  repoName: string,
+  fixture: FixtureRepo,
   branch: string,
   manifest: ProjectManifest,
+  token: string,
 ): Promise<void> {
-  await provisionRepo(`${REPO_OWNER}/${repoName}`);
   const dir = tempDir("supagloo-render-fixture-");
-  git(["clone", `${GIT_SERVER}/${REPO_OWNER}/${repoName}.git`, dir]);
+  git([
+    "clone",
+    authenticatedRemoteUrl({ token, owner: fixture.owner, repo: fixture.repo }),
+    dir,
+  ]);
   await writeRemotionScaffold(manifest, dir);
   git(["checkout", "-B", branch], dir);
   git(["add", "-A"], dir);
@@ -200,14 +224,16 @@ interface Seeded {
   renderJobId: string;
   projectId: string;
   userId: string;
-  repoName: string;
+  /** The per-run throwaway repo on real github.com this subject renders from. */
+  fixture: FixtureRepo;
   payload: RenderWorkflowPayload;
 }
 
 /**
- * Seed a complete render subject: user (+ GitHub installation, + optionally a real
- * OpenRouter connection), project, working version, uploaded assets, a scaffolded repo
- * pushed to the git server, and a queued RenderJob.
+ * Seed a complete render subject: user (+ the DISCOVERED GitHub installation, +
+ * optionally a real OpenRouter connection), a per-run PRIVATE fixture repo on real
+ * github.com, project, working version, uploaded assets, a scaffolded project pushed to
+ * that repo, and a queued RenderJob.
  */
 async function seedRender(
   label: string,
@@ -216,7 +242,6 @@ async function seedRender(
   },
 ): Promise<Seeded> {
   const suffix = randomUUID().slice(0, 8);
-  const repoName = `render-${label}-${suffix}`;
 
   const user = await prisma.user.create({
     data: {
@@ -226,15 +251,10 @@ async function seedRender(
       avatarInitials: "RE",
     },
   });
-  await prisma.githubConnection.create({
-    data: {
-      userId: user.id,
-      installationId: INSTALLATION_ID,
-      githubLogin: REPO_OWNER,
-      repositorySelection: "all",
-      status: "connected",
-    },
-  });
+  // The installation id + login are DISCOVERED at runtime (task 62 D5) — the fabricated
+  // `installationId: "42"` / `githubLogin: "acme"` pair is exactly what made real GitHub
+  // 404 `POST /app/installations/42/access_tokens` (plan row 62 item (d)).
+  const github = await seedGithubConnection({ prisma, userId: user.id });
   if (opts.withOpenRouter) {
     creds ??= resolveGenerationSeedCreds();
     await seedOpenRouterConnection({
@@ -245,13 +265,19 @@ async function seedRender(
     });
   }
 
+  // The fixture repo must exist before the Project row, because the row records the
+  // repo it points at. `provisionFixtureRepo` creates it with the PAT
+  // (`private: true, auto_init: true`) and gates on repo-readiness THEN
+  // installation-visibility before returning.
+  const fixture = await provisionFixtureRepo(`render-${label}`);
+
   const project = await prisma.project.create({
     data: {
       slug: `render-${suffix}`,
       ownerId: user.id,
       name: "Render E2E",
-      repoOwner: REPO_OWNER,
-      repoName,
+      repoOwner: fixture.owner,
+      repoName: fixture.repo,
       repoVisibility: "private",
       createdFrom: "blank",
       currentBranch: "v0.0.1",
@@ -289,7 +315,7 @@ async function seedRender(
     music: { style: "ambient cinematic pads", assetKey: musicKey },
   };
 
-  await pushScaffoldedProject(repoName, "v0.0.1", manifest);
+  await pushScaffoldedProject(fixture, "v0.0.1", manifest, github.token);
 
   const version = await prisma.projectVersion.create({
     data: {
@@ -324,7 +350,7 @@ async function seedRender(
     renderJobId,
     projectId: project.id,
     userId: user.id,
-    repoName,
+    fixture,
     payload: { renderJobId },
   };
 }
