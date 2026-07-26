@@ -375,6 +375,51 @@ describe("scaffoldProjectWorkflow — permanent failure is recorded, not hung", 
     // The stage log is upserted IN PLACE — a later stage is untouched, never appended.
     expect(stages.find((s) => s.key === "pushOpenMergeBasePr")?.state).toBe("pending");
   }, 90_000);
+
+  // Review finding DR4 — the same defect, in the failure that is far MORE likely than a
+  // 422 or an unreachable repo. Row 63's catch recorded a failure only when
+  // `isPermanentScaffoldFailure(err)` was true, and that predicate knows exactly three
+  // types — none of them db-lib's `GithubAppError`, which is what step 1 throws. Step 1
+  // also deliberately carries no `shouldRetry` (D64.5), so a 404 burns the whole
+  // 4-attempt `NETWORK_RETRY` budget and then throws, and the workflow rethrew having
+  // written NOTHING: eternal wizard spinner, inside the fix meant to kill it. This case
+  // is the cheapest possible proof — it fails at step 1, so it touches no repo at all.
+  it("flips ProjectJob.status to failed when the installation token mint fails (GithubAppError)", async () => {
+    const github = await resolveGithubE2eContext();
+    const unused: FixtureRepo = {
+      owner: github.owner,
+      repo: `never-touched-${randomUUID().slice(0, 8)}`,
+      fullName: `${github.owner}/never-touched`,
+      cloneUrl: "https://github.com/invalid/invalid.git",
+    };
+    const { jobId, payload } = await seedProjectJob(unused);
+
+    const handle = await client.enqueue<ScaffoldProjectResult>(
+      {
+        workflowName: WORKFLOW_NAMES.scaffoldProject,
+        queueName: WORKFLOW_QUEUE.scaffoldProject,
+        workflowID: jobId,
+      },
+      // A real, well-formed App JWT against an installation this App does not own ⇒ real
+      // GitHub answers `POST /app/installations/999999999/access_tokens` with 404 and
+      // db-lib's `mintInstallationToken` throws `GithubAppError`. 404 is NOT retryable in
+      // db-lib's client either, so this costs exactly one request per DBOS attempt.
+      { ...payload, installationId: "999999999" },
+    );
+    const outcome = await handle.getResult().then(
+      () => "ok",
+      () => "failed",
+    );
+    expect(outcome).toBe("failed");
+
+    const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("failed");
+    expect(job.completedAt).not.toBeNull();
+    expect(job.error ?? "").not.toBe("");
+    const stages = job.stages as Array<{ key: string; state: string }>;
+    expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("failed");
+    expect(stages.find((s) => s.key === "ensureRepoAccessible")?.state).toBe("pending");
+  }, 90_000);
 });
 
 describe("scaffoldProjectWorkflow — crash / replay", () => {

@@ -11,7 +11,7 @@ import {
   mergePullRequest,
   openPullRequest,
 } from "./scaffold-project/github-rest";
-import { isPermanentScaffoldFailure, retryUnlessPermanent } from "./scaffold-project/retry";
+import { retryUnlessPermanent } from "./scaffold-project/retry";
 import {
   BASE_BRANCH,
   DEFAULT_BASE_BRANCH,
@@ -338,22 +338,49 @@ async function scaffoldProjectFn(
     };
   } catch (err) {
     // Plan row 63 / D63.7. Until now this function had NO try/catch and no
-    // `markJobFailed`, so a PERMANENT failure — row 63's own `422 field:base
-    // code:invalid` among them — left `ProjectJob.status` at `"running"` with the
-    // offending stage `pending` forever while DBOS reported ERROR. The user-visible
-    // face of the defect was an ETERNAL WIZARD SPINNER instead of a failure.
+    // `markJobFailed`, so a failure — row 63's own `422 field:base code:invalid` among
+    // them — left `ProjectJob.status` at `"running"` with the offending stage `pending`
+    // forever while DBOS reported ERROR. The user-visible face of the defect was an
+    // ETERNAL WIZARD SPINNER instead of a failure.
     //
-    // Only PERMANENT failures are recorded (same shape as `import-project.ts`):
-    // transient ones are still owned by DBOS retry/recovery, and writing `failed` for
-    // one would lie about a job that is about to succeed. Re-thrown either way, so the
-    // DBOS workflow status is unchanged.
-    if (isPermanentScaffoldFailure(err)) {
+    // EVERY escaping error is recorded, not just the typed-permanent ones (review
+    // finding DR4). The first cut gated this on `isPermanentScaffoldFailure(err)`, which
+    // recognises exactly `RepoUnreachableError` / `GithubRestError` / `GitCommandError` —
+    // and therefore NOT db-lib's `GithubAppError`, which is what step 1
+    // `mintInstallationToken` throws, and not the Zod/Prisma errors `writeRemotionScaffold`
+    // and `finalizeRecords` throw. A bad App private key or a revoked installation — the
+    // single most likely permanent failure there is — reproduced the eternal spinner in
+    // full inside the fix meant to kill it.
+    //
+    // Recording unconditionally is not a guess about transience: by the time an error
+    // reaches this catch, DBOS has ALREADY spent that step's retry budget and
+    // CHECKPOINTED the error (`dbos-executor.ts` writes it via `recordOperationResult`
+    // and only then throws), so the step re-throws the same recorded error on every
+    // replay. There is no path back to success without an operator `resumeWorkflow`, and
+    // the workflow rethrows below either way, so the DBOS status is unchanged. A crash
+    // — the case that IS recoverable — unwinds the process instead of running this catch.
+    //
+    // `markJobFailed` refuses to overwrite an already-`succeeded` job, which is what
+    // keeps the widened catch honest if `finalizeRecords`' trailing `removeWorkspace`
+    // ever throws after the success write (see `stages.ts`).
+    try {
       await DBOS.runStep(
         async () => {
-          await markJobFailed(prisma, jobId, currentStage, (err as Error).message);
+          await markJobFailed(
+            prisma,
+            jobId,
+            currentStage,
+            err instanceof Error ? err.message : String(err),
+          );
         },
         { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },
       );
+    } catch {
+      // The bookkeeping write must never REPLACE the real failure. It fails when the app
+      // DB is unreachable, and (harmlessly) when the workflow was cancelled — DBOS
+      // rejects a `runStep` in a CANCELLED workflow before it records anything, so this
+      // step cannot poison the function-ID sequence a later `resumeWorkflow` replays.
+      // Swallow, and rethrow the cause below.
     }
     throw err;
   }

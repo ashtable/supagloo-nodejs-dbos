@@ -92,6 +92,12 @@ export async function markStageDone(
  * `pending` FOREVER while DBOS reported ERROR. The user-visible symptom was an eternal
  * wizard spinner rather than a failure. `commit-version` and `publish-version` still
  * share that gap; it is tracked as plan row 50 item (2), not widened into row 63.
+ *
+ * NEVER CLOBBERS A TERMINAL SUCCESS (review finding DR4). The scaffold catch now records
+ * EVERY error that escapes the workflow body, which opens exactly one new window:
+ * `finalizeRecords` writes `status = "succeeded"` and only THEN removes the workspace, so
+ * a throw from that `rm` would arrive here with the job already legitimately succeeded.
+ * The guard closes it once, for every caller (`import-project/stages.ts` re-exports this).
  */
 export async function markJobFailed(
   prisma: PrismaClient,
@@ -101,8 +107,9 @@ export async function markJobFailed(
 ): Promise<void> {
   const job = await prisma.projectJob.findUniqueOrThrow({
     where: { id: jobId },
-    select: { stages: true },
+    select: { stages: true, status: true },
   });
+  if (job.status === "succeeded") return;
   const stages = JobStagesSchema.parse(job.stages);
   await prisma.projectJob.update({
     where: { id: jobId },

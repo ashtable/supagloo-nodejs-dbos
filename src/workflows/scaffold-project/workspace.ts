@@ -69,17 +69,18 @@ export function workspacePath(ctx: ScaffoldContext): string {
   return join(ctx.workspaceRoot ?? DEFAULT_ROOT, ctx.jobId);
 }
 
-async function branchSha(dir: string, branch: string): Promise<string | null> {
+/** Resolve any ref to its SHA, or `null` when the ref does not exist. */
+async function refSha(dir: string, ref: string): Promise<string | null> {
   try {
-    const out = (
-      await git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], {
-        cwd: dir,
-      })
-    ).trim();
+    const out = (await git(["rev-parse", "--verify", "--quiet", ref], { cwd: dir })).trim();
     return out || null;
   } catch {
     return null; // ref does not exist (rev-parse --verify exits non-zero)
   }
+}
+
+async function branchSha(dir: string, branch: string): Promise<string | null> {
+  return refSha(dir, `refs/heads/${branch}`);
 }
 
 /** Ensure a valid clone exists at the deterministic path (reuse, else fresh). */
@@ -108,18 +109,37 @@ export async function ensureClone(ctx: ScaffoldContext): Promise<string> {
  * THE FIX. Establish the base ref FIRST, so `main` — not `v0.0.0` — is the ref GitHub
  * promotes, and so `v0.0.0` branches from a real tip and has commits between it and the
  * base. Four self-healing levels, in order (the house idiom):
- *   (i)   the clone already has commits ⇒ nothing to do (the overwhelmingly common case:
- *         an `auto_init`ed or already-populated repo);
- *   (ii)  the REMOTE already carries the base ref (a concurrent replay won, or the local
- *         clone predates it) ⇒ fetch and adopt it, never re-create it;
- *   (iii) genuinely unborn ⇒ create the branch explicitly (`checkout -B`, because the
- *         unborn HEAD's name varies with git version and remote `init.defaultBranch`),
- *         make the deterministic EMPTY bootstrap commit, and push it;
+ *   (i)   the origin is already KNOWN to carry the base ref ⇒ adopt it locally, no
+ *         network (the overwhelmingly common case: an `auto_init`ed or already-populated
+ *         repo, whose clone recorded `refs/remotes/origin/<base>`);
+ *   (ii)  our cached view may be stale, so ASK the origin (a concurrent replay won, or
+ *         our push landed but its report was lost) ⇒ fetch and adopt, never re-create;
+ *   (iii) the origin genuinely lacks the ref ⇒ create the branch explicitly (`checkout
+ *         -B`, because the unborn HEAD's name varies with git version and remote
+ *         `init.defaultBranch`), give it the deterministic EMPTY bootstrap commit if and
+ *         only if HEAD is still unborn, and push it;
  *   (iv)  the push loses a race (another replay pushed first) ⇒ re-fetch and adopt the
  *         remote ref instead of failing.
  *
+ * EVERY LEVEL IS KEYED ON REMOTE STATE, WHICH IS THE WHOLE POINT (review R4). The durable
+ * effect lives on the origin, and level (iii) necessarily creates the local commit BEFORE
+ * it pushes. So a short-circuit keyed on the LOCAL `HEAD` — "the clone already has
+ * commits" — is satisfied by our own half-finished work: `cloneToWorkspace` is
+ * `{ ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent }` and `ensureClone` REUSES a
+ * live workspace, so one transient `pushBranch` failure re-enters this function on a
+ * workspace whose HEAD now resolves, the bootstrap is skipped permanently, `main` is
+ * never pushed, and `openPullRequest(base: "main")` 422s — the exact defect above.
+ * `refs/remotes/origin/<base>` is the local record of an OBSERVATION of the origin: git
+ * writes it on clone, on fetch, and on a SUCCESSFUL push, and a local `git commit` can
+ * never forge it. (Residual, deliberately not handled: a branch deleted on the origin
+ * after we cloned leaves a stale tracking ref. That is an external mutation, not a replay
+ * hazard, and re-checking it would cost a network round-trip on every scaffold.)
+ *
  * Idempotent and crash-safe: the effect is durable on the REMOTE, so a rebuilt
- * (ephemeral) workspace re-clones a repo that already satisfies level (i) or (ii).
+ * (ephemeral) workspace re-clones a repo that already satisfies level (i) or (ii), and a
+ * re-entry at level (iii) re-pushes the SAME single bootstrap commit rather than stacking
+ * a second one — which matters because `v0.0.0` is committed on top of the base tip, so a
+ * changed parent would change the `baseSha` that `commitBaseVersion` already checkpointed.
  * Called from inside the EXISTING `cloneToWorkspace` step — deliberately not a new
  * `DBOS.runStep`, because db-lib's `SCAFFOLD_STAGES` is pinned key-for-key to the step
  * names and must keep mirroring wireframe 12a's designed 7-row log (D63.2).
@@ -128,15 +148,28 @@ export async function ensureBaseRef(ctx: ScaffoldContext): Promise<void> {
   const path = workspacePath(ctx);
   const base = baseRefOf(ctx);
 
-  // (i) The clone has commits — HEAD resolves. Nothing to bootstrap.
-  if (await headExists(path)) return;
+  // (i) The origin was OBSERVED to have the base ref — by the clone, by a fetch, or by a
+  // push of ours that succeeded. Adopt it and stop; no network, and no local commit can
+  // fake this ref. Checking out from it (rather than just returning) also leaves the
+  // workspace ON the base branch even when the origin's default branch is some other name.
+  const trackingRef = `refs/remotes/origin/${base}`;
+  if (await refSha(path, trackingRef)) {
+    await checkoutBranch(path, base, trackingRef);
+    return;
+  }
 
-  // (ii) Someone already created the base ref on the remote (a concurrent replay).
+  // (ii) That view can be stale — ask the origin itself (a concurrent replay may have
+  // pushed after we cloned, or our own push may have landed with its report lost).
   if (await adoptRemoteBaseRef(path, base)) return;
 
-  // (iii) Genuinely unborn: create the ref and push it.
+  // (iii) The origin genuinely has no base ref. Create it — from the current tip if the
+  // clone has commits under a different branch name, else as a root commit.
   await checkoutBranch(path, base);
-  await commitEmpty(path, BOOTSTRAP_COMMIT.message);
+  // The bootstrap commit exists only to give a commit-less repo something to point at, so
+  // make it ONLY when HEAD is still unborn. That keeps a re-entry after a failed push
+  // idempotent (it re-pushes the same commit instead of stacking another empty one) and
+  // keeps a populated-but-differently-named repo free of a pointless empty commit.
+  if (!(await headExists(path))) await commitEmpty(path, BOOTSTRAP_COMMIT.message);
   try {
     await pushBranch(path, base);
   } catch (err) {
@@ -146,14 +179,15 @@ export async function ensureBaseRef(ctx: ScaffoldContext): Promise<void> {
   }
 }
 
-/** True when the working tree has a resolvable HEAD (i.e. the clone has commits). */
+/**
+ * True when the working tree has a resolvable HEAD (i.e. it has commits).
+ *
+ * ONLY safe as "does a commit exist here to point a branch at" — never as "is the
+ * bootstrap done", because this function cannot distinguish a commit that is durable on
+ * the origin from one this workspace made and failed to push (review R4).
+ */
 async function headExists(dir: string): Promise<boolean> {
-  try {
-    const out = (await git(["rev-parse", "--verify", "--quiet", "HEAD"], { cwd: dir })).trim();
-    return out !== "";
-  } catch {
-    return false; // unborn HEAD — `rev-parse --verify` exits non-zero
-  }
+  return (await refSha(dir, "HEAD")) !== null;
 }
 
 /** Fetch and check out `branch` from the origin if the REMOTE has it; else `false`. */

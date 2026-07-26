@@ -123,4 +123,24 @@ describe("markJobFailed", () => {
     expect(stages.find((s) => s.key === "pushOpenMergeBasePr")?.state).toBe("failed");
     expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("pending");
   });
+
+  // Review finding DR4. The scaffold catch now records EVERY error that escapes the
+  // workflow body, not just the three typed permanent ones — which opens exactly one new
+  // window: `finalizeRecords` writes `status = "succeeded"` and only THEN calls
+  // `removeWorkspace`, so a throw from that `rm` would reach the catch with the job
+  // already legitimately succeeded. Refusing to clobber a terminal success closes it here,
+  // once, for every caller (import re-exports this function).
+  it("refuses to clobber a job that already succeeded", async () => {
+    const findUniqueOrThrow = vi
+      .fn()
+      .mockResolvedValue({ stages: initialStages(), status: "succeeded" });
+    const update = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      projectJob: { findUniqueOrThrow, update },
+    } as unknown as PrismaClient;
+
+    await markJobFailed(prisma, "job-1", "finalizeRecords", "EBUSY: rm workspace");
+
+    expect(update).not.toHaveBeenCalled();
+  });
 });
