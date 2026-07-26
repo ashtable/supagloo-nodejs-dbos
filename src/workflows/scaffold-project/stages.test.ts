@@ -4,6 +4,7 @@ import {
   SCAFFOLD_STAGES,
   initialStages,
   mergeStage,
+  markJobFailed,
   markJobRunning,
   JobStagesSchema,
   type JobStage,
@@ -85,5 +86,61 @@ describe("markJobRunning", () => {
       where: { id: "job-1" },
       data: { status: "running" },
     });
+  });
+});
+
+// --------------------------------------------------------------------- plan row 63
+// Until now `scaffoldProjectFn` had NO try/catch and no `markJobFailed`, so a permanent
+// failure (row 63's own `422 field:base code:invalid`) left `ProjectJob.status` at
+// `"running"` with `pushOpenMergeBasePr: pending` FOREVER while DBOS reported ERROR —
+// the user-visible face of the defect is an eternal wizard spinner instead of a
+// failure. Import already had this (`import-project/stages.ts:35`); scaffold did not.
+describe("markJobFailed", () => {
+  it("flips status to failed, marks the offending stage failed in place, stamps completedAt and writes the error", async () => {
+    const findUniqueOrThrow = vi.fn().mockResolvedValue({ stages: initialStages() });
+    const update = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      projectJob: { findUniqueOrThrow, update },
+    } as unknown as PrismaClient;
+
+    await markJobFailed(
+      prisma,
+      "job-1",
+      "pushOpenMergeBasePr",
+      "open pull request failed: 422 — base is invalid",
+    );
+
+    expect(update).toHaveBeenCalledTimes(1);
+    const arg = update.mock.calls[0][0];
+    expect(arg.where).toEqual({ id: "job-1" });
+    expect(arg.data.status).toBe("failed");
+    expect(arg.data.error).toContain("422");
+    expect(arg.data.completedAt).toBeInstanceOf(Date);
+
+    const stages = arg.data.stages as Array<{ key: string; state: string }>;
+    // Upsert IN PLACE — the order and every other stage survive untouched.
+    expect(stages.map((s) => s.key)).toEqual(SCAFFOLD_STAGES.map((s) => s.key));
+    expect(stages.find((s) => s.key === "pushOpenMergeBasePr")?.state).toBe("failed");
+    expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("pending");
+  });
+
+  // Review finding DR4. The scaffold catch now records EVERY error that escapes the
+  // workflow body, not just the three typed permanent ones — which opens exactly one new
+  // window: `finalizeRecords` writes `status = "succeeded"` and only THEN calls
+  // `removeWorkspace`, so a throw from that `rm` would reach the catch with the job
+  // already legitimately succeeded. Refusing to clobber a terminal success closes it here,
+  // once, for every caller (import re-exports this function).
+  it("refuses to clobber a job that already succeeded", async () => {
+    const findUniqueOrThrow = vi
+      .fn()
+      .mockResolvedValue({ stages: initialStages(), status: "succeeded" });
+    const update = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      projectJob: { findUniqueOrThrow, update },
+    } as unknown as PrismaClient;
+
+    await markJobFailed(prisma, "job-1", "finalizeRecords", "EBUSY: rm workspace");
+
+    expect(update).not.toHaveBeenCalled();
   });
 });

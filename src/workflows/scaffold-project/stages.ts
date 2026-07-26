@@ -77,6 +77,52 @@ export async function markStageDone(
 }
 
 /**
+ * Record a PERMANENT failure onto the job: flip `status = failed`, mark the offending
+ * stage `failed` (an upsert-in-place via {@link mergeStage}), stamp `completedAt`, and
+ * write the human-readable `error`. Idempotent under replay (a failed workflow only
+ * re-runs if explicitly resumed; re-writing the same failed state is a no-op).
+ *
+ * GENERIC, like {@link mergeStage} / {@link markStageDone} / {@link markJobRunning}: it
+ * keys off the stage array, not the catalogue, so `import-project/stages.ts` re-exports
+ * it rather than keeping a second copy.
+ *
+ * Plan row 63 / D63.7 is why scaffold now uses it. `scaffoldProjectFn` had no
+ * `try`/`catch` at all, so a permanent failure — row 63's own `422 field:base
+ * code:invalid` — left `ProjectJob.status` at `"running"` with the offending stage
+ * `pending` FOREVER while DBOS reported ERROR. The user-visible symptom was an eternal
+ * wizard spinner rather than a failure. `commit-version` and `publish-version` still
+ * share that gap; it is tracked as plan row 50 item (2), not widened into row 63.
+ *
+ * NEVER CLOBBERS A TERMINAL SUCCESS (review finding DR4). The scaffold catch now records
+ * EVERY error that escapes the workflow body, which opens exactly one new window:
+ * `finalizeRecords` writes `status = "succeeded"` and only THEN removes the workspace, so
+ * a throw from that `rm` would arrive here with the job already legitimately succeeded.
+ * The guard closes it once, for every caller (`import-project/stages.ts` re-exports this).
+ */
+export async function markJobFailed(
+  prisma: PrismaClient,
+  jobId: string,
+  failedStageKey: string,
+  errorMessage: string,
+): Promise<void> {
+  const job = await prisma.projectJob.findUniqueOrThrow({
+    where: { id: jobId },
+    select: { stages: true, status: true },
+  });
+  if (job.status === "succeeded") return;
+  const stages = JobStagesSchema.parse(job.stages);
+  await prisma.projectJob.update({
+    where: { id: jobId },
+    data: {
+      status: "failed",
+      completedAt: new Date(),
+      error: errorMessage,
+      stages: toJson(mergeStage(stages, failedStageKey, "failed")),
+    },
+  });
+}
+
+/**
  * Flip the job's top-level `status` to `running` (design-delta §2.9 lifecycle). The
  * first thing the scaffold workflow does, so the polling UI observes queued→running
  * before any stage completes. Status ONLY — the stage log is untouched here. Idempotent

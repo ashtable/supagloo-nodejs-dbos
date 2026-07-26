@@ -38,10 +38,15 @@ import { countStepExecutions } from "../../src/testing/step-introspection";
 // used to back this spec. Consequences that shape the code below:
 //
 //   • Each test provisions its OWN per-run repo,
-//     the shared e2e prefix + `scaffold-<case>` + the run id — private, `auto_init: true` (a
-//     commit-less repo has no `main`, and the base PR opens with `base: "main"`, which
-//     real GitHub 422s). Per-run names are MANDATORY, not tidiness: the v0.0.0 commit is
+//     the shared e2e prefix + `scaffold-<case>` + the run id — private, `auto_init: true`
+//     by DEFAULT. Per-run names are MANDATORY, not tidiness: the v0.0.0 commit is
 //     byte-deterministic by design, so a REUSED repo rejects a second run.
+//     THE ONE EXCEPTION is the commit-less case below (plan row 63), which passes
+//     `{ autoInit: false }` on purpose: the repo then has zero commits and no `main`, the
+//     exact shape that used to 422 the base PR. It reaches `succeeded` because the
+//     workflow bootstraps the base ref itself (`workspace.ts` `ensureBaseRef`). That
+//     opt-out is additive and deliberately used nowhere else — every other lane
+//     (scaffold-happy, commit, publish, render) depends on the default.
 //   • Nothing is torn down, ever — not even on success (D6). Reclaim the repos with
 //     root's interactive `npm run cleanup:github-e2e`, which ARCHIVES (never deletes)
 //     after confirming each name.
@@ -261,6 +266,159 @@ describe("scaffoldProjectWorkflow — happy path", () => {
     expect(job.status).toBe("succeeded");
     const stages = job.stages as Array<{ state: string }>;
     expect(stages.every((s) => s.state === "done")).toBe(true);
+  }, 90_000);
+});
+
+// ---------------------------------------------------------------------- plan row 63
+// The row's stated e2e acceptance, verbatim: "scaffold a PAT-created repo that has NO
+// initial commit and reach `succeeded` — the case that 422s today".
+//
+// Traced failure before this row (real GitHub, real git 2.50.1):
+//   git clone <empty repo>   → exit 0, "warning: You appear to have cloned an empty
+//                              repository", HEAD = unborn refs/heads/main
+//   git checkout -B v0.0.0   → exit 0 (works from an unborn HEAD)
+//   git commit               → a ROOT commit, no parent
+//   git push origin v0.0.0   → exit 0 — and REAL GITHUB PROMOTES v0.0.0 TO
+//                              default_branch right here, so a naive retry is not
+//                              idempotent-clean
+//   POST /pulls base=main    → 422 Validation Failed (field: base, code: invalid)
+// The `ensureBaseRef` bootstrap runs BEFORE any of that, so `main` exists on the remote
+// first and GitHub promotes `main`, not `v0.0.0`.
+describe("scaffoldProjectWorkflow — commit-less repo (row 63)", () => {
+  it("scaffolds a PAT-created repo that has NO initial commit and reaches succeeded", async () => {
+    const github = await resolveGithubE2eContext();
+    const readers = await githubReaders();
+    // `autoInit: false` ⇒ zero commits, no `main`, nothing for the branch readiness
+    // gate to observe. This is the shape the product's own create-new path produced,
+    // and the shape wireframe 13a's "Empty · created just now" repo has.
+    const fixture = await provisionFixtureRepo("scaffold-unborn", {}, { autoInit: false });
+    const { projectId, jobId, payload } = await seedProjectJob(fixture);
+
+    const handle = await client.enqueue<ScaffoldProjectResult>(
+      {
+        workflowName: WORKFLOW_NAMES.scaffoldProject,
+        queueName: WORKFLOW_QUEUE.scaffoldProject,
+        workflowID: jobId,
+      },
+      payload,
+    );
+    const result = (await handle.getResult()) as ScaffoldProjectResult;
+
+    expect(result.workflowId).toBe(jobId);
+    // The base PR is PRESERVED (D63.3): the bootstrap creates `main` and the base
+    // version still lands through a merged PR, so `prNumber` stays non-null and
+    // wireframe 12a step 2's designed row 5 ("Pushed → opened & merged PR into main")
+    // stays literally true. If this goes red the bootstrap is wrong, not the assertion.
+    expect(result.baseVersion.prNumber).toBeGreaterThan(0);
+
+    // D63.4: scaffold MUST leave a `main` ref — `publish-version.ts` opens its PR with
+    // `base: "main"` and `publish-version/workspace.ts` does `git clone --branch main`.
+    const heads = remoteHeads(fixture, github.token);
+    expect(heads).toContain("refs/heads/main");
+    expect(heads).toContain("refs/heads/v0.0.0");
+    expect(heads).toContain("refs/heads/v0.0.1");
+
+    const pulls = await readers.listPulls({ repo: fixture.repo });
+    expect(pulls).toHaveLength(1);
+    expect(pulls[0].merged_at).not.toBeNull();
+    expect(pulls[0].base.ref).toBe("main");
+    expect(pulls[0].number).toBe(result.baseVersion.prNumber);
+
+    const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("succeeded");
+    const stages = job.stages as Array<{ state: string }>;
+    expect(stages.every((s) => s.state === "done")).toBe(true);
+
+    const versions = await prisma.projectVersion.findMany({ where: { projectId } });
+    expect(versions.map((v) => v.semver).sort()).toEqual(["0.0.0", "0.0.1"]);
+  }, 120_000);
+});
+
+// D63.7. `scaffoldProjectFn` had NO try/catch, so row 63's own 422 left
+// `ProjectJob.status = "running"` with `pushOpenMergeBasePr: pending` forever while
+// DBOS reported ERROR — the user-visible face of the defect is an ETERNAL WIZARD
+// SPINNER, not a failure. `import-project.ts` already had this; scaffold did not.
+describe("scaffoldProjectWorkflow — permanent failure is recorded, not hung", () => {
+  it("flips ProjectJob.status to failed when a scaffold step fails permanently, instead of hanging at running", async () => {
+    const github = await resolveGithubE2eContext();
+    // A repo the installation genuinely cannot reach ⇒ `ensureRepoAccessible` throws a
+    // typed, PERMANENT RepoUnreachableError on the first attempt. Nothing is created on
+    // GitHub, so this case accumulates no fixture repo.
+    const missing: FixtureRepo = {
+      owner: github.owner,
+      repo: `no-such-repo-${randomUUID().slice(0, 8)}`,
+      fullName: `${github.owner}/no-such-repo`,
+      cloneUrl: "https://github.com/invalid/invalid.git",
+    };
+    const { jobId, payload } = await seedProjectJob(missing);
+
+    const handle = await client.enqueue<ScaffoldProjectResult>(
+      {
+        workflowName: WORKFLOW_NAMES.scaffoldProject,
+        queueName: WORKFLOW_QUEUE.scaffoldProject,
+        workflowID: jobId,
+      },
+      payload,
+    );
+    const outcome = await handle.getResult().then(
+      () => "ok",
+      () => "failed",
+    );
+    expect(outcome).toBe("failed");
+
+    const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("failed");
+    expect(job.completedAt).not.toBeNull();
+    expect(job.error ?? "").not.toBe("");
+    const stages = job.stages as Array<{ key: string; state: string }>;
+    expect(stages.find((s) => s.key === "ensureRepoAccessible")?.state).toBe("failed");
+    // The stage log is upserted IN PLACE — a later stage is untouched, never appended.
+    expect(stages.find((s) => s.key === "pushOpenMergeBasePr")?.state).toBe("pending");
+  }, 90_000);
+
+  // Review finding DR4 — the same defect, in the failure that is far MORE likely than a
+  // 422 or an unreachable repo. Row 63's catch recorded a failure only when
+  // `isPermanentScaffoldFailure(err)` was true, and that predicate knows exactly three
+  // types — none of them db-lib's `GithubAppError`, which is what step 1 throws. Step 1
+  // also deliberately carries no `shouldRetry` (D64.5), so a 404 burns the whole
+  // 4-attempt `NETWORK_RETRY` budget and then throws, and the workflow rethrew having
+  // written NOTHING: eternal wizard spinner, inside the fix meant to kill it. This case
+  // is the cheapest possible proof — it fails at step 1, so it touches no repo at all.
+  it("flips ProjectJob.status to failed when the installation token mint fails (GithubAppError)", async () => {
+    const github = await resolveGithubE2eContext();
+    const unused: FixtureRepo = {
+      owner: github.owner,
+      repo: `never-touched-${randomUUID().slice(0, 8)}`,
+      fullName: `${github.owner}/never-touched`,
+      cloneUrl: "https://github.com/invalid/invalid.git",
+    };
+    const { jobId, payload } = await seedProjectJob(unused);
+
+    const handle = await client.enqueue<ScaffoldProjectResult>(
+      {
+        workflowName: WORKFLOW_NAMES.scaffoldProject,
+        queueName: WORKFLOW_QUEUE.scaffoldProject,
+        workflowID: jobId,
+      },
+      // A real, well-formed App JWT against an installation this App does not own ⇒ real
+      // GitHub answers `POST /app/installations/999999999/access_tokens` with 404 and
+      // db-lib's `mintInstallationToken` throws `GithubAppError`. 404 is NOT retryable in
+      // db-lib's client either, so this costs exactly one request per DBOS attempt.
+      { ...payload, installationId: "999999999" },
+    );
+    const outcome = await handle.getResult().then(
+      () => "ok",
+      () => "failed",
+    );
+    expect(outcome).toBe("failed");
+
+    const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("failed");
+    expect(job.completedAt).not.toBeNull();
+    expect(job.error ?? "").not.toBe("");
+    const stages = job.stages as Array<{ key: string; state: string }>;
+    expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("failed");
+    expect(stages.find((s) => s.key === "ensureRepoAccessible")?.state).toBe("pending");
   }, 90_000);
 });
 

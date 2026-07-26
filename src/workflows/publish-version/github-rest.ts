@@ -1,3 +1,4 @@
+import { withGithubRetry } from "@supagloo/database-lib";
 import { GithubRestError } from "../scaffold-project/github-rest";
 
 /**
@@ -11,6 +12,10 @@ import { GithubRestError } from "../scaffold-project/github-rest";
  * `mergePullRequestAndTag` step never fails on its own prior tag. The `GithubRestError`
  * (carrying the HTTP status) is imported from the scaffold module so the shared
  * permanent-vs-transient classifier (`retryUnlessPermanent`) applies unchanged.
+ *
+ * Plan row 64 extends that sharing to the BACKOFF: the request goes through db-lib's
+ * `withGithubRetry`, the same bounded, capped, `Retry-After`-honouring primitive the
+ * scaffold client uses (§11.7 "one implementation, four consumers").
  */
 
 export interface GithubRestConfig {
@@ -18,6 +23,9 @@ export interface GithubRestConfig {
   /** A minted installation token (`ghs_…`). */
   token: string;
   fetchImpl?: typeof fetch;
+  /** Injectable sleep for the bounded rate-limit backoff (plan row 64); a real timer
+   *  in production, a recording spy in the unit lane so nothing ever waits. */
+  sleepImpl?: (ms: number) => Promise<void>;
 }
 
 const trimSlash = (u: string) => u.replace(/\/+$/, "");
@@ -45,13 +53,19 @@ export async function createTag(
 ): Promise<CreatedTag> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const ref = `refs/tags/v${args.semver}`;
-  const res = await fetchImpl(
-    `${trimSlash(cfg.apiBaseUrl)}/repos/${args.owner}/${args.repo}/git/refs`,
-    {
-      method: "POST",
-      headers: { ...authHeaders(cfg.token), "content-type": "application/json" },
-      body: JSON.stringify({ ref, sha: args.sha }),
-    },
+  // Plan row 64. `withGithubRetry` RETURNS the final `Response` and never throws, which
+  // is what makes it safe to wrap a function whose 422 is a SUCCESS: 422 is never
+  // retryable, so the already-exists branch below still runs on attempt 1, and 201
+  // short-circuits the loop before any sleep. The wrapper only ever changes what happens
+  // to a throttled or 5xx response.
+  const res = await withGithubRetry(
+    () =>
+      fetchImpl(`${trimSlash(cfg.apiBaseUrl)}/repos/${args.owner}/${args.repo}/git/refs`, {
+        method: "POST",
+        headers: { ...authHeaders(cfg.token), "content-type": "application/json" },
+        body: JSON.stringify({ ref, sha: args.sha }),
+      }),
+    { sleepImpl: cfg.sleepImpl },
   );
 
   if (res.status === 201) {

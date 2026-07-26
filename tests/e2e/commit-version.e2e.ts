@@ -37,7 +37,9 @@ import { countStepExecutions } from "../../src/testing/step-introspection";
 //
 // Task 62 (design-delta §11) deleted the github-stub (:4801) + git-server (:4805). Each
 // test provisions its own per-run PRIVATE repo
-// (the shared e2e prefix + `commit-<case>` + the run id, `auto_init: true`) and is never torn
+// (the shared e2e prefix + `commit-<case>` + the run id, `auto_init: true` — the harness
+// DEFAULT, which every lane but `scaffold-project.e2e.ts`'s row-63 commit-less case uses)
+// and is never torn
 // down in-suite — reclaim with root's interactive `npm run cleanup:github-e2e`, which
 // archives rather than deletes.
 //

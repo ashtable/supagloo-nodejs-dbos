@@ -58,7 +58,8 @@ import {
  *
  * Task 62 (design-delta §11): the github-stub (:4801) and the local git smart-HTTP
  * server (:4805) are DELETED. Each spec provisions its own per-run throwaway repo
- * (the shared e2e prefix + `render-<label>` + the run id, private, `auto_init`) on the real
+ * (the shared e2e prefix + `render-<label>` + the run id, private, `auto_init` — the harness
+ * DEFAULT, which every lane but `scaffold-project.e2e.ts`'s row-63 commit-less case uses) on the real
  * account and pushes its fixture branch there. That makes this the spec where the render
  * lane's **real network clone from github.com** is proven — retiring the
  * stale-git-server-fixture trap (tech-lead memory `render-workflow-gotchas`) by deletion

@@ -175,8 +175,16 @@ export interface RootGithubApiModule {
     runId: string;
     /** Stamped into the repo DESCRIPTION by the harness, not into its name. */
     spec?: string;
+    /** Defaults to `true` in the root harness — see {@link ProvisionFixtureRepoOptions}. */
+    autoInit?: boolean;
   }): Promise<CreatedFixtureRepo>;
-  waitForRepoReady(args: { pat: string; owner: string; repo: string }): Promise<unknown>;
+  waitForRepoReady(args: {
+    pat: string;
+    owner: string;
+    repo: string;
+    /** Defaults to `true` in the root harness; `false` waits on the repo record only. */
+    requireBranch?: boolean;
+  }): Promise<unknown>;
   waitForInstallationVisibility(args: {
     token: string;
     fullName: string;
@@ -480,13 +488,17 @@ export interface FixtureRepo {
  * usable, in this exact order (D6):
  *
  *   1. `POST /user/repos` with the **PAT** — `{ private: true, auto_init: true }`.
- *      `auto_init` is LOAD-BEARING, not cosmetic: `scaffold-project.ts` opens its base
- *      PR with `base: "main"`, and a commit-less repo has no `main`, so real GitHub
- *      422s. This is exactly what the retired git-server fixture's
- *      `{seed:true, defaultBranch:"main"}` did. Anyone "simplifying" it to
+ *      `auto_init` is the LOAD-BEARING DEFAULT, not cosmetic: `scaffold-project.ts`
+ *      opens its base PR with `base: "main"`, and a commit-less repo has no `main`.
+ *      This is exactly what the retired git-server fixture's
+ *      `{seed:true, defaultBranch:"main"}` did. Anyone flipping the DEFAULT to
  *      `auto_init:false` breaks scaffold, commit, publish and render at once.
+ *      `{ autoInit: false }` is an explicit, additive opt-out (plan row 63) used by ONE
+ *      spec — `tests/e2e/scaffold-project.e2e.ts`'s commit-less case, which proves the
+ *      workflow's own unborn-base-ref bootstrap. See {@link ProvisionFixtureRepoOptions}.
  *   2. `waitForRepoReady` — a just-created repo can 404 briefly on first contents read
- *      or clone.
+ *      or clone. Under `{ autoInit: false }` the branch half of that gate is skipped,
+ *      because a commit-less repo has no branch for it to observe.
  *   3. `waitForInstallationVisibility` — under `repository_selection: all` a new repo is
  *      visible to the installation but not instantly, and
  *      `scaffold-project/github-rest.ts`'s `ensureRepoReachable` classifies absence as a
@@ -500,12 +512,24 @@ export interface FixtureRepo {
  *
  * There is no teardown counterpart, by design — see the file header.
  */
+export interface ProvisionFixtureRepoOptions {
+  /**
+   * `false` ⇒ create the repo with NO initial commit (plan row 63). The repo then has
+   * zero commits and no `main`, which is the shape wireframe 13a's "Empty · created just
+   * now" existing repo has. Defaults to `true`, which every other lane depends on.
+   * Passing `false` also skips the branch half of the readiness gate.
+   */
+  autoInit?: boolean;
+}
+
 export async function provisionFixtureRepo(
   slug: string,
   deps: GithubE2eDeps = {},
+  opts: ProvisionFixtureRepoOptions = {},
 ): Promise<FixtureRepo> {
   const ctx = await resolveGithubE2eContext(deps);
   const { naming, api } = ctx.harness;
+  const autoInit = opts.autoInit !== false;
 
   const created = await api.createFixtureRepo({
     pat: ctx.pat,
@@ -515,6 +539,7 @@ export async function provisionFixtureRepo(
     // `buildE2eRepoDescription`), so the reviewer running the cleanup script can see which
     // lane created it. It is not part of the repo NAME — that is prefix + slug + runId.
     spec: `dbos ${slug}`,
+    autoInit,
   });
 
   // GitHub's raw repo JSON: `owner` is `{login}`, the name is `name`, and `full_name` is
@@ -549,7 +574,7 @@ export async function provisionFixtureRepo(
     );
   }
 
-  await api.waitForRepoReady({ pat: ctx.pat, owner, repo });
+  await api.waitForRepoReady({ pat: ctx.pat, owner, repo, requireBranch: autoInit });
   await api.waitForInstallationVisibility({ token: ctx.token, fullName });
 
   return { owner, repo, fullName, cloneUrl: publicRemoteUrl({ owner, repo }) };

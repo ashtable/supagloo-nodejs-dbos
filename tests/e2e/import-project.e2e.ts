@@ -32,7 +32,9 @@ import { countStepExecutions } from "../../src/testing/step-introspection";
 //
 // Task 62 (design-delta §11) deleted the github-stub (:4801) + git-server (:4805). Each
 // test provisions its own per-run PRIVATE repo
-// (the shared e2e prefix + `import-<case>` + the run id, `auto_init: true`), never torn down
+// (the shared e2e prefix + `import-<case>` + the run id, `auto_init: true` — the harness
+// DEFAULT, which every lane but `scaffold-project.e2e.ts`'s row-63 commit-less case uses),
+// never torn down
 // in-suite — reclaim with root's interactive `npm run cleanup:github-e2e`, which archives
 // rather than deletes. A fresh fixture repo carries only GitHub's `auto_init` README (which
 // is exactly what the "not a Supagloo project" case needs), so the VALID fixture
