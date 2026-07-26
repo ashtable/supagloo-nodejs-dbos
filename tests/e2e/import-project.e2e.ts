@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +16,7 @@ import {
 } from "../../src/workflows/import-project";
 import {
   authenticatedRemoteUrl,
+  gitFixtureExec,
   provisionFixtureRepo,
   resolveGithubE2eContext,
   resolveGithubE2eSecrets,
@@ -110,12 +110,14 @@ function authRemote(fullName: string): string {
  *  plus three `vN.N.N` branches (so version resolution is exercised). */
 function seedSupaglooRepo(fullName: string, branches: string[]): void {
   const work = mkdtempSync(join(tmpdir(), "import-fixture-"));
-  const g = (args: string[]) =>
-    execFileSync("git", args, { cwd: work, env: { ...process.env, ...HERMETIC_GIT } });
+  // ALWAYS through the redacting seam: `authRemote()` embeds a live installation token in
+  // an argv element, and `execFileSync` synthesises its rejection message from argv
+  // (`Command failed: git clone <url>`), so a raw call prints the credential into the
+  // vitest failure report. `gitFixtureExec` scrubs URL userinfo out of the message,
+  // stdout and stderr, and supplies the hermetic git env itself.
+  const g = (args: string[]) => gitFixtureExec(args, { cwd: work, env: HERMETIC_GIT });
   try {
-    execFileSync("git", ["clone", authRemote(fullName), work], {
-      env: { ...process.env, ...HERMETIC_GIT },
-    });
+    gitFixtureExec(["clone", authRemote(fullName), work], { env: HERMETIC_GIT });
     writeFileSync(
       join(work, "remotion.config.ts"),
       "// Supagloo-generated Remotion config — DO NOT EDIT.\n",

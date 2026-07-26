@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +17,7 @@ import {
 import { emptyManifest } from "../../src/remotion/__fixtures__/manifests";
 import {
   authenticatedRemoteUrl,
+  gitFixtureExec,
   githubReaders,
   provisionFixtureRepo,
   resolveGithubE2eContext,
@@ -91,20 +91,19 @@ let client: DBOSClient;
  * Head refs on the origin, via a real `git ls-remote` against **github.com**.
  *
  * The fixture repos are private, so this needs the installation token in the remote URL
- * (the retired git-server needed no credential). `stdio: "pipe"` keeps the URL — which
- * contains a live token — out of the test output on failure; the thrown error's message
- * is a git message, not the URL.
+ * (the retired git-server needed no credential). It therefore goes through
+ * `gitFixtureExec`, which redacts URL userinfo out of the thrown message AND out of the
+ * captured stdout/stderr. That is not optional tidiness: `execFileSync` synthesises its
+ * rejection message from **argv** (`Command failed: git ls-remote --heads <url>`), so a
+ * raw call would print a live installation token into the vitest failure report. `stdio`
+ * alone does nothing about it — the string never came from the child's streams.
  */
 function remoteHeads(fixture: FixtureRepo, token: string): string[] {
-  const out = execFileSync(
-    "git",
-    [
-      "ls-remote",
-      "--heads",
-      authenticatedRemoteUrl({ token, owner: fixture.owner, repo: fixture.repo }),
-    ],
-    { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, stdio: ["ignore", "pipe", "pipe"] },
-  ).toString();
+  const out = gitFixtureExec([
+    "ls-remote",
+    "--heads",
+    authenticatedRemoteUrl({ token, owner: fixture.owner, repo: fixture.repo }),
+  ]);
   return out
     .split("\n")
     .filter(Boolean)

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,6 +7,7 @@ import {
   signAppJwt,
   type PrismaClient,
 } from "@supagloo/database-lib";
+import { redactUrlCredentials } from "../workflows/scaffold-project/git";
 
 /**
  * The dbos adapter onto task 62's shared real-GitHub e2e harness (plan D3/D4/D5/D6).
@@ -637,7 +639,8 @@ export function publicRemoteUrl(args: {
  *
  * Keep it out of anything that could be logged: `scaffold-project/git.ts`'s
  * `redactUrlCredentials()` protects the product's own git failures, but a spec that
- * prints this string leaks a live token into CI output.
+ * prints this string leaks a live token into CI output. **Never hand this URL to a raw
+ * `execFileSync` — use {@link gitFixtureExec}, which is the enforced redaction seam.**
  */
 export function authenticatedRemoteUrl(args: {
   token: string;
@@ -649,6 +652,100 @@ export function authenticatedRemoteUrl(args: {
   url.username = "x-access-token";
   url.password = args.token;
   return url.toString();
+}
+
+// ---------------------------------------------------------------------------
+// The redacting fixture-git exec seam
+// ---------------------------------------------------------------------------
+
+/** Injection seam so the unit lane can drive the failure path without a real `git`. */
+export type FixtureExecSync = (
+  file: string,
+  args: string[],
+  options: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    stdio: ["ignore", "pipe", "pipe"];
+  },
+) => Buffer | string;
+
+export interface GitFixtureExecOptions {
+  cwd?: string;
+  /** Extra env merged OVER `process.env` (the hermetic defaults below still apply). */
+  env?: NodeJS.ProcessEnv;
+  execSync?: FixtureExecSync;
+}
+
+/**
+ * Hermetic git defaults for fixture invocations: never prompt, and never let the host's
+ * user/system git config perturb behaviour. Mirrors `scaffold-project/git.ts`'s
+ * `HERMETIC_ENV`, which the product uses for exactly the same reason.
+ */
+const FIXTURE_GIT_ENV = {
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+} as const;
+
+const defaultExecSync: FixtureExecSync = (file, args, options) =>
+  execFileSync(file, args, options);
+
+/**
+ * Run `git` for a FIXTURE operation and redact URL credentials out of anything it can
+ * throw. **Every spec-side `git` call that touches an {@link authenticatedRemoteUrl} must
+ * go through here.**
+ *
+ * ## Why this exists (the bug it fixes)
+ *
+ * `execFileSync` builds its rejection message as `Command failed: <file> <argv joined by
+ * space>` followed by stderr — synthesised from **argv**, not from the child's streams. So
+ * passing `https://x-access-token:<installation token>@github.com/...` as an argv element
+ * puts a LIVE GitHub credential into `err.message`, which vitest then prints verbatim in
+ * the failure report. `stdio: "pipe"` does not help: it only stops git's own streams being
+ * inherited, and this string never came from those streams. Before task 62 the fixture
+ * remotes were unauthenticated git-server URLs, so the exposure did not exist; the moment
+ * the specs moved to real, private fixture repos it did.
+ *
+ * The credential is an installation token with `contents:write` + `pull_requests:write` on
+ * an account holding the user's REAL repos, and failure output is precisely the thing that
+ * gets pasted into issues, CI logs and agent transcripts — a materially wider blast radius
+ * than the `.env` the token is loaded from.
+ *
+ * Redaction reuses the PRODUCT's `redactUrlCredentials()` (`scaffold-project/git.ts`), so
+ * the harness and the product cannot drift on what "redacted" means, and `stdout`/`stderr`
+ * are scrubbed alongside the message because vitest prints those too.
+ *
+ * ## Residual exposure, stated rather than implied
+ *
+ * The token is still in the child's **argv** while it runs, so a local process can read it
+ * via `ps`, and `git clone` records the remote (credential included) in the clone's
+ * `.git/config` under the OS temp dir. Closing those needs the credential moved out of the
+ * URL entirely (e.g. `git -c http.extraheader=...`); this wrapper closes the LOG leak,
+ * which is the one with an external blast radius. See plan row 62 / design-delta §11.8.
+ */
+export function gitFixtureExec(
+  args: string[],
+  opts: GitFixtureExecOptions = {},
+): string {
+  const execSync = opts.execSync ?? defaultExecSync;
+  try {
+    const out = execSync("git", args, {
+      cwd: opts.cwd,
+      env: { ...process.env, ...FIXTURE_GIT_ENV, ...opts.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return out.toString();
+  } catch (err) {
+    const e = err as { message?: unknown; stderr?: unknown; stdout?: unknown };
+    const parts = [
+      redactUrlCredentials(String(e.message ?? err)),
+      redactUrlCredentials(String(e.stdout ?? "")).trim(),
+      redactUrlCredentials(String(e.stderr ?? "")).trim(),
+    ].filter(Boolean);
+    // A fresh Error: mutating the original would leave the un-redacted `stderr`/`stdout`
+    // properties on it, which vitest's diff/serializer would still reach.
+    throw new Error(parts.join("\n"));
+  }
 }
 
 // ---------------------------------------------------------------------------

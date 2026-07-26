@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +18,7 @@ import { writeRemotionScaffold } from "../../src/remotion";
 import { emptyManifest } from "../../src/remotion/__fixtures__/manifests";
 import {
   authenticatedRemoteUrl,
+  gitFixtureExec,
   githubReaders,
   provisionFixtureRepo,
   resolveGithubE2eContext,
@@ -104,11 +104,15 @@ function authRemote(fullName: string): string {
   return authenticatedRemoteUrl({ token: installationToken, owner, repo });
 }
 
+/**
+ * Fixture `git`, ALWAYS through the redacting seam. `authRemote()` embeds a live
+ * installation token in an argv element, and `execFileSync` synthesises its rejection
+ * message from argv (`Command failed: git clone <url>`) — so a raw call prints the
+ * credential into the vitest failure report. `gitFixtureExec` scrubs URL userinfo out of
+ * the message, stdout and stderr, and supplies the hermetic git env itself.
+ */
 function gitFixture(args: string[], cwd?: string): string {
-  return execFileSync("git", args, {
-    cwd,
-    env: { ...process.env, ...HERMETIC_GIT },
-  }).toString();
+  return gitFixtureExec(args, { cwd, env: HERMETIC_GIT });
 }
 
 /**
@@ -156,11 +160,12 @@ async function seedWorkingBranch(fullName: string): Promise<void> {
 
 /** The origin's head SHA for `branch` (via ls-remote), or "" if the ref is absent. */
 function branchHead(fullName: string, branch: string): string {
-  const out = execFileSync(
-    "git",
-    ["ls-remote", "--heads", authRemote(fullName), `refs/heads/${branch}`],
-    { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
-  ).toString();
+  const out = gitFixture([
+    "ls-remote",
+    "--heads",
+    authRemote(fullName),
+    `refs/heads/${branch}`,
+  ]);
   return out.split(/\s+/)[0] ?? "";
 }
 

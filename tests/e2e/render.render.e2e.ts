@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +31,7 @@ import {
 import { resolveAudioModel } from "../../src/testing/e2e-models";
 import {
   authenticatedRemoteUrl,
+  gitFixtureExec,
   provisionFixtureRepo,
   resolveGithubE2eSecrets,
   seedGithubConnection,
@@ -147,18 +147,23 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
+/**
+ * Fixture `git`, ALWAYS through the redacting seam. The clone below authenticates with a
+ * live installation token embedded in an argv element, and `execFileSync` synthesises its
+ * rejection message from argv (`Command failed: git clone <url>`) — so a raw call prints
+ * the credential into the vitest failure report; `stdio: "pipe"` does nothing about it,
+ * because that string never came from the child's streams. `gitFixtureExec` scrubs URL
+ * userinfo out of the message, stdout and stderr, and supplies the hermetic git env.
+ */
 function git(args: string[], cwd?: string): void {
-  execFileSync("git", args, {
+  gitFixtureExec(args, {
     cwd,
     env: {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: "0",
       GIT_AUTHOR_NAME: "Render E2E",
       GIT_AUTHOR_EMAIL: "render@supagloo.test",
       GIT_COMMITTER_NAME: "Render E2E",
       GIT_COMMITTER_EMAIL: "render@supagloo.test",
     },
-    stdio: "pipe",
   });
 }
 

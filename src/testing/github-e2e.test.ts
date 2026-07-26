@@ -11,8 +11,10 @@ import {
   ROOT_DIR_VAR,
   __resetGithubE2eState,
   authenticatedRemoteUrl,
+  gitFixtureExec,
   githubReaders,
   loadRootHarness,
+  type FixtureExecSync,
   makeRealHostEnvOverrides,
   provisionFixtureRepo,
   publicRemoteUrl,
@@ -517,6 +519,107 @@ describe("remote URL builders", () => {
     expect(
       publicRemoteUrl({ owner: "o", repo: "r", gitBaseUrl: "https://github.com/" }),
     ).toBe("https://github.com/o/r.git");
+  });
+});
+
+describe("gitFixtureExec redaction (the failure output is a real trust boundary)", () => {
+  // A token-SHAPED sentinel, never a real credential. If this string ever escapes into a
+  // thrown message, so would a live `ghs_` installation token.
+  const SENTINEL = "ghs_UNITTESTSENTINELVALUE0123456789";
+  const AUTH_URL = `https://x-access-token:${SENTINEL}@github.com/o/r.git`;
+
+  /**
+   * Drives the REAL `execFileSync` failure path, with ZERO network egress:
+   * `protocol.https.allow=never` makes git refuse the transport before it opens a socket,
+   * while still putting the full argv (URL included) into Node's synthesised
+   * "Command failed: …" message. That synthesis — not git's streams — is the leak, which
+   * is why `stdio: "pipe"` alone never fixed it and why this must be pinned against real
+   * `execFileSync` rather than a fake.
+   */
+  it("keeps the credential out of the thrown message on a REAL exec failure", () => {
+    let thrown: unknown;
+    try {
+      gitFixtureExec([
+        "-c",
+        "protocol.https.allow=never",
+        "ls-remote",
+        "--heads",
+        AUTH_URL,
+      ]);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    // The bug: without redaction Node embeds the argv verbatim here.
+    expect(message).not.toContain(SENTINEL);
+    expect(message).toContain("x-access-token:***@github.com/o/r.git");
+    // Still diagnosable — git's own reason survives.
+    expect(message).toContain("not allowed");
+    // And no un-redacted sibling property survives for a serializer to print.
+    expect(JSON.stringify(thrown, Object.getOwnPropertyNames(thrown))).not.toContain(
+      SENTINEL,
+    );
+  });
+
+  it("redacts the credential out of stderr and stdout, not just the message", () => {
+    const execSync: FixtureExecSync = () => {
+      throw Object.assign(new Error("Command failed: git push"), {
+        stdout: `pushing to ${AUTH_URL}`,
+        stderr: `remote: rejected ${AUTH_URL}`,
+      });
+    };
+
+    expect(() => gitFixtureExec(["push"], { execSync })).toThrow(
+      /x-access-token:\*\*\*@github\.com/,
+    );
+    try {
+      gitFixtureExec(["push"], { execSync });
+    } catch (err) {
+      expect((err as Error).message).not.toContain(SENTINEL);
+      expect((err as Error).message).toContain("remote: rejected");
+    }
+  });
+
+  it("returns stdout and applies the hermetic git env on success", () => {
+    const seen: { args?: string[]; env?: NodeJS.ProcessEnv; cwd?: string } = {};
+    const execSync: FixtureExecSync = (_file, args, options) => {
+      seen.args = args;
+      seen.env = options.env;
+      seen.cwd = options.cwd;
+      return Buffer.from("sha\trefs/heads/main\n");
+    };
+
+    expect(gitFixtureExec(["ls-remote"], { cwd: "/tmp/x", execSync })).toBe(
+      "sha\trefs/heads/main\n",
+    );
+    expect(seen.args).toEqual(["ls-remote"]);
+    expect(seen.cwd).toBe("/tmp/x");
+    expect(seen.env?.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(seen.env?.GIT_CONFIG_NOSYSTEM).toBe("1");
+    expect(seen.env?.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+  });
+
+  it("lets a caller add env on top of the hermetic defaults", () => {
+    let env: NodeJS.ProcessEnv | undefined;
+    const execSync: FixtureExecSync = (_file, _args, options) => {
+      env = options.env;
+      return "";
+    };
+    gitFixtureExec(["commit"], { env: { GIT_AUTHOR_NAME: "Render E2E" }, execSync });
+    expect(env?.GIT_AUTHOR_NAME).toBe("Render E2E");
+    expect(env?.GIT_TERMINAL_PROMPT).toBe("0");
+  });
+
+  it("never inherits the child's streams — capture is what makes redaction possible", () => {
+    let stdio: unknown;
+    const execSync: FixtureExecSync = (_file, _args, options) => {
+      stdio = options.stdio;
+      return "";
+    };
+    gitFixtureExec(["status"], { execSync });
+    expect(stdio).toEqual(["ignore", "pipe", "pipe"]);
   });
 });
 
