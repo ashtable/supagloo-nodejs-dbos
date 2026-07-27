@@ -19,6 +19,12 @@ import {
 import { getVideoMetadata } from "@remotion/renderer";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
 import { makeInternalS3Client } from "../../src/files/s3-client";
 import { writeRemotionScaffold } from "../../src/remotion";
@@ -90,13 +96,42 @@ const ENCRYPTION_KEY = "0".repeat(64);
 // against a stub.
 const githubSecrets = resolveGithubE2eSecrets();
 
+// ISOLATION, NOT A PRECONDITION. This spec launches the REAL DBOS runtime in-process and
+// registers the REAL static workflow names on the REAL shared queues — exactly what the
+// root Compose `dbos` container does. Nothing used to distinguish them: `executor_id` is
+// "local" for both (and is a recovery filter, never a dequeue filter), the in-process
+// worker's auto-computed application version MATCHES the container's, and the dequeue
+// predicate accepts `application_version IS NULL`. The cancel case makes this acute — if
+// the container is the executor that picked up the render, the cancel proof is measuring
+// a process this spec does not control.
+//
+// Requiring the container to be stopped is not an option: that precondition is
+// unsatisfiable across a full sweep (root's own e2e lane and nextjs's render lane both
+// bring `dbos` UP and deliberately leave it up). Instead the in-process runtime AND the
+// DBOSClient share a per-lane DBOS system SCHEMA inside the same `supagloo_dbos` database
+// (SDK `systemDatabaseSchemaName`), so the two executors cannot see each other's rows in
+// EITHER direction. The container may be up or down; both pass. Queue and workflow names
+// are unchanged and deliberately still the real ones — static registration is a hard
+// constraint of src/dbos/registry.ts and the real names are what this spec proves.
+
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("dbos_render");
+
+/** The one place this spec resolves the system-DB URL, so the runtime, the client and the
+ *  schema reset can never drift onto different databases. */
+const DBOS_URL =
+  process.env.DBOS_DATABASE_URL ??
+  "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos";
+
 function makeEnv(overrides: Record<string, string | undefined> = {}): Env {
   return loadEnv({
     DATABASE_URL:
       process.env.DATABASE_URL ?? "postgres://supagloo:supagloo@localhost:5432/supagloo",
-    DBOS_DATABASE_URL:
-      process.env.DBOS_DATABASE_URL ??
-      "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
+    DBOS_DATABASE_URL: DBOS_URL,
+    // The lane half of the isolation seam: launchDbos() forwards this to
+    // DBOS.setConfig({ systemDatabaseSchemaName }). Unset in Compose; explicit here.
+    // It is inside makeEnv() on purpose, so the mid-spec RE-launch below keeps isolation.
+    DBOS_SYSTEM_DATABASE_SCHEMA: SYSTEM_SCHEMA,
     NODE_ENV: "test",
     // NO GITHUB_API_BASE_URL / GITHUB_GIT_BASE_URL: `src/config/env.ts` defaults them to
     // https://api.github.com and https://github.com, so real-by-default is achieved by
@@ -356,8 +391,8 @@ async function seedRender(
   };
 }
 
-function enqueueRender(seeded: Seeded) {
-  return client.enqueue<RenderResult>(
+async function enqueueRender(seeded: Seeded) {
+  const handle = await client.enqueue<RenderResult>(
     {
       workflowName: WORKFLOW_NAMES.render,
       queueName: WORKFLOW_QUEUE.render,
@@ -365,6 +400,23 @@ function enqueueRender(seeded: Seeded) {
     },
     seeded.payload,
   );
+  // The CLIENT half of the isolation is real: this enqueue landed in the lane's schema
+  // and is absent from the shared one the Compose worker polls. Folded into the enqueue
+  // this spec ALREADY makes — never a synthetic one, which would cost a real Chromium
+  // encode for no new information.
+  //
+  // Checked here, at the enqueue, and not at the assertions. With the client half
+  // dropped the row lands in the shared schema, the containerised worker performs the
+  // render and writes the SAME MinIO objects and the SAME RenderJob rows, and every
+  // assertion below still passes — the spec would go green having proven the CONTAINER
+  // works rather than this process. For the cancel and crash/replay cases that is worse
+  // than useless: they would be measuring an executor this spec does not control.
+  await assertWorkflowIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+    workflowID: seeded.renderJobId,
+  });
+  return handle;
 }
 
 async function waitForDbosStatus(id: string, statuses: string[]): Promise<void> {
@@ -385,11 +437,19 @@ beforeAll(async () => {
     accessKey: process.env.S3_ACCESS_KEY ?? "supagloo",
     secretKey: process.env.S3_SECRET_KEY ?? "supagloo-dev",
   });
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  // Only here — the mid-spec relaunch must NOT wipe the checkpoints it inherits.
+  await resetLaneSchema({ systemDatabaseUrl: DBOS_URL, schema: SYSTEM_SCHEMA });
   await launchDbos(makeEnv());
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: DBOS_URL,
+    schema: SYSTEM_SCHEMA,
+  });
   client = await DBOSClient.create({
-    systemDatabaseUrl:
-      process.env.DBOS_DATABASE_URL ??
-      "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
+    systemDatabaseUrl: DBOS_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the client half
   });
 }, 600_000);
 
@@ -400,6 +460,16 @@ afterAll(async () => {
   await prisma.$disconnect().catch(() => {});
   s3?.destroy();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+describe("lane isolation", () => {
+  it("E-DB0-render: this lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
 });
 
 describe("renderWorkflow — happy path (real npm install, real bundle, real Chromium encode)", () => {

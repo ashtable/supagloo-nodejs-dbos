@@ -7,6 +7,12 @@ import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import { createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
 import { initialStages } from "../../src/workflows/scaffold-project/stages";
 import {
@@ -67,12 +73,36 @@ import { countStepExecutions } from "../../src/testing/step-introspection";
 // throwaway keypair + `appId: "123456"` could only ever have satisfied a stub.
 const githubSecrets = resolveGithubE2eSecrets();
 
+// ISOLATION, NOT A PRECONDITION. This spec launches the REAL DBOS runtime in-process and
+// registers the REAL static workflow names on the REAL shared queues — exactly what the
+// root Compose `dbos` container does. Nothing used to distinguish them: `executor_id` is
+// "local" for both (and is a recovery filter, never a dequeue filter), the in-process
+// worker's auto-computed application version MATCHES the container's, and the dequeue
+// predicate accepts `application_version IS NULL`. So the container could dequeue this
+// spec's work — and, worse, could be the executor that resumes a workflow the crash/replay
+// specs just killed, leaving the exactly-once proof measuring the wrong process.
+//
+// Requiring the container to be stopped is not an option: that precondition is
+// unsatisfiable across a full sweep (root's own e2e lane and nextjs's render lane both
+// bring `dbos` UP and deliberately leave it up). Instead the in-process runtime AND the
+// DBOSClient share a per-lane DBOS system SCHEMA inside the same `supagloo_dbos` database
+// (SDK `systemDatabaseSchemaName`), so the two executors cannot see each other's rows in
+// EITHER direction. The container may be up or down; both pass. Queue and workflow names
+// are unchanged and deliberately still the real ones — static registration is a hard
+// constraint of src/dbos/registry.ts and the real names are what this spec proves.
+
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("dbos_scaffold");
+
 const env: Env = loadEnv({
   DATABASE_URL:
     process.env.DATABASE_URL ?? "postgres://supagloo:supagloo@localhost:5432/supagloo",
   DBOS_DATABASE_URL:
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
+  // The lane half of the isolation seam: launchDbos() forwards this to
+  // DBOS.setConfig({ systemDatabaseSchemaName }). Unset in Compose; explicit here.
+  DBOS_SYSTEM_DATABASE_SCHEMA: SYSTEM_SCHEMA,
   NODE_ENV: "test",
   // NO GITHUB_API_BASE_URL / GITHUB_GIT_BASE_URL override: `src/config/env.ts` already
   // defaults them to https://api.github.com and https://github.com. Real-by-default is
@@ -185,8 +215,22 @@ async function waitForStatus(jobId: string, statuses: string[]): Promise<void> {
 }
 
 beforeAll(async () => {
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    schema: SYSTEM_SCHEMA,
+  });
   await launchDbos(env);
-  client = await DBOSClient.create({ systemDatabaseUrl: env.DBOS_DATABASE_URL });
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    schema: SYSTEM_SCHEMA,
+  });
+  client = await DBOSClient.create({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the client half
+  });
 }, 120_000);
 
 afterAll(async () => {
@@ -194,6 +238,16 @@ afterAll(async () => {
   await client?.destroy().catch(() => {});
   await shutdownDbos();
   await prisma.$disconnect().catch(() => {});
+});
+
+describe("lane isolation", () => {
+  it("E-DB0-scaffold: this lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
 });
 
 describe("scaffoldProjectWorkflow — happy path", () => {
@@ -211,6 +265,22 @@ describe("scaffoldProjectWorkflow — happy path", () => {
       },
       payload,
     );
+    // The CLIENT half of the isolation is real: this enqueue landed in the lane's
+    // schema and is absent from the shared one the Compose worker polls. Folded into
+    // the FIRST enqueue this spec ALREADY makes — never a synthetic enqueue of a real
+    // workflow, which would do real GitHub/S3/provider work for no new information.
+    //
+    // Asserted BEFORE getResult(), and that ordering is the whole point. With the
+    // client half dropped the row lands in the shared schema, the containerised worker
+    // executes this very workflow and drives the SAME app-DB rows, and every assertion
+    // below still passes — the spec would go green having proven the CONTAINER works
+    // rather than this process. That is the green lie the guard exists to stop, and it
+    // is invisible without a positive check at the enqueue itself.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: jobId,
+    });
     const result = (await handle.getResult()) as ScaffoldProjectResult;
 
     expect(result.workflowId).toBe(jobId);

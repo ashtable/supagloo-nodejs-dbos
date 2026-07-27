@@ -72,6 +72,21 @@ export const envSchema = z.object({
   DATABASE_URL: postgresUrl("DATABASE_URL"),
   // DBOS system database (`supagloo_dbos`) — DBOS checkpoints/queues.
   DBOS_DATABASE_URL: postgresUrl("DBOS_DATABASE_URL"),
+  // OPTIONAL. The SCHEMA inside that database holding DBOS's checkpoints/queues (the
+  // SDK's `systemDatabaseSchemaName`; its default is "dbos"). Name and validation copied
+  // VERBATIM from supagloo-nodejs-api's loader, because the two services MUST agree: a
+  // schema set on one of them only would leave the api enqueueing into a namespace this
+  // worker never polls. Unset in every Compose file — the SDK default is the shipped
+  // configuration. It exists for the designed single-database deployment fallback, and
+  // the e2e lane passes a per-lane value explicitly so the containerised worker and an
+  // in-process runtime cannot race for the same rows.
+  DBOS_SYSTEM_DATABASE_SCHEMA: z
+    .string()
+    .regex(/^[a-z_][a-z0-9_]*$/, {
+      message:
+        "DBOS_SYSTEM_DATABASE_SCHEMA must be a lowercase Postgres identifier (letters, digits, underscore; not starting with a digit)",
+    })
+    .optional(),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
   // Task #17 GitHub App (design-delta §2.3/§7). App-LEVEL secrets — one pair per

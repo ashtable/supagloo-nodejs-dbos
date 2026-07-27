@@ -4,6 +4,12 @@ import { DBOSClient } from "@dbos-inc/dbos-sdk";
 import { createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
+import {
+  assertLaneRuntimeIsolated,
+  assertWorkflowIsolated,
+  laneSystemSchema,
+  resetLaneSchema,
+} from "../../src/testing/dbos-lane-isolation";
 import { WORKFLOW_NAMES, WORKFLOW_QUEUE } from "../../src/dbos/registry";
 import type { NoopProofResult } from "../../src/workflows/noop-proof";
 
@@ -15,6 +21,28 @@ import type { NoopProofResult } from "../../src/workflows/noop-proof";
 // the workflow writes a row to the app db `supagloo` via db-lib's Prisma client.
 // No mocks. Non-UI → no Stagehand.
 
+// ISOLATION, NOT A PRECONDITION. This spec launches the REAL DBOS runtime in-process and
+// registers the REAL static workflow names on the REAL shared queues — exactly what the
+// root Compose `dbos` container does. Nothing used to distinguish them: `executor_id` is
+// "local" for both (and is a recovery filter, never a dequeue filter), the in-process
+// worker's auto-computed application version MATCHES the container's, and the dequeue
+// predicate accepts `application_version IS NULL`. So the container could dequeue this
+// spec's work — which for THIS spec would silently invalidate the exactly-once proof it
+// exists to make: a second executor writing the same app-DB row is precisely what the
+// `count(*) === 1` assertions rule out.
+//
+// Requiring the container to be stopped is not an option: that precondition is
+// unsatisfiable across a full sweep (root's own e2e lane and nextjs's render lane both
+// bring `dbos` UP and deliberately leave it up). Instead the in-process runtime AND the
+// DBOSClient share a per-lane DBOS system SCHEMA inside the same `supagloo_dbos` database
+// (SDK `systemDatabaseSchemaName`), so the two executors cannot see each other's rows in
+// EITHER direction. The container may be up or down; both pass. Queue and workflow names
+// are unchanged and deliberately still the real ones — static registration is a hard
+// constraint of src/dbos/registry.ts and the real names are what this spec proves.
+
+/** This lane's private DBOS system schema inside `supagloo_dbos` (see the header note). */
+const SYSTEM_SCHEMA = laneSystemSchema("dbos_noop");
+
 const env: Env = loadEnv({
   DATABASE_URL:
     process.env.DATABASE_URL ??
@@ -22,6 +50,9 @@ const env: Env = loadEnv({
   DBOS_DATABASE_URL:
     process.env.DBOS_DATABASE_URL ??
     "postgres://supagloo:supagloo@localhost:5432/supagloo_dbos",
+  // The lane half of the isolation seam: launchDbos() forwards this to
+  // DBOS.setConfig({ systemDatabaseSchemaName }). Unset in Compose; explicit here.
+  DBOS_SYSTEM_DATABASE_SCHEMA: SYSTEM_SCHEMA,
   NODE_ENV: "test",
   // launchDbos() now injects the git-ops GitHub config from env (Task #17), so these
   // are required to boot even though the noop workflow never touches GitHub.
@@ -64,9 +95,21 @@ async function enqueueNoop(
 }
 
 beforeAll(async () => {
+  // Self-heal a crashed previous run BEFORE launch, so no stale PENDING row is adopted
+  // by DBOS's recovery sweep (same executor_id "local", same auto-computed app version).
+  await resetLaneSchema({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    schema: SYSTEM_SCHEMA,
+  });
   await launchDbos(env);
+  // Fail FAST and LOUD if the config did not take. Never a warn, never a skip.
+  await assertLaneRuntimeIsolated({
+    systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    schema: SYSTEM_SCHEMA,
+  });
   client = await DBOSClient.create({
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    systemDatabaseSchemaName: SYSTEM_SCHEMA, // ← the client half
   });
 }, 120_000);
 
@@ -74,6 +117,16 @@ afterAll(async () => {
   await client?.destroy().catch(() => {});
   await shutdownDbos();
   await prisma.$disconnect().catch(() => {});
+});
+
+describe("lane isolation", () => {
+  it("E-DB0-noop: this lane runs on its own DBOS system schema, so the Compose worker cannot see its work", async () => {
+    expect(SYSTEM_SCHEMA).not.toBe("dbos");
+    await assertLaneRuntimeIsolated({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+    });
+  });
 });
 
 describe("noop proof workflow (enqueue → execute → app-DB write)", () => {
@@ -86,6 +139,17 @@ describe("noop proof workflow (enqueue → execute → app-DB write)", () => {
     expect(result.workflowId).toBe(workflowId);
     expect(result.recordedNote).toBe(note);
     expect(await countRows(workflowId)).toBe(1);
+
+    // …and the CLIENT half of the isolation is real: the checkpoint landed in this lane's
+    // schema and is absent from the shared one the Compose worker polls. This is the only
+    // dbos lane that gets this assertion — the other nine would need a synthetic enqueue
+    // of a REAL workflow (scaffold, render, a provider call) to make it, which would do
+    // real GitHub/S3/provider work for no new information.
+    await assertWorkflowIsolated({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: workflowId,
+    });
 
     // Re-enqueue with the SAME workflowID = the idempotency key. DBOS must NOT
     // re-execute: the plain INSERT means a second execution would have produced a
