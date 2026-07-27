@@ -240,9 +240,12 @@ async function scaffoldProjectFn(
       { name: "writeRemotionScaffold" },
     );
 
-    // 5) commitBaseVersion — deterministic v0.0.0 commit.
+    // 5) commitBaseVersion — deterministic v0.0.0 commit. Its sha is CHECKPOINTED (that is
+    //    what makes the deterministic-commit property observable and what a replay compares
+    //    against) but no longer READ by a later step: plan row 50 item (1) removed the
+    //    `?? baseSha` merge-sha fallback it used to feed.
     await at("commitBaseVersion");
-    const baseSha = await DBOS.runStep(
+    await DBOS.runStep(
       async () => {
         const { baseSha } = await materializeBaseVersion(ctx);
         await markStageDone(prisma, jobId, "commitBaseVersion");
@@ -279,9 +282,14 @@ async function scaffoldProjectFn(
         return {
           number: opened.number,
           url: opened.url,
-          // The merge sha (base version's recorded head); falls back to the local
-          // base sha on the idempotent 405-already-merged replay path.
-          mergeSha: merged.sha ?? baseSha,
+          // The merge sha — the base version's PERMANENTLY recorded head. Plan row 50
+          // item (1) deleted the `?? baseSha` fallback that used to stand in for it on the
+          // idempotent 405-already-merged replay path: `baseSha` is the LOCAL pre-merge
+          // commit, and the squash merge produces a different one, so the fallback wrote a
+          // commit that is not on `main` into `ProjectVersion.headCommitSha`.
+          // `mergePullRequest` now re-reads the true sha itself (D50.1) and throws rather
+          // than guess (D50.2).
+          mergeSha: merged.sha,
         };
       },
       // Push (git) + PR open/merge (REST): fail fast on a permanent git auth failure

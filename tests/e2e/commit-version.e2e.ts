@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import { createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -112,7 +113,7 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: githubSecrets.appId,
   GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
-  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
   S3_BUCKET: "supagloo-dev",

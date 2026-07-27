@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { shelterManifest } from "../remotion/__fixtures__/manifests";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 /**
  * Task #36 — STEP ORDERING (plan row 36's headline unit test).
@@ -76,7 +77,7 @@ vi.mock("../db/app-db", () => ({ getAppDb: () => fakePrisma }));
 vi.mock("../providers/config", () => ({
   getProviderConfig: () => ({
     openrouterBaseUrl: "https://openrouter.invalid",
-    secretsEncryptionKey: "0".repeat(64),
+    secretsEncryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
   }),
 }));
 vi.mock("../providers/credentials", () => ({

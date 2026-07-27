@@ -1,6 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { callLlmStructured } from "../../src/providers/generate-object";
 import { mintGlooToken } from "../../src/providers/gloo";
 import {
@@ -59,7 +60,7 @@ const env: Env = loadEnv({
   OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
   GLOO_BASE_URL: process.env.GLOO_BASE_URL,
   YOUVERSION_BASE_URL: process.env.YOUVERSION_BASE_URL,
-  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // S3 (writer) vars are required at boot (unused by this providers e2e).
   S3_ENDPOINT: "http://minio:9000",
   S3_BUCKET: "supagloo-dev",

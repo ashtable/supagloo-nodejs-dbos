@@ -3,6 +3,7 @@ import {
   CHILD_ENV_ALLOWLIST,
   buildScrubbedChildEnv,
 } from "./child-env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../testing/secrets-fixture";
 
 /**
  * Task #36 — the untrusted-code isolation crux (design-delta §7 workflow 9).
@@ -24,7 +25,7 @@ import {
  */
 
 const SECRET_VALUES = {
-  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\nMIIEv\n-----END PRIVATE KEY-----",
   GITHUB_APP_ID: "123456",
   DATABASE_URL: "postgres://supagloo:supagloo@postgres:5432/supagloo",

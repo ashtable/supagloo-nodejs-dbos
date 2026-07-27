@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DBOS, DBOSClient } from "@dbos-inc/dbos-sdk";
 import { createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -49,13 +50,22 @@ import { countStepExecutions } from "../../src/testing/step-introspection";
 // with the host git CLI + task-16 writeRemotionScaffold. Publish then merges v0.0.1 → main,
 // tags v0.0.1, and cuts v0.0.2.
 //
-// Two proofs: (1) happy path — the PR is opened/merged, the release tag + next branch (v0.0.2)
-// exist, and the ProjectVersion states flip (working 0.0.1 → published, new working 0.0.2);
-// (2) crash/replay MID-MERGE — cancel at the mergePullRequestAndTag boundary (after
+// Three proofs: (1) happy path — the PR is opened/merged, the release tag + next branch
+// (v0.0.2) exist, and the ProjectVersion states flip (working 0.0.1 → published, new working
+// 0.0.2); (2) crash/replay MID-MERGE — cancel at the mergePullRequestAndTag boundary (after
 // openPullRequest checkpointed), delete the workspace (fresh worker), resume → completes with
-// NO duplicate PR. Both proofs assert on TWO axes (D9): DBOS step counts for durability and
-// real-github.com reads (`listPulls` with `state: "all"`, `listTagRefs`) for
+// NO duplicate PR; (3) plan row 50 item (2) — a real PERMANENT failure (publishing a branch
+// with no diff) reconciles `ProjectJob.status` to `failed` instead of leaving the poller on
+// `running` forever. Proofs 1 and 2 assert on TWO axes (D9): DBOS step counts for durability
+// and real-github.com reads (`listPulls` with `state: "all"`, `listTagRefs`) for
 // non-duplication — replacing the stub's single conflated `/__stub/calls` counter.
+//
+// Proof 1 additionally carries plan row 50 item (1): the TRUE merge-commit sha. It forks the
+// completed workflow at `mergePullRequestAndTag` (`DBOS.forkWorkflow`) to force the
+// already-merged 405 replay path — unreachable by crash/resume, because a checkpointed step
+// returns its memo and never calls GitHub — and asserts the release tag's TARGET sha and the
+// persisted `ProjectVersion.headCommitSha` are the real merge commit, not the pre-merge
+// working-branch tip the deleted `merged.sha ?? workingHead` fallback used to substitute.
 
 const BRANCH = "v0.0.1";
 const SEMVER = "0.0.1";
@@ -112,7 +122,7 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: githubSecrets.appId,
   GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
-  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
   S3_BUCKET: "supagloo-dev",
@@ -188,6 +198,46 @@ async function seedWorkingBranch(fullName: string): Promise<void> {
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * A working branch that is IDENTICAL to `main` — the "publish with no diff" case. Real
+ * GitHub rejects the release PR with `422 "No commits between main and v0.0.1"`, which is
+ * the permanent, non-swallowed failure plan row 50 item (2)'s e2e needs.
+ */
+async function seedNoDiffWorkingBranch(fullName: string): Promise<void> {
+  const work = mkdtempSync(join(tmpdir(), "publish-nodiff-"));
+  try {
+    gitFixture(["clone", authRemote(fullName), work]);
+    await writeRemotionScaffold(emptyManifest, work);
+    gitFixture(["add", "-A"], work);
+    gitFixture(["commit", "-m", "supagloo scaffold"], work);
+    gitFixture(["push", "origin", "main"], work);
+    // Cut the working branch and push it WITHOUT a commit of its own.
+    gitFixture(["checkout", "-b", BRANCH], work);
+    gitFixture(["push", "origin", BRANCH], work);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The COMMIT a tag ref points at — the third property (beyond "a tag exists" and "exactly
+ * one tag") that plan row 50 item (1) is about. `refs/tags/*` from
+ * `GET /repos/{o}/{r}/git/refs/tags` carries `object.sha`; `createTag` writes a lightweight
+ * ref, so that sha IS the commit.
+ */
+function tagTargetSha(
+  refs: Array<Record<string, unknown> | string>,
+  ref: string,
+): string | undefined {
+  for (const entry of refs) {
+    if (typeof entry === "string") continue;
+    if (String(entry.ref) !== ref) continue;
+    const object = entry.object as { sha?: unknown } | undefined;
+    return typeof object?.sha === "string" ? object.sha : undefined;
+  }
+  return undefined;
 }
 
 /** The origin's head SHA for `branch` (via ls-remote), or "" if the ref is absent. */
@@ -327,6 +377,11 @@ describe("publishVersionWorkflow — happy path", () => {
     const readers = await githubReaders();
     const fixture = await provisionFixtureRepo("publish-happy");
     await seedWorkingBranch(fixture.fullName);
+    // Plan row 50 item (1): the PRE-merge working-branch tip — the exact value the deleted
+    // `merged.sha ?? workingHead` fallback used to substitute for the merge commit. Read
+    // BEFORE the publish runs, because publish is what merges it away.
+    const preMergeHead = branchHead(fixture.fullName, BRANCH);
+    expect(preMergeHead).toMatch(/^[0-9a-f]{40}$/);
     const { projectId, jobId, payload } = await seedPublishProjectJob(fixture);
 
     const handle = await client.enqueue<PublishVersionResult>(
@@ -416,7 +471,120 @@ describe("publishVersionWorkflow — happy path", () => {
     const stages = job.stages as Array<{ state: string }>;
     expect(stages).toHaveLength(7);
     expect(stages.every((s) => s.state === "done")).toBe(true);
-  }, 120_000);
+
+    // ---------------------------------------------------------------------------
+    // Plan row 50 item (1) — the TRUE merge-commit sha, on the replay path.
+    //
+    // The pre-existing non-duplication assertions above CANNOT see this bug: a release tag
+    // pointing at the WRONG commit is still exactly one tag (current-design §5.4 item 1
+    // asserts the count). So the new properties are the tag's TARGET sha and the persisted
+    // `headCommitSha`.
+    // ---------------------------------------------------------------------------
+    const trueMergeSha = String(pulls[0].merge_commit_sha);
+    expect(trueMergeSha).toMatch(/^[0-9a-f]{40}$/);
+    // A squash merge creates a NEW commit, so the value the old fallback would have used is
+    // demonstrably not the merge commit. This is the whole bug in one line.
+    expect(trueMergeSha).not.toBe(preMergeHead);
+    expect(result.published.headCommitSha).toBe(trueMergeSha);
+    expect(published.headCommitSha).toBe(trueMergeSha);
+    expect(tagTargetSha(tags, `refs/tags/v${SEMVER}`)).toBe(trueMergeSha);
+
+    // Force the already-merged (405) replay path for real. A crash/resume cannot reach it —
+    // a checkpointed step returns its memo and never calls GitHub — so this is the plan
+    // row's other named trigger: "a forced step retry after a successful merge".
+    // `forkWorkflow` restarts execution AT `mergePullRequestAndTag` with every earlier step
+    // replayed from its checkpoint, so the merge PUT hits an already-merged PR and returns
+    // 405. Before row 50 the step then returned the pre-merge working head and wrote it to
+    // `ProjectVersion.headCommitSha` — permanently.
+    const steps = (await DBOS.listWorkflowSteps(jobId)) ?? [];
+    const mergeStep = steps.find((s) => s.name === "mergePullRequestAndTag");
+    expect(mergeStep).toBeDefined();
+
+    const forkJobId = `${jobId}-fork`;
+    // The forked run re-executes `finalizeRecords`, which writes by `DBOS.workflowID`; give
+    // it a job row of its own rather than let a P2025 masquerade as the property under test.
+    await prisma.projectJob.create({
+      data: {
+        id: forkJobId,
+        projectId,
+        userId: payload.userId,
+        kind: "publish",
+        status: "queued",
+        stages: initialPublishStages(),
+      },
+    });
+    const forkHandle = await DBOS.forkWorkflow<PublishVersionResult>(
+      jobId,
+      mergeStep!.functionID,
+      { newWorkflowID: forkJobId },
+    );
+    const forked = (await forkHandle.getResult()) as PublishVersionResult;
+
+    // THE ASSERTION. Under the old `merged.sha ?? workingHead` this is `preMergeHead`.
+    expect(forked.published.headCommitSha).toBe(trueMergeSha);
+    const republished = await prisma.projectVersion.findFirstOrThrow({
+      where: { projectId, semver: SEMVER },
+    });
+    expect(republished.headCommitSha).toBe(trueMergeSha);
+    // Still exactly one tag, still on the true merge commit (`createTag`'s 422
+    // already-exists branch is idempotent, so the replay neither duplicates nor moves it).
+    const tagsAfterFork = (await readers.listTagRefs({ repo: fixture.repo })) as Array<
+      Record<string, unknown> | string
+    >;
+    expect(
+      tagsAfterFork
+        .map((t) => (typeof t === "string" ? t : String(t.ref)))
+        .filter((r) => r === `refs/tags/v${SEMVER}`),
+    ).toHaveLength(1);
+    expect(tagTargetSha(tagsAfterFork, `refs/tags/v${SEMVER}`)).toBe(trueMergeSha);
+  }, 240_000);
+});
+
+/**
+ * Plan row 50 item (2) — an uncaught PERMANENT step failure must reconcile
+ * `ProjectJob.status`, not leave the poller spinning on `"running"` forever.
+ *
+ * The trigger is the row's own suggestion and the only realistic permanent publish failure:
+ * publish a working branch with NO diff against `main`. Real GitHub answers
+ * `POST /repos/{o}/{r}/pulls` with `422 "No commits between main and v0.0.1"`, which
+ * `openPullRequest` deliberately does NOT swallow (only the duplicate-head 422 resolves to
+ * an existing PR), so a permanent `GithubRestError` escapes the workflow body.
+ *
+ * Before this row `publishVersionWorkflow` had no try/catch and did not even import
+ * `markJobFailed`: DBOS recorded ERROR, and the `ProjectJob` row — the ONLY thing
+ * `GET /v1/projects/:id/jobs/:jobId` can read, since no HTTP flows from dbos to api
+ * (design-delta §5.1:741-746) — stayed `"running"` with every stage `pending` and a null
+ * `error`.
+ */
+describe("publishVersionWorkflow — permanent failure reconciles the job row", () => {
+  it("publishing a branch with no diff fails the job instead of hanging at running", async () => {
+    const fixture = await provisionFixtureRepo("publish-nodiff");
+    await seedNoDiffWorkingBranch(fixture.fullName);
+    const { jobId, payload } = await seedPublishProjectJob(fixture);
+
+    const handle = await client.enqueue<PublishVersionResult>(
+      {
+        workflowName: WORKFLOW_NAMES.publishVersion,
+        queueName: WORKFLOW_QUEUE.publishVersion,
+        workflowID: jobId,
+      },
+      payload,
+    );
+    await expect(handle.getResult()).rejects.toThrow();
+    await waitForStatus(jobId, ["ERROR"]);
+
+    const job = await prisma.projectJob.findUniqueOrThrow({ where: { id: jobId } });
+    expect(job.status).toBe("failed");
+    expect(job.completedAt).toBeInstanceOf(Date);
+    // The api's poll surfaces this string; it must name the real cause, not a generic one.
+    expect(job.error).toContain("open pull request failed: 422");
+    const stages = job.stages as Array<{ key: string; state: string }>;
+    expect(stages.find((s) => s.key === "openPullRequest")?.state).toBe("failed");
+    // The stages that genuinely completed are not rewritten by the failure record.
+    expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("done");
+    // And nothing downstream was marked done on the way out.
+    expect(stages.find((s) => s.key === "finalizeRecords")?.state).toBe("pending");
+  }, 150_000);
 });
 
 describe("publishVersionWorkflow — crash / replay (mid-merge, no duplicate PR)", () => {

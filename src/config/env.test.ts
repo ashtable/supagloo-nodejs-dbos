@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadEnv } from "./env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 // The DBOS worker needs TWO distinct Postgres connection strings (design-delta
 // §4): the APP db (`supagloo`, where workflows write domain rows via db-lib's
@@ -25,7 +26,11 @@ const GITHUB_APP = {
 // provider secrets (via db-lib's decryptSecret) inside the generation workflows.
 // Required (fail-fast at boot), a 64-hex-char value — copied verbatim from
 // supagloo-nodejs-api's loader so API and DBOS agree on the same key contract.
-const SECRETS_ENCRYPTION_KEY = "0".repeat(64);
+//
+// Plan row 43 / D43.1: this used to be `"0".repeat(64)`, which the loader now REJECTS
+// (§11.7:2309-2318's real decryption incident). One authored fixture for the whole repo —
+// see `src/testing/secrets-fixture.ts` and its structural guard.
+const SECRETS_ENCRYPTION_KEY = TEST_SECRETS_ENCRYPTION_KEY;
 
 // Task #32 S3 (writer role): required for the asset-uploading workflows.
 const S3_ENV = {
@@ -336,5 +341,173 @@ describe("DBOS_SYSTEM_DATABASE_SCHEMA (the optional system-schema knob)", () => 
     const section = example.slice(Math.max(0, at - 1400), at + 500);
     expect(section).toMatch(/same value/i);
     expect(section).toMatch(/nothing polls|never polls|no worker polls/i);
+  });
+});
+
+// ---------------------------------------------------------------------- plan row 43
+// Secrets/env BOOT HARDENING, dbos half (design-delta §2.10; brief §2).
+//
+// Two of the row's three claims were already true here and are pinned, not rebuilt:
+// `SECRETS_ENCRYPTION_KEY` length/presence has been enforced since task 29 (brief finding
+// S4), and "distinct-per-env" does NOT mean per-SERVICE distinct — api and dbos must carry
+// the IDENTICAL key within an environment or `decryptSecret` fails (brief finding S5,
+// design-delta §11.7:2309-2318, root `compose-config.test.ts` PART V invariant 5). What is
+// NEW: the all-zeros key is rejected in-process, and every error names the FILE as well as
+// the variable.
+//
+// The obvious weak-key gate — reject the well-known dev key when `NODE_ENV === "production"`
+// — is deliberately NOT used (D43.1). `docker-compose.yml` pins `NODE_ENV: production` on
+// BOTH api and dbos and hardcodes the dev key, so that gate would refuse to boot the shipped
+// stack in every lane. The "distinct per environment" half is enforced structurally in root,
+// over Compose and `.env.example`, where it can actually be seen.
+describe("plan row 43 — SECRETS_ENCRYPTION_KEY weak-key rejection", () => {
+  it("U-DBENV-R43-1: rejects the all-zeros key, naming the variable AND the file", () => {
+    const err = (() => {
+      try {
+        loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "0".repeat(64) }));
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("SECRETS_ENCRYPTION_KEY");
+    // design-delta §8:1414-1418 / §11.3:2034-2042 / §11.8:2392-2396: the operator must be
+    // told WHICH variable and WHERE it is read, not just that "the environment is invalid".
+    expect(err!.message).toContain("src/config/env.ts");
+    // The remedy is the same string the length check already recommends.
+    expect(err!.message).toContain("openssl rand -hex 32");
+  });
+
+  it("U-DBENV-R43-2: rejects all-zeros in EITHER hex case, and accepts a real 64-hex key", () => {
+    expect(() => loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "0".repeat(64) }))).toThrow();
+    // Not a case-sensitivity trap: "0" has no case. What must NOT happen is a
+    // near-miss being rejected — only the literal placeholder is refused.
+    const almost = "0".repeat(63) + "1";
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: almost })).SECRETS_ENCRYPTION_KEY).toBe(
+      almost,
+    );
+    expect(
+      loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY }))
+        .SECRETS_ENCRYPTION_KEY,
+    ).toBe(TEST_SECRETS_ENCRYPTION_KEY);
+  });
+
+  it("U-DBENV-R43-3: the Compose dev key still boots — the weak-key gate is not NODE_ENV-gated", () => {
+    // `docker-compose.yml:87`/`:134` hardcode exactly this value for api AND dbos, with
+    // `NODE_ENV: production`. A production-gated rejection would break the `dbos` container
+    // in all fourteen lanes; this test is the standing proof that it does not.
+    const devKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    for (const nodeEnv of ["development", "test", "production"] as const) {
+      const env = loadEnv(
+        validEnv({ SECRETS_ENCRYPTION_KEY: devKey, NODE_ENV: nodeEnv }),
+      );
+      expect(env.SECRETS_ENCRYPTION_KEY).toBe(devKey);
+    }
+  });
+
+  it("U-DBENV-R43-4: api and dbos take the SAME key — no per-service-distinct rule exists here", () => {
+    // Brief finding S5. Encryption is symmetric across the two services: the api encrypts a
+    // user's provider credential and this worker decrypts it. A validator that demanded a
+    // dbos-specific key would break decryption in production and turn root's PART V
+    // invariant 5 red. The absence of such a rule is the assertion.
+    const shared = TEST_SECRETS_ENCRYPTION_KEY;
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: shared })).SECRETS_ENCRYPTION_KEY).toBe(
+      shared,
+    );
+  });
+});
+
+// The row's Unit column asks for "validator matrices per service" — plural, because the
+// three services' required sets are DELIBERATELY different (brief §2.2 constraint 6). This
+// is dbos's matrix. Required-ness tiers are asserted as they are, not normalised: promoting
+// an optional key to required would falsify current-design §5.3 and break every Compose file.
+describe("plan row 43 — dbos required-variable matrix", () => {
+  const REQUIRED = [
+    "DATABASE_URL",
+    "DBOS_DATABASE_URL",
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY",
+    "SECRETS_ENCRYPTION_KEY",
+    "S3_ENDPOINT",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+  ] as const;
+
+  it.each(REQUIRED)(
+    "U-DBENV-R43-M: a missing %s refuses to boot, naming the variable and the file",
+    (name) => {
+      const err = (() => {
+        try {
+          loadEnv(validEnv({ [name]: undefined }));
+          return undefined;
+        } catch (e) {
+          return e as Error;
+        }
+      })();
+      expect(err).toBeDefined();
+      expect(err!.message).toContain(name);
+      expect(err!.message).toContain("src/config/env.ts");
+    },
+  );
+
+  it.each(REQUIRED)("U-DBENV-R43-M: an EMPTY %s is refused too, not silently accepted", (name) => {
+    expect(() => loadEnv(validEnv({ [name]: "" }))).toThrow(new RegExp(name));
+  });
+
+  it("U-DBENV-R43-5: every optional key stays optional", () => {
+    // current-design §5.3:615-633 spends nineteen lines arguing DBOS_SYSTEM_DATABASE_SCHEMA
+    // is optional-and-unset-everywhere; S3_PUBLIC_ENDPOINT exists for name-parity with the
+    // api and is unused here; YOUVERSION_APP_KEY has a public-domain fallback; the two
+    // RENDER_*_MODEL keys mean "no fallback synthesis" when unset.
+    const env = loadEnv(validEnv());
+    expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
+    expect(env.S3_PUBLIC_ENDPOINT).toBeUndefined();
+    expect(env.YOUVERSION_APP_KEY).toBeUndefined();
+    expect(env.RENDER_NARRATION_MODEL).toBeUndefined();
+    expect(env.RENDER_MUSIC_MODEL).toBeUndefined();
+    // Provider base URLs default to the REAL hosts — production needs zero config.
+    expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
+    expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
+    expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
+    expect(env.S3_REGION).toBe("us-east-1");
+  });
+
+  it("U-DBENV-R43-6: the api-only GitHub OAuth trio is NOT required by dbos", () => {
+    // The asymmetry is by design (brief §2.2 constraint 6): dbos has no user context, so it
+    // never performs the OAuth hop and must not be made to carry its credentials. A
+    // "required provider vars" matrix copied wholesale from the api would be wrong here, and
+    // adding a var carries its own burden of argument (design-delta §11.2:1983-1994).
+    const env = loadEnv(validEnv());
+    expect(env).not.toHaveProperty("GITHUB_APP_SLUG");
+    expect(env).not.toHaveProperty("GITHUB_OAUTH_CLIENT_ID");
+    expect(env).not.toHaveProperty("GITHUB_OAUTH_CLIENT_SECRET");
+    // And supplying them is not an error either — they are simply ignored.
+    expect(() =>
+      loadEnv(
+        validEnv({
+          GITHUB_APP_SLUG: "supagloo",
+          GITHUB_OAUTH_CLIENT_ID: "Iv1.deadbeef",
+          GITHUB_OAUTH_CLIENT_SECRET: "shhh",
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("U-DBENV-R43-7: a multi-problem env reports EVERY offending variable at once", () => {
+    // Fail-fast at boot is only actionable if it does not make the operator play
+    // whack-a-mole one restart at a time.
+    const err = (() => {
+      try {
+        loadEnv(validEnv({ S3_BUCKET: undefined, GITHUB_APP_ID: undefined }));
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("S3_BUCKET");
+    expect(err!.message).toContain("GITHUB_APP_ID");
   });
 });

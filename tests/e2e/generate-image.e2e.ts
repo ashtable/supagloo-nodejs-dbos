@@ -8,6 +8,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { buildAssetKey, createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -48,7 +49,7 @@ import type {
 
 const S3_PUBLIC = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 const S3_BUCKET = process.env.S3_BUCKET ?? "supagloo-dev";
-const ENCRYPTION_KEY = "0".repeat(64);
+const ENCRYPTION_KEY = TEST_SECRETS_ENCRYPTION_KEY;
 
 // ISOLATION, NOT A PRECONDITION. This spec launches the REAL DBOS runtime in-process and
 // registers the REAL static workflow names on the REAL shared queues — exactly what the

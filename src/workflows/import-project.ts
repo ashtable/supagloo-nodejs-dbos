@@ -8,10 +8,11 @@ import { getAppDb } from "../db/app-db";
 import { getScaffoldConfig } from "./scaffold-project/config";
 import { markJobRunning, markStageDone } from "./scaffold-project/stages";
 import { NotASupaglooProjectError, ManifestInvalidError } from "./import-project/errors";
-import {
-  isPermanentImportFailure,
-  retryUnlessPermanentImport,
-} from "./import-project/retry";
+// `isPermanentImportFailure` is deliberately NOT imported any more: plan row 50 item (2)
+// removed it from the terminal-failure catch (it was the outer half of the double gate).
+// It remains the classifier behind `retryUnlessPermanentImport`, which is where a
+// permanent-vs-transient judgement actually belongs — the DBOS step's retry decision.
+import { retryUnlessPermanentImport } from "./import-project/retry";
 import {
   checkoutVersionBranch,
   ensureImportClone,
@@ -37,10 +38,11 @@ import { finalizeImportRecords } from "./import-project/finalize";
  *
  * Crash-safety: the clone is EPHEMERAL, so every FS-touching step calls
  * `ensureImportClone` first (reuse-or-reclone) — import is read-only on the remote, so
- * there is no deterministic-commit obligation (unlike scaffold). A permanent CONTENT
- * failure (`NotASupaglooProjectError` / `ManifestInvalidError`) is non-retryable and is
- * recorded onto the job (status=failed + the offending stage `failed` + error) — the
- * 12b "NOT A SUPAGLOO PROJECT" state. Registered STATICALLY at module load.
+ * there is no deterministic-commit obligation (unlike scaffold). EVERY escaping error is
+ * recorded onto the job (status=failed + a stage `failed` + the message); the two
+ * permanent CONTENT failures (`NotASupaglooProjectError` / `ManifestInvalidError`) are
+ * additionally non-retryable and name their own stage — the 12b "NOT A SUPAGLOO PROJECT"
+ * state. Registered STATICALLY at module load.
  */
 
 export const IMPORT_PROJECT_WORKFLOW_NAME = WORKFLOW_NAMES.importProject;
@@ -95,7 +97,18 @@ function authenticatedCloneUrl(
   return url.toString();
 }
 
-/** Map a permanent content failure to the stage whose state should show `failed`. */
+/**
+ * Map a permanent CONTENT failure to the stage whose state should show `failed`.
+ *
+ * Plan row 50 item (2) / D50.3: this is now the PREFERRED stage key, not a gate. It used
+ * to be half of a double gate (`isPermanentImportFailure(err)` AND a non-null return
+ * here), which meant a failure was recorded for exactly these two error types and NOTHING
+ * was written for every other class. It survives because these two mappings are
+ * load-bearing for wireframe 12b's terminal "NOT A SUPAGLOO PROJECT" / invalid-manifest
+ * stage state: the offending stage is not necessarily the one in flight (verification
+ * fails inside the `verifySupaglooProject` step, but a manifest error can surface from a
+ * step whose own label is less specific).
+ */
 function failedStageFor(err: unknown): string | null {
   if (err instanceof NotASupaglooProjectError) return "verifySupaglooProject";
   if (err instanceof ManifestInvalidError) return "parseManifest";
@@ -112,9 +125,20 @@ async function importProjectFn(
   const prisma = getAppDb();
   const cfg = getScaffoldConfig();
 
+  // Which stage is in flight, for the terminal-failure record below (plan row 50 item 2 /
+  // D50.4, copied from `scaffold-project.ts`). Free: `boundary(label)` already receives
+  // EXACTLY the stage key at every step, so `at()` just remembers it on the way past. A
+  // workflow-LOCAL variable (never module state), deterministically re-derived on replay,
+  // and safe under the git-ops queue's worker_concurrency > 1.
+  let currentStage = "markJobRunning";
+  const at = async (label: string): Promise<void> => {
+    currentStage = label;
+    await boundary(label);
+  };
+
   try {
     // 0) markJobRunning — flip queued → running (status only, not a stage).
-    await boundary("markJobRunning");
+    await at("markJobRunning");
     await DBOS.runStep(
       async () => {
         await markJobRunning(prisma, jobId);
@@ -123,7 +147,7 @@ async function importProjectFn(
     );
 
     // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
-    await boundary("mintInstallationToken");
+    await at("mintInstallationToken");
     const token = await DBOS.runStep(
       async () => {
         const minted = await mintInstallationToken({
@@ -149,7 +173,7 @@ async function importProjectFn(
     };
 
     // 2) cloneRepo — clone the existing repo into the ephemeral workspace.
-    await boundary("cloneRepo");
+    await at("cloneRepo");
     await DBOS.runStep(
       async () => {
         await ensureImportClone(ctx);
@@ -160,7 +184,7 @@ async function importProjectFn(
 
     // 3) verifySupaglooProject — remotion.config.ts + >=1 vN.N.N branch (NON-RETRYABLE
     //    typed failure otherwise). Reads local refs — self-heals the clone first.
-    await boundary("verifySupaglooProject");
+    await at("verifySupaglooProject");
     const branches = await DBOS.runStep(
       async () => {
         const path = await ensureImportClone(ctx);
@@ -180,7 +204,7 @@ async function importProjectFn(
     );
 
     // 4) resolveLatestVersionBranch — highest vN.N.N by REAL semver compare.
-    await boundary("resolveLatestVersionBranch");
+    await at("resolveLatestVersionBranch");
     const resolved = await DBOS.runStep(
       async () => {
         const resolved = resolveLatestVersionBranch(branches);
@@ -192,7 +216,7 @@ async function importProjectFn(
 
     // 5) parseManifest — checkout the resolved version branch, validate its manifest
     //    (NON-RETRYABLE typed failure otherwise). Self-heals the clone first.
-    await boundary("parseManifest");
+    await at("parseManifest");
     const headCommitSha = await DBOS.runStep(
       async () => {
         const path = await ensureImportClone(ctx);
@@ -205,7 +229,7 @@ async function importProjectFn(
     );
 
     // 6) finalizeRecords — Project + ONE ProjectVersion(working) + job stages/status.
-    await boundary("finalizeRecords");
+    await at("finalizeRecords");
     await DBOS.runStep(
       async () => {
         await finalizeImportRecords(prisma, jobId, {
@@ -234,20 +258,48 @@ async function importProjectFn(
       },
     };
   } catch (err) {
-    // Record a PERMANENT content failure onto the job so the poll surfaces the terminal
-    // 12b stage state ("NOT A SUPAGLOO PROJECT" / invalid manifest). Transient failures
-    // are left to DBOS retry/recovery; non-content permanent failures (git/HTTP) end the
-    // workflow ERROR without a specific stage (scaffold parity). Re-thrown either way.
-    if (isPermanentImportFailure(err)) {
-      const failedStage = failedStageFor(err);
-      if (failedStage) {
-        await DBOS.runStep(
-          async () => {
-            await markJobFailed(prisma, jobId, failedStage, (err as Error).message);
-          },
-          { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },
-        );
-      }
+    // Plan row 50 item (2) / D50.3 — this catch is now UNGATED, matching scaffold's.
+    //
+    // It used to be DOUBLY gated: `isPermanentImportFailure(err)` AND a non-null
+    // `failedStageFor(err)`, which answers for exactly `NotASupaglooProjectError` and
+    // `ManifestInvalidError`. Everything else — db-lib's `GithubAppError` from step 1
+    // `mintInstallationToken`, a `GitCommandError` from the clone, a Prisma/Zod error from
+    // `finalizeRecords` — escaped with NOTHING written, leaving `ProjectJob.status` at
+    // `"running"` with every stage `pending` forever while DBOS reported ERROR. That is the
+    // eternal wizard spinner row 63 killed in scaffold, still fully alive here for every
+    // class but two. (plan.md row 50's parenthetical "importProjectWorkflow already did"
+    // is wrong, and contradicts its own Notes column, which says task 19's catch "only
+    // narrowly covers two content-classification errors".)
+    //
+    // The typed content mappings are PRESERVED as the preferred stage key — wireframe 12b's
+    // terminal "NOT A SUPAGLOO PROJECT" state depends on the offending stage being
+    // `verifySupaglooProject` rather than merely whichever step was in flight — and
+    // `currentStage` is the fallback for everything else.
+    //
+    // Recording unconditionally is not a guess about transience: by the time an error
+    // reaches this catch DBOS has already spent that step's retry budget and CHECKPOINTED
+    // the error, so it re-throws on every replay; a crash — the case that IS recoverable —
+    // unwinds the process instead of running this catch. `markJobFailed` refuses to
+    // overwrite an already-`succeeded` job, which is what keeps the widened catch honest if
+    // `finalizeRecords`' trailing `removeImportWorkspace` ever throws after the success
+    // write.
+    try {
+      await DBOS.runStep(
+        async () => {
+          await markJobFailed(
+            prisma,
+            jobId,
+            failedStageFor(err) ?? currentStage,
+            err instanceof Error ? err.message : String(err),
+          );
+        },
+        { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },
+      );
+    } catch {
+      // The bookkeeping write must never REPLACE the real failure. It fails when the app DB
+      // is unreachable, and (harmlessly) when the workflow was cancelled — DBOS rejects a
+      // `runStep` in a CANCELLED workflow before it records anything, so this step cannot
+      // poison the function-ID sequence a later `resumeWorkflow` replays.
     }
     throw err;
   }

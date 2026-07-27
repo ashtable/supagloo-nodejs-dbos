@@ -28,6 +28,26 @@ const HTTP_URL = /^https?:\/\/.+/;
 // than on the first decrypt inside a generation workflow.
 const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
+/**
+ * The all-zeros key: 64 hex characters, so it passes {@link SECRETS_KEY_HEX}, and a real
+ * incident (design-delta §11.7:2309-2318) — `docker-compose.test.yml` overrode the API's
+ * key to this value while dbos kept the Compose dev key, so every provider credential the
+ * API ENCRYPTED failed `decryptSecret` in this worker. Row 62 deleted that override; plan
+ * row 43 / D43.1 makes the value itself un-loadable so it cannot return by another door.
+ *
+ * WHY NOT the obvious `NODE_ENV === "production"` weak-key gate: `docker-compose.yml`
+ * pins `NODE_ENV: production` on BOTH api and dbos AND hardcodes the well-known dev key, so
+ * a production-gated rejection would refuse to boot the shipped stack in every lane. The
+ * "distinct per environment" half of the row lives where it can actually be checked —
+ * root's Compose/`.env.example` guard — and this in-process half rejects only the value
+ * with a recorded history of breaking decryption.
+ *
+ * NOT a per-service rule. api and dbos must carry the IDENTICAL key within an environment
+ * (current-design §2.2:99, root `compose-config.test.ts` PART V invariant 5); the message
+ * below is byte-identical to the API's for exactly that reason.
+ */
+const WEAK_SECRETS_KEYS = new Set(["0".repeat(64)]);
+
 /** The DBOS application name (DBOS.setConfig `name`). Fixed, not env-configured. */
 export const DBOS_APP_NAME = "supagloo-dbos";
 
@@ -138,6 +158,14 @@ export const envSchema = z.object({
       message:
         "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
         "generate one with `openssl rand -hex 32`",
+    })
+    // Plan row 43 / D43.1 — see WEAK_SECRETS_KEYS. Keep this message byte-identical to
+    // supagloo-nodejs-api's: the two services share one key, so they must reject the same
+    // values with the same words or an operator will think only one of them is unhappy.
+    .refine((value) => !WEAK_SECRETS_KEYS.has(value), {
+      message:
+        "SECRETS_ENCRYPTION_KEY must not be a placeholder key (all zeros); " +
+        "generate a real one with `openssl rand -hex 32`",
     }),
 
   // Task #32 S3 (design-delta §4/§8). The asset-uploading workflows PUT generated media
@@ -225,9 +253,24 @@ export const envSchema = z.object({
 export type Env = z.infer<typeof envSchema>;
 
 /**
+ * Where this validator lives, named in the failure message.
+ *
+ * Plan row 43 (design-delta §8:1414-1418, §11.3:2034-2042, §11.8:2392-2396): a boot
+ * refusal must name the VARIABLE **and** the FILE. "Invalid environment configuration —
+ * S3_BUCKET: Required" tells an operator which knob; it does not tell them which of five
+ * repos owns it, and `S3_BUCKET` is a name three of them use. Repo-qualified because the
+ * message is read out of a merged `docker compose logs` stream.
+ */
+const ENV_SOURCE_FILE = "supagloo-nodejs-dbos/src/config/env.ts";
+
+/**
  * Parse and validate the environment. Throws a single, actionable error listing
- * every problem when validation fails (fail-fast at boot). Accepts an injected
- * source for testing; defaults to `process.env`.
+ * EVERY problem when validation fails (fail-fast at boot) — one restart per bad config,
+ * not one per bad variable. Accepts an injected source for testing; defaults to
+ * `process.env`.
+ *
+ * Every failure throws; none warns and continues (design-delta §8:1414-1418). The message
+ * carries variable names and human remedies but never a VALUE, so it is safe to log as-is.
  */
 export function loadEnv(
   source: Record<string, string | undefined> = process.env,
@@ -237,7 +280,9 @@ export function loadEnv(
     const details = result.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
       .join("; ");
-    throw new Error(`Invalid environment configuration — ${details}`);
+    throw new Error(
+      `Invalid environment configuration in ${ENV_SOURCE_FILE} — ${details}`,
+    );
   }
   return result.data;
 }

@@ -86,12 +86,14 @@ export async function markStageDone(
  * keys off the stage array, not the catalogue, so `import-project/stages.ts` re-exports
  * it rather than keeping a second copy.
  *
- * Plan row 63 / D63.7 is why scaffold now uses it. `scaffoldProjectFn` had no
- * `try`/`catch` at all, so a permanent failure — row 63's own `422 field:base
- * code:invalid` — left `ProjectJob.status` at `"running"` with the offending stage
- * `pending` FOREVER while DBOS reported ERROR. The user-visible symptom was an eternal
- * wizard spinner rather than a failure. `commit-version` and `publish-version` still
- * share that gap; it is tracked as plan row 50 item (2), not widened into row 63.
+ * Plan row 63 / D63.7 is why scaffold uses it. `scaffoldProjectFn` had no `try`/`catch`
+ * at all, so a permanent failure — row 63's own `422 field:base code:invalid` — left
+ * `ProjectJob.status` at `"running"` with the offending stage `pending` FOREVER while
+ * DBOS reported ERROR. The user-visible symptom was an eternal wizard spinner rather than
+ * a failure. Plan row 50 item (2) finished the job: `commit-version` and
+ * `publish-version` gained the same ungated catch (they had none at all), and
+ * `import-project`'s — which fired for exactly two content-classification errors — was
+ * widened to match. **All four git-ops workflows now call this on every escaping error.**
  *
  * NEVER CLOBBERS A TERMINAL SUCCESS (review finding DR4). The scaffold catch now records
  * EVERY error that escapes the workflow body, which opens exactly one new window:

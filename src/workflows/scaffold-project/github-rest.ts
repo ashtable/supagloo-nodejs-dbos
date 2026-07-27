@@ -335,16 +335,97 @@ export async function openPullRequest(
 }
 
 /**
+ * How many times {@link resolveMergeCommitSha} re-reads the PR while GitHub is still
+ * populating `merge_commit_sha`, and the (blind, doubling) waits between those reads.
+ *
+ * GitHub's pulls index is near-real-time but NOT transactional (design-delta
+ * §11.5:2245-2246) and `merge_commit_sha` is filled in ASYNCHRONOUSLY a moment after a
+ * merge lands, so a `200` whose value is still `null` is a WAIT, not a failure. Bounded
+ * on purpose: exhausting the budget throws a TRANSIENT error, which hands the problem
+ * back to the DBOS step budget — a durable, crash-safe re-attempt that re-enters the 405
+ * branch and reads again. Throttling (`403 + Retry-After`, `429`) is NOT handled here;
+ * that is `withGithubRetry`'s job, one layer down, on every individual read.
+ */
+export const MERGE_SHA_MAX_ATTEMPTS = 4;
+const MERGE_SHA_BASE_DELAY_MS = 500;
+
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Read the TRUE merge-commit sha of an already-merged PR (`GET /repos/{o}/{r}/pulls/{n}`).
+ *
+ * Plan row 50 item (1) / D50.2. Callers must NEVER substitute a pre-merge branch tip when
+ * this cannot answer: under a SQUASH merge the merge commit is a brand-new commit, and the
+ * value is not transient — it becomes the release tag's target AND the permanently stored
+ * `ProjectVersion.headCommitSha`. Wireframe 14b's `v0.0.2 [LIVE ON MAIN]` chip and its
+ * `restore` action both read it, so a wrong sha is a rendered falsehood plus a restore of
+ * the wrong commit. A loud failure is strictly better, and DBOS recovery can retry it.
+ *
+ * A PERMANENT status (4xx except 429) fails fast and typed, so the step's
+ * `shouldRetry: retryUnlessPermanent` does not burn its budget on a 404/401.
+ */
+async function resolveMergeCommitSha(
+  cfg: GithubRestConfig,
+  args: { owner: string; repo: string; number: number },
+): Promise<string> {
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const sleep = cfg.sleepImpl ?? realSleep;
+  const url = `${trimSlash(cfg.apiBaseUrl)}/repos/${args.owner}/${args.repo}/pulls/${args.number}`;
+
+  for (let attempt = 1; attempt <= MERGE_SHA_MAX_ATTEMPTS; attempt += 1) {
+    const res = await retrying(cfg, () =>
+      fetchImpl(url, { headers: authHeaders(cfg.token) }),
+    );
+    if (res.ok) {
+      const body = (await res.json()) as { merge_commit_sha?: string | null };
+      if (body.merge_commit_sha) return body.merge_commit_sha;
+      // Merged, but the sha has not materialised yet — wait and re-read.
+    } else if (isPermanentHttpStatus(res.status)) {
+      throw new GithubRestError(
+        `read merged pull request failed: ${res.status}`,
+        res.status,
+      );
+    }
+    if (attempt < MERGE_SHA_MAX_ATTEMPTS) {
+      await sleep(MERGE_SHA_BASE_DELAY_MS * 2 ** (attempt - 1));
+    }
+  }
+
+  // Untyped ⇒ TRANSIENT under `retryUnlessPermanent`, deliberately: the whole merge step
+  // is safe to re-run (the merge itself is idempotent), and re-running is the only correct
+  // recovery. Falling back to a stale sha is not (D50.2).
+  throw new Error(
+    `merge commit sha unavailable for ${args.owner}/${args.repo}#${args.number} ` +
+      `after ${MERGE_SHA_MAX_ATTEMPTS} reads of an already-merged pull request`,
+  );
+}
+
+/**
  * Merge the base PR (squash). Real GitHub returns 405 for an already-merged PR (the
  * retired task-9 stub returned 405 on a DOUBLE-merge for the same reason); we treat
  * 405 as an idempotent "already merged" success so a replayed merge is safe.
  * (Scaffold merges are clean fast-forwards, so a FIRST-attempt 405-for-conflict
  * cannot occur; a genuine 409 conflict would surface as a permanent GithubRestError.)
+ *
+ * **Plan row 50 item (1): the already-merged branch RE-FETCHES the true merge-commit sha
+ * rather than returning none.** It used to return `{ merged: true }` with no sha, and both
+ * call sites papered over that with `merged.sha ?? <pre-merge branch tip>` — a value
+ * derived from the wrong read, which design-delta §11.5:2235-2239 calls "a green lie" and
+ * §11.6:2263-2269 had already produced once (`state=open` → `state=all`). The return type
+ * is now `sha: string`, so the fallback is a COMPILE error rather than a thing a future
+ * edit can quietly reintroduce.
+ *
+ * D50.1 — the re-fetch lives here, INSIDE the existing step's helper, not in a new DBOS
+ * step: a new step would shift every downstream `functionID` and stale the crash/replay
+ * step-count assertions. It is also unnecessary, because the 405 branch is only reached
+ * when the step is GENUINELY re-executing (a checkpointed step returns its memo and never
+ * calls GitHub), so the extra read happens exactly when it is needed and never on the
+ * happy path.
  */
 export async function mergePullRequest(
   cfg: GithubRestConfig,
   args: { owner: string; repo: string; number: number; mergeMethod?: string },
-): Promise<{ merged: boolean; sha?: string }> {
+): Promise<{ merged: boolean; sha: string }> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
   // 405 ("already merged") is a 4xx with no throttle signal, so it is never retryable and
   // the idempotent-replay branch below still runs on attempt 1.
@@ -361,10 +442,14 @@ export async function mergePullRequest(
 
   if (res.ok) {
     const b = (await res.json()) as { merged?: boolean; sha?: string };
-    return { merged: b.merged ?? true, sha: b.sha };
+    // A 200 merge always carries `sha`; resolving the one-in-a-million body that does not
+    // costs one read and keeps the return type honest, instead of guessing.
+    if (b.sha) return { merged: b.merged ?? true, sha: b.sha };
+    return { merged: true, sha: await resolveMergeCommitSha(cfg, args) };
   }
   if (res.status === 405) {
-    return { merged: true }; // already merged (idempotent replay)
+    // Already merged (idempotent replay) — read the sha the merge response cannot give us.
+    return { merged: true, sha: await resolveMergeCommitSha(cfg, args) };
   }
   throw new GithubRestError(`merge pull request failed: ${res.status}`, res.status);
 }

@@ -4,6 +4,7 @@ import {
   ensureRepoReachable,
   GithubRestError,
   isPermanentHttpStatus,
+  MERGE_SHA_MAX_ATTEMPTS,
   openPullRequest,
   mergePullRequest,
   RepoUnreachableError,
@@ -174,8 +175,10 @@ describe("openPullRequest", () => {
 });
 
 describe("mergePullRequest", () => {
-  it("PUTs a squash merge and returns the merge sha", async () => {
+  it("PUTs a squash merge and returns the merge sha, with NO follow-up read", async () => {
+    const urls: string[] = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      urls.push(String(url));
       expect(String(url)).toContain("/repos/acme/empty-one/pulls/7/merge");
       expect(init?.method).toBe("PUT");
       expect(JSON.parse(String(init?.body))).toMatchObject({ merge_method: "squash" });
@@ -189,11 +192,48 @@ describe("mergePullRequest", () => {
     });
     expect(res.merged).toBe(true);
     expect(res.sha).toBe("abc123");
+    // Plan row 50 item (1): the re-fetch is reached ONLY when the merge response could
+    // not carry a sha. A 200 already has one, so the happy path costs zero extra calls.
+    expect(urls).toHaveLength(1);
   });
+});
 
-  it("treats the stub's 405 double-merge as an idempotent already-merged success", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse(405, { message: "Pull Request is not mergeable" })) as unknown as typeof fetch;
+/**
+ * Plan row 50 item (1) / D50.1 + D50.2 — the TRUE merge-commit sha on the idempotent
+ * `405 already-merged` replay path.
+ *
+ * Until now `mergePullRequest` returned `{ merged: true }` with NO sha there, and both
+ * call sites papered over it with `merged.sha ?? <pre-merge branch tip>`
+ * (`scaffold-project.ts` → `baseSha`, `publish-version.ts` → `workingHead`). Under a
+ * SQUASH merge the merge commit is a brand-new commit, so that fallback is wrong every
+ * time it fires — and the wrong value is not transient: it becomes the release tag's
+ * target AND the permanently stored `ProjectVersion.headCommitSha`. design-delta
+ * §11.5:2235-2239 names the class ("on a merged PR, re-read — never fall back to a stale
+ * value"); §11.6:2263-2269's `state=open` → `state=all` fix was the second instance.
+ *
+ * D50.1: the re-fetch lives INSIDE this helper, not in a new DBOS step — a new step
+ * would shift every downstream `functionID` and stale the existing crash/replay
+ * step-count assertions. It is also unnecessary: the 405 branch is reached only when the
+ * step is GENUINELY re-executing (a checkpointed step returns its memo and never calls
+ * GitHub), so the in-helper re-fetch runs exactly when it is needed.
+ *
+ * D50.2: if the re-fetch cannot produce a `merge_commit_sha`, THROW. There is no
+ * fallback to reintroduce.
+ */
+describe("mergePullRequest — 405 already-merged re-fetch (row 50 item 1)", () => {
+  it("re-fetches the PR and returns its TRUE merge_commit_sha", async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      urls.push(String(url));
+      if (init?.method === "PUT") {
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      return jsonResponse(200, {
+        number: 7,
+        merged: true,
+        merge_commit_sha: "true-merge-sha",
+      });
+    }) as unknown as typeof fetch;
 
     const res = await mergePullRequest(cfgWith(fetchImpl), {
       owner: "acme",
@@ -201,6 +241,77 @@ describe("mergePullRequest", () => {
       number: 7,
     });
     expect(res.merged).toBe(true);
+    expect(res.sha).toBe("true-merge-sha");
+    // The follow-up read is the PR itself, not a list — precise, and unaffected by the
+    // pulls index's near-real-time-but-not-transactional behaviour.
+    expect(urls[1]).toContain("/repos/acme/empty-one/pulls/7");
+    expect(urls[1]).not.toContain("/merge");
+  });
+
+  it("waits out GitHub's asynchronous merge_commit_sha population, bounded", async () => {
+    // Real GitHub populates `merge_commit_sha` a moment AFTER the merge lands, so a
+    // 200 whose value is still null is a WAIT, not a failure (§7.2 constraint 3).
+    const sleeps: number[] = [];
+    const shas: Array<string | null> = [null, null, "true-merge-sha"];
+    let gets = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      return jsonResponse(200, { number: 7, merged: true, merge_commit_sha: shas[gets++] });
+    }) as unknown as typeof fetch;
+
+    const res = await mergePullRequest(cfgWithSleep(fetchImpl, sleeps), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    });
+    expect(res.sha).toBe("true-merge-sha");
+    expect(gets).toBe(3);
+    // Honoured, not skipped — the recorded delays are the proof (plan row 64's technique).
+    expect(sleeps).toEqual([500, 1_000]);
+  });
+
+  it("THROWS a permanent GithubRestError when the re-fetch 404s — never a fallback sha", async () => {
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      return jsonResponse(404, { message: "Not Found" });
+    }) as unknown as typeof fetch;
+
+    const err = await mergePullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(404);
+    expect(retryUnlessPermanent(err)).toBe(false);
+  });
+
+  it("THROWS (transiently) when merge_commit_sha never appears, after a bounded number of reads", async () => {
+    const sleeps: number[] = [];
+    let gets = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      gets += 1;
+      return jsonResponse(200, { number: 7, merged: true, merge_commit_sha: null });
+    }) as unknown as typeof fetch;
+
+    const err = await mergePullRequest(cfgWithSleep(fetchImpl, sleeps), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(String(err.message)).toMatch(/merge commit sha/i);
+    expect(gets).toBe(MERGE_SHA_MAX_ATTEMPTS);
+    // Transient by classification: DBOS re-runs the whole step, which re-enters the 405
+    // branch and reads again. That is the only correct recovery — a stale sha is not.
+    expect(retryUnlessPermanent(err)).toBe(true);
   });
 });
 
