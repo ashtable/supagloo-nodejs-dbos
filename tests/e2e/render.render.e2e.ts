@@ -45,6 +45,7 @@ import {
   type FixtureRepo,
 } from "../../src/testing/github-e2e";
 import { countStepExecutions } from "../../src/testing/step-introspection";
+import { assertCheckpointedTokensSealed } from "../../src/testing/token-leak-probe";
 import {
   __setRenderBoundaryHook,
   renderWorkspaceRoot,
@@ -525,6 +526,17 @@ describe("renderWorkflow — happy path (real npm install, real bundle, real Chr
       await countStepExecutions(client, seeded.renderJobId, "installDependencies"),
     ).toBe(1);
     expect(await countStepExecutions(client, seeded.renderJobId, "renderMedia")).toBe(1);
+
+    // PLAN ROW 48 — no plaintext installation token in any DBOS checkpoint. The probe
+    // reads the LANE schema (a default-`dbos` query from inside a lane finds zero rows
+    // and passes vacuously — brief §9 S8) and proves the mint step's checkpoint is a
+    // real ciphertext of a real token, not merely the absence of one.
+    await assertCheckpointedTokensSealed({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: seeded.renderJobId,
+      encryptionKey: ENCRYPTION_KEY,
+    });
   });
 });
 

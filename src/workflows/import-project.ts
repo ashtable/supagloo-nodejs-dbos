@@ -1,11 +1,12 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import {
-  mintInstallationToken,
-  type ImportProjectPayload,
-} from "@supagloo/database-lib";
+import { type ImportProjectPayload } from "@supagloo/database-lib";
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getScaffoldConfig } from "./scaffold-project/config";
+import {
+  mintEncryptedInstallationToken,
+  openInstallationToken,
+} from "./shared/installation-token";
 import { markJobRunning, markStageDone } from "./scaffold-project/stages";
 import { NotASupaglooProjectError, ManifestInvalidError } from "./import-project/errors";
 // `isPermanentImportFailure` is deliberately NOT imported any more: plan row 50 item (2)
@@ -148,19 +149,25 @@ async function importProjectFn(
 
     // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
     await at("mintInstallationToken");
-    const token = await DBOS.runStep(
+    // PLAN ROW 48: the step returns the token SEALED (AES-256-GCM), because a step's
+    // return value is what DBOS checkpoints into `operation_outputs`. The body opens it
+    // in memory; body locals are never checkpointed. Step name, step count and every
+    // `functionID` are unchanged, so the `countStepExecutions === 1` durability proof and
+    // the crash/replay step counts stand. See `shared/installation-token.ts`.
+    const sealedToken = await DBOS.runStep(
       async () => {
-        const minted = await mintInstallationToken({
+        const sealed = await mintEncryptedInstallationToken({
           appId: cfg.githubAppId,
           privateKey: cfg.githubAppPrivateKey,
           installationId: payload.installationId,
           apiBaseUrl: cfg.githubApiBaseUrl,
         });
         await markStageDone(prisma, jobId, "mintInstallationToken");
-        return minted.token;
+        return sealed;
       },
       { name: "mintInstallationToken", ...NETWORK_RETRY },
     );
+    const token = openInstallationToken(sealedToken);
 
     const ctx: ImportContext = {
       jobId,

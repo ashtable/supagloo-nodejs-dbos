@@ -20,6 +20,7 @@
  * isolation story, not an accident.
  */
 import { bundle } from "@remotion/bundler";
+import { buildRenderMediaOptions } from "./media-options";
 import {
   ensureBrowser,
   makeCancelSignal,
@@ -47,6 +48,20 @@ export interface RenderSpec {
   height: number;
   fps: number;
   durationInFrames: number;
+  /**
+   * Plan row 45 (§9-Q8). Remotion's OWN per-frame budget — distinct from the parent's
+   * child-process kill deadline, which is what the design's "generous step timeout" has
+   * meant so far. Without it a single wedged frame is invisible until the outer deadline
+   * SIGTERMs the whole child with no attribution. See `render/media-options.ts`.
+   */
+  timeoutInMilliseconds: number;
+  /**
+   * Plan row 45. Remotion defaults this to the machine's CPU COUNT, and each unit is a
+   * Chromium tab holding decoded frames — the biggest unbounded memory lever here.
+   * OMITTED unless the operator sets `RENDER_MEDIA_CONCURRENCY`, so the default behaviour
+   * is unchanged until a measurement justifies a number.
+   */
+  concurrency?: number;
 }
 
 export interface StillSpec {
@@ -150,6 +165,13 @@ async function main(): Promise<void> {
       outputLocation: s.outputLocation,
       overwrite: true,
       cancelSignal,
+      // Plan row 45 (§9-Q8) — the tuned knobs, built by `render/media-options.ts` in the
+      // parent and carried across the process boundary in the spec (the child reads no
+      // configuration of its own; its env is scrubbed by design).
+      ...buildRenderMediaOptions({
+        mediaTimeoutMs: s.timeoutInMilliseconds,
+        concurrency: s.concurrency,
+      }),
       onProgress: ({ renderedFrames, encodedFrames }) => {
         // Emit only on change — the parent throttles again before it touches the DB.
         if (renderedFrames === lastReported) return;

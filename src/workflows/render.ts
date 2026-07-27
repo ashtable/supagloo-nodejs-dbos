@@ -2,7 +2,6 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
   buildRenderOutputKey,
   buildRenderThumbnailKey,
-  mintInstallationToken,
   type PrismaClient,
   type ProjectManifest,
   type RenderWorkflowPayload,
@@ -10,6 +9,10 @@ import {
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getScaffoldConfig } from "./scaffold-project/config";
+import {
+  mintEncryptedInstallationToken,
+  openInstallationToken,
+} from "./shared/installation-token";
 import { getProviderConfig } from "../providers/config";
 import { loadOpenRouterCredential } from "../providers/credentials";
 import { requestSpeech } from "../providers/media-client";
@@ -352,6 +355,13 @@ async function renderInChild(
       height: composition.height,
       fps: composition.fps,
       durationInFrames: composition.durationInFrames,
+      // Plan row 45 (§9-Q8): Remotion's OWN per-frame timeout + optional frame
+      // concurrency. The child's env is scrubbed, so tuning crosses the boundary in the
+      // spec rather than through the environment.
+      timeoutInMilliseconds: cfg.mediaTimeoutMs,
+      ...(cfg.mediaConcurrency !== undefined
+        ? { concurrency: cfg.mediaConcurrency }
+        : {}),
     },
     {
       timeoutMs: cfg.mediaTimeoutMs,
@@ -490,18 +500,22 @@ async function renderFn(payload: RenderWorkflowPayload): Promise<RenderResult> {
     //    clone starts with mintInstallationToken".
     await boundary("mintInstallationToken");
     const scaffoldCfg = getScaffoldConfig();
-    const token = await DBOS.runStep<string>(
+    // PLAN ROW 48: SEALED, for the same reason as the four git-ops workflows — a step's
+    // return value is what DBOS checkpoints. This is render's ONLY mint step (the plan
+    // row's list and the old scaffold comment both got that wrong — brief §9 S7), and its
+    // position in `RENDER_STEP_SEQUENCE` is untouched.
+    const sealedToken = await DBOS.runStep<string>(
       async () => {
-        const minted = await mintInstallationToken({
+        return await mintEncryptedInstallationToken({
           appId: scaffoldCfg.githubAppId,
           privateKey: scaffoldCfg.githubAppPrivateKey,
           installationId,
           apiBaseUrl: scaffoldCfg.githubApiBaseUrl,
         });
-        return minted.token;
       },
       { name: "mintInstallationToken", ...RENDER_NETWORK_RETRY },
     );
+    const token = openInstallationToken(sealedToken);
 
     const cloneUrl = authenticatedCloneUrl(
       scaffoldCfg.githubGitBaseUrl,

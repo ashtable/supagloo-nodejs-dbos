@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GithubAppError } from "@supagloo/database-lib";
 import { emptyManifest } from "../remotion/__fixtures__/manifests";
 import { initialStages } from "./scaffold-project/stages";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 /**
  * Plan row 63 / D63.7, review finding DR4 — the TERMINAL-FAILURE record.
@@ -49,6 +50,17 @@ vi.mock("@dbos-inc/dbos-sdk", () => ({
 vi.mock("@supagloo/database-lib", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   mintInstallationToken: h.mint,
+}));
+
+vi.mock("../providers/config", () => ({
+  getProviderConfig: () => ({
+    openrouterBaseUrl: "https://openrouter.invalid",
+    glooBaseUrl: "https://gloo.invalid",
+    youversionBaseUrl: "https://youversion.invalid",
+    // Plan row 48: the mintInstallationToken step SEALS its result with this key, so a
+    // workflow body cannot run without provider config in scope.
+    secretsEncryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
+  }),
 }));
 
 vi.mock("../db/app-db", () => ({

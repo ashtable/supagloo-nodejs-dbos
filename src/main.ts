@@ -2,6 +2,13 @@ import { loadEnv } from "./config/env";
 import { launchDbos, shutdownDbos } from "./dbos/runtime";
 import { WORKER_FAILED_LOG, WORKER_READY_LOG } from "./dbos/worker-log";
 import { redactForLog, registerLogSecrets } from "./logging/redact";
+// Plan row 42 / D42.1 — THE ONLY IMPORT OF THIS MODULE, ANYWHERE. Importing it arms the
+// daily `cleanupOrphanedAssetsWorkflow` schedule (a module-load side effect). Because the
+// fifteen e2e lanes launch the runtime via `dbos/runtime.ts#launchDbos` and never load
+// this file, the schedule is inert in every lane BY CONSTRUCTION — which matters because
+// that workflow deletes objects from the one shared MinIO bucket and rows from the shared
+// app database. `src/dbos/scheduled-cleanup.fence.test.ts` holds the property.
+import "./dbos/scheduled-cleanup";
 
 /**
  * Process entry point for the DBOS worker. The `dbos` Compose service runs this

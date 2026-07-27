@@ -1,4 +1,10 @@
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
 
 /**
  * The FIRST real S3 WRITER in the codebase (design-delta §4/§8, task #32). Unlike the API
@@ -104,4 +110,96 @@ export async function downloadAsset(
     bytes: Buffer.from(await body.transformToByteArray()),
     contentType: res.ContentType,
   };
+}
+
+/**
+ * --- Plan row 42: the ONLY S3 LIST + DELETE path in the entire design ---------------
+ *
+ * design-delta §8:1401-1403 dropped `presign-upload` and `DELETE /v1/files` *because*
+ * workflow 10 (`cleanupOrphanedAssetsWorkflow`) exists — so nothing in product code
+ * deleted an object before this. These two helpers are that path, and they are the
+ * mechanism by which a bug in the selection rules would become permanent data loss in
+ * the single shared `supagloo-dev` bucket. They deliberately do nothing clever: no
+ * recursive "delete the prefix", no `--force`, no implicit widening. The caller supplies
+ * an explicit key list that `cleanup-orphaned-assets/selection.ts` has already admitted
+ * through db-lib's `parseS3Key`.
+ */
+
+export interface ListAssetsArgs {
+  bucket: string;
+  /** Prefix to enumerate. ALWAYS as narrow as the caller can make it. */
+  prefix: string;
+}
+
+/**
+ * Enumerate every key under `prefix`, following `ContinuationToken` to the end.
+ *
+ * The pagination is not hypothetical tidiness: S3/MinIO cap a page at 1000 keys, and a
+ * sweep that silently stopped at page one would leave orphans behind forever while
+ * reporting success.
+ */
+export async function listAssets(
+  client: S3Client,
+  args: ListAssetsArgs,
+): Promise<string[]> {
+  const keys: string[] = [];
+  let continuationToken: string | undefined;
+  do {
+    const page = await client.send(
+      new ListObjectsV2Command({
+        Bucket: args.bucket,
+        Prefix: args.prefix,
+        ContinuationToken: continuationToken,
+      }),
+    );
+    for (const obj of page.Contents ?? []) {
+      if (typeof obj.Key === "string") keys.push(obj.Key);
+    }
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
+}
+
+export interface DeleteAssetsArgs {
+  bucket: string;
+  /** The EXACT keys to remove. Never a prefix — there is no prefix-delete here. */
+  keys: string[];
+}
+
+export interface DeleteAssetsResult {
+  deleted: string[];
+  errors: Array<{ key?: string; code?: string; message?: string }>;
+}
+
+/** S3's hard limit on `DeleteObjects` — a larger request is rejected outright. */
+const DELETE_BATCH_SIZE = 1000;
+
+/**
+ * Remove exactly the given keys, batched at S3's 1000-key limit.
+ *
+ * Per-key failures are RETURNED rather than thrown: `DeleteObjects` is a partial-success
+ * API, and a caller that treated a 200 as "all gone" would report a clean sweep while
+ * objects remained. An empty key set sends NO request at all (an empty `Delete` is a 400).
+ */
+export async function deleteAssets(
+  client: S3Client,
+  args: DeleteAssetsArgs,
+): Promise<DeleteAssetsResult> {
+  const result: DeleteAssetsResult = { deleted: [], errors: [] };
+  for (let i = 0; i < args.keys.length; i += DELETE_BATCH_SIZE) {
+    const batch = args.keys.slice(i, i + DELETE_BATCH_SIZE);
+    const res = await client.send(
+      new DeleteObjectsCommand({
+        Bucket: args.bucket,
+        Delete: { Objects: batch.map((Key) => ({ Key })) },
+      }),
+    );
+    for (const d of res.Deleted ?? []) {
+      if (typeof d.Key === "string") result.deleted.push(d.Key);
+    }
+    for (const e of res.Errors ?? []) {
+      result.errors.push({ key: e.Key, code: e.Code, message: e.Message });
+    }
+  }
+  return result;
 }

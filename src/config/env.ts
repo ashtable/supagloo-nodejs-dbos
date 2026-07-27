@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CLEANUP_RETENTION_HOURS_DEFAULT } from "../workflows/cleanup-orphaned-assets/selection";
 
 /**
  * Zod-validated environment for the DBOS worker. Scope grows per task (same
@@ -86,6 +87,23 @@ const optionalModelId = () =>
       z.string().min(1).optional(),
     )
     .optional();
+
+
+/**
+ * An optional boolean env var. Compose substitutes `${FOO:-}` to the EMPTY STRING when the
+ * operator has not defined it, so "" must mean the default rather than a parse failure —
+ * the same normalization `optionalModelId` performs for model ids.
+ */
+const booleanFlag = (label: string) =>
+  z
+    .preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z
+        .union([z.boolean(), z.enum(["true", "false", "1", "0"])])
+        .optional(),
+    )
+    .transform((v) => v === true || v === "true" || v === "1")
+    .describe(label);
 
 export const envSchema = z.object({
   // App database (`supagloo`) — the workflow's app-DB writes go here.
@@ -229,6 +247,22 @@ export const envSchema = z.object({
   // `DBOS.cancelWorkflow` can COOPERATIVELY abort the in-flight Chromium render. Without
   // this, DBOS's own cancellation (which preempts only at the NEXT step boundary) would
   // let a cancelled render burn CPU to completion.
+  // Plan row 45 (§9-Q8). Remotion's frame concurrency inside ONE render. Optional with NO
+  // default: Remotion defaults it to the CPU count, and each unit is a Chromium tab
+  // holding decoded frames — the biggest unbounded memory lever in the pipeline. Unset
+  // means "leave Remotion's default alone", because the sizing numbers are extrapolated
+  // from Compose (api/dbos are not deployed to Railway), and shipping a guessed default
+  // would change every render on the strength of a measurement not yet made.
+  // NOT the same knob as QUEUE_CONFIG.render.workerConcurrency (renders per worker = 1,
+  // firm since task 36).
+  RENDER_MEDIA_CONCURRENCY: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.coerce
+      .number()
+      .int("RENDER_MEDIA_CONCURRENCY must be a positive integer")
+      .positive("RENDER_MEDIA_CONCURRENCY must be a positive integer")
+      .optional(),
+  ),
   RENDER_CANCEL_POLL_SECONDS: z.coerce
     .number()
     .positive("RENDER_CANCEL_POLL_SECONDS must be a positive number of seconds")
@@ -248,6 +282,26 @@ export const envSchema = z.object({
   // not defined it, and an empty optional model must mean "no fallback", not "fail boot".
   RENDER_NARRATION_MODEL: optionalModelId(),
   RENDER_MUSIC_MODEL: optionalModelId(),
+
+  // Plan row 42 — `cleanupOrphanedAssetsWorkflow`, the scheduled daily janitor.
+  //
+  // How long a FAILED/CANCELED job's S3 objects are kept before they may be swept.
+  // OPTIONAL with a 7-day default, and the default is a SAFETY property rather than a
+  // preference: the Compose `dbos` container runs this sweep nightly against the SAME app
+  // database and the SAME `supagloo-dev` bucket that the in-process e2e lanes use, and
+  // those lanes' fixtures are seconds old. Seven days puts every fixture out of reach by
+  // days. (The other half of that safety argument is structural — the schedule is armed
+  // only from `src/main.ts`, which no lane loads. See `src/dbos/scheduled-cleanup.ts`.)
+  // Session purging is NOT governed by this: sessions go strictly on `expiresAt`.
+  CLEANUP_RETENTION_HOURS: z.coerce
+    .number()
+    .positive("CLEANUP_RETENTION_HOURS must be a positive number of hours")
+    .default(CLEANUP_RETENTION_HOURS_DEFAULT),
+
+  // Plan the sweep and report it, mutate nothing. A real operator mode, not a test hook:
+  // it defaults to off, carries no `NODE_ENV` branch, and the two destructive steps are
+  // SKIPPED wholesale rather than a flag being checked inside a mutation helper.
+  CLEANUP_DRY_RUN: booleanFlag("CLEANUP_DRY_RUN"),
 });
 
 export type Env = z.infer<typeof envSchema>;

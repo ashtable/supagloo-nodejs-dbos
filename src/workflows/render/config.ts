@@ -19,6 +19,16 @@ export interface RenderConfig {
   installTimeoutMs: number;
   /** How often the long steps poll their own DBOS status for a cooperative cancel. */
   cancelPollMs: number;
+  /**
+   * Plan row 45 (§9-Q8) — `RENDER_MEDIA_CONCURRENCY`. Remotion's own frame concurrency,
+   * which defaults to the machine's CPU COUNT (one Chromium tab each). UNDEFINED means
+   * "leave Remotion's default alone": api and dbos are not deployed to Railway, so any
+   * recommended number is extrapolated from Compose and must be an operator decision
+   * rather than a shipped guess. Distinct from `QUEUE_CONFIG.render.workerConcurrency`,
+   * which is 1 and firm — that is how many RENDERS share a worker, this is how many
+   * FRAMES share a render.
+   */
+  mediaConcurrency?: number;
   /** Fallback narration model; undefined ⇒ render-time narration synthesis is disabled. */
   narrationModel?: string;
   /** Fallback music model; undefined ⇒ render-time music synthesis is disabled. */

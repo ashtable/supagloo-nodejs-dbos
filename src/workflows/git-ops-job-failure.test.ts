@@ -6,6 +6,7 @@ import { initialImportStages } from "./import-project/stages";
 import { initialCommitStages } from "./commit-version/stages";
 import { initialPublishStages } from "./publish-version/stages";
 import { NotASupaglooProjectError } from "./import-project/errors";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 /**
  * Plan row 50 item (2) — the SHARED terminal-failure record, across ALL FOUR git-ops
@@ -73,6 +74,17 @@ vi.mock("@dbos-inc/dbos-sdk", () => ({
 vi.mock("@supagloo/database-lib", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   mintInstallationToken: h.mint,
+}));
+
+vi.mock("../providers/config", () => ({
+  getProviderConfig: () => ({
+    openrouterBaseUrl: "https://openrouter.invalid",
+    glooBaseUrl: "https://gloo.invalid",
+    youversionBaseUrl: "https://youversion.invalid",
+    // Plan row 48: the mintInstallationToken step SEALS its result with this key, so a
+    // workflow body cannot run without provider config in scope.
+    secretsEncryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
+  }),
 }));
 
 vi.mock("../db/app-db", () => ({

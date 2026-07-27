@@ -33,6 +33,7 @@ import {
   type FixtureRepo,
 } from "../../src/testing/github-e2e";
 import { countStepExecutions } from "../../src/testing/step-introspection";
+import { assertCheckpointedTokensSealed } from "../../src/testing/token-leak-probe";
 
 // End-to-end proof of publishVersionWorkflow against **REAL GitHub**: api.github.com mints
 // the installation token, opens + merges the PR, and creates the release tag; github.com
@@ -121,7 +122,9 @@ const env: Env = loadEnv({
   // (finding F1: dbos was always real-by-default; only these specs pointed it at a stub).
   GITHUB_APP_ID: githubSecrets.appId,
   GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
-  // Task #29 made SECRETS_ENCRYPTION_KEY required at boot (unused by this workflow).
+  // Task #29 made SECRETS_ENCRYPTION_KEY required at boot; since plan row 48 this
+  // workflow USES it — the mintInstallationToken step seals its result with it, so this
+  // value and the probe's `encryptionKey` below must stay the same key.
   SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
@@ -426,6 +429,17 @@ describe("publishVersionWorkflow — happy path", () => {
     // (1) DURABILITY — each REST-touching step ran exactly once, attributed to THIS
     //     workflow id in the DBOS system DB.
     expect(await countStepExecutions(client, jobId, "mintInstallationToken")).toBe(1);
+
+    // PLAN ROW 48 — no plaintext installation token in any DBOS checkpoint. The probe
+    // reads the LANE schema (a default-`dbos` query from inside a lane finds zero rows
+    // and passes vacuously — brief §9 S8) and proves the mint step's checkpoint is a
+    // real ciphertext of a real token, not merely the absence of one.
+    await assertCheckpointedTokensSealed({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: jobId,
+      encryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
+    });
     expect(await countStepExecutions(client, jobId, "openPullRequest")).toBe(1);
     expect(await countStepExecutions(client, jobId, "mergePullRequestAndTag")).toBe(1);
     expect(await countStepExecutions(client, jobId, "cutNextVersionBranch")).toBe(1);

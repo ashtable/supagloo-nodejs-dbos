@@ -32,6 +32,11 @@ describe("static queue registry", () => {
     expect(Object.keys(QUEUE_CONFIG).sort()).toEqual([
       "ai-generation",
       "git-ops",
+      // Plan row 42: the fourth queue. `WORKFLOW_QUEUE` is
+      // `satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>`, so adding a workflow
+      // name WITHOUT a queue is a compile error — which is why the maintenance queue is
+      // not optional once cleanupOrphanedAssets exists.
+      "maintenance",
       "render",
     ]);
   });
@@ -40,12 +45,16 @@ describe("static queue registry", () => {
     expect(QUEUE_CONFIG["git-ops"].workerConcurrency).toBe(4);
     expect(QUEUE_CONFIG["ai-generation"].workerConcurrency).toBe(8);
     expect(QUEUE_CONFIG["render"].workerConcurrency).toBe(1);
+    // Plan row 42: one janitor at a time. Two concurrent cleanup runs would race on the
+    // same delete set in the one shared bucket for no throughput benefit.
+    expect(QUEUE_CONFIG["maintenance"].workerConcurrency).toBe(1);
   });
 });
 
 describe("static workflow registry", () => {
   it("declares the workflows built so far (git-ops four + noopProof + generateScript/Image/Audio/Video)", () => {
     expect(Object.values(WORKFLOW_NAMES).sort()).toEqual([
+      "cleanupOrphanedAssets",
       "commitVersion",
       "generateAudio",
       "generateImage",
@@ -71,6 +80,10 @@ describe("static workflow registry", () => {
     expect(WORKFLOW_QUEUE.generateVideo).toBe("ai-generation");
     // Task #36: render is the ONLY workflow on the dedicated `render` queue.
     expect(WORKFLOW_QUEUE.render).toBe("render");
+    // Plan row 42: the scheduled janitor is alone on `maintenance`. It is deliberately
+    // NOT on git-ops — a nightly bucket sweep must never occupy a slot the user-facing
+    // scaffold/commit/publish work is waiting on.
+    expect(WORKFLOW_QUEUE.cleanupOrphanedAssets).toBe("maintenance");
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
