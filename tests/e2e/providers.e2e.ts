@@ -33,6 +33,11 @@ import { resolveGlooModel, resolveTextModel } from "../../src/testing/e2e-models
 // `resolveTextModel` (cheapest structured-output-capable text model); Gloo via `resolveGlooModel`
 // (its authenticated `/platform/v2/models` catalogue).
 
+// OUT OF SCOPE for the per-lane DBOS system-schema isolation the other ten e2e specs
+// carry: this spec never calls launchDbos() and never creates a DBOSClient, so it has no
+// executor that the Compose `dbos` container could race. It loads an Env only to reach the
+// provider base URLs. Nothing was missed here.
+
 // Real-host base URLs default via the env schema; a sourced `.env` sets them to the live hosts.
 const env: Env = loadEnv({
   DATABASE_URL:

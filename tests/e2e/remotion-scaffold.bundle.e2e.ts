@@ -17,6 +17,11 @@ import {
 // (that's @remotion/renderer, out of scope). No DB/DBOS/Postgres: this runs under
 // the dedicated vitest.e2e.bundle.config.ts (no globalSetup). Non-UI → no Playwright.
 
+// OUT OF SCOPE for the per-lane DBOS system-schema isolation the other ten e2e specs
+// carry: this spec never calls launchDbos() and never creates a DBOSClient (it touches no
+// database at all), so it has no executor that the Compose `dbos` container could race.
+// Nothing was missed here.
+
 // The scaffold is written to an os-tmp dir OUTSIDE the repo tree, so webpack cannot
 // resolve `remotion`/`react` by walking up. We point resolve.modules at the dbos
 // repo's own node_modules (where the pinned deps are installed).
