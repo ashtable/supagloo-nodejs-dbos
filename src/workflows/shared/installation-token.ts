@@ -88,6 +88,39 @@ export async function mintEncryptedInstallationToken(
  * Fails LOUDLY on a wrong or rotated key (AES-GCM's auth tag makes silent garbage
  * impossible), rather than handing a broken credential to a clone URL where it would
  * surface as a confusing git auth failure three steps later.
+ *
+ * ── RESIDUAL HAZARD: `SECRETS_ENCRYPTION_KEY` ROTATION ACROSS A REPLAY ────────────────────
+ *
+ * Step-11 item 36 (R4850-6). This is a residual row 48 INTRODUCED, stated here rather than
+ * discovered later, which is this run's convention for residuals.
+ *
+ * The decrypt happens in the WORKFLOW BODY, outside any step, and the ciphertext is what
+ * `operation_outputs` holds. So if `SECRETS_ENCRYPTION_KEY` is rotated between the execution
+ * that checkpointed the ciphertext and any LATER replay of the same workflow, this call throws
+ * `SecretCryptoError { code: "AUTH_FAILED" }` on the AES-GCM auth tag — outside a step, so no
+ * step retry budget and no `shouldRetry` classifier is involved, and the workflow simply fails
+ * on every subsequent replay attempt. The three ways a replay happens in this system:
+ *
+ *   • `recoverPendingWorkflows` at worker boot (the common one — rotate the key, restart the
+ *     container, and every in-flight git-ops workflow wedges);
+ *   • an operator `DBOS.resumeWorkflow` on a workflow that was in flight before the rotation;
+ *   • `DBOS.forkWorkflow`, which the publish-version e2e itself relies on.
+ *
+ * This is GENUINELY NEW: before row 48 the step checkpointed the PLAINTEXT token, so a replay
+ * failed differently — it reused an expired ~1h token and got a GitHub 401, a transient-looking
+ * failure the step budget would burn through. Rotation was not a factor because no ciphertext
+ * was involved.
+ *
+ * **OPERATOR RECOVERY.** Do not try to re-key the checkpoint. `DBOS.forkWorkflow(workflowID,
+ * { startStep: <the mintInstallationToken step> })` re-executes the mint step under the NEW
+ * key, which both re-mints a live token and re-seals it; every step before it keeps its
+ * checkpoint, and everything after it runs against a token that opens. That is why the mint
+ * step's name and position are pinned (D50.1 / R11) — forking to it is the documented recovery
+ * path, so moving it has an operational cost beyond the `functionID` shift.
+ *
+ * Not fixed in code, deliberately: the alternatives are decrypting inside a step (which would
+ * checkpoint the plaintext again — the exact thing row 48 exists to prevent) or a
+ * multi-key/key-id envelope, which is a design change, not a review fix.
  */
 export function openInstallationToken(sealed: string): string {
   return decryptSecret(sealed, getProviderConfig().secretsEncryptionKey);

@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   AI_GENERATION_QUEUE_NAME,
+  CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
   GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
@@ -9,6 +12,7 @@ import {
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
+  MAINTENANCE_QUEUE_NAME,
   RENDER_QUEUE_NAME,
   RENDER_WORKFLOW_NAME,
   SCAFFOLD_PROJECT_WORKFLOW_NAME,
@@ -83,7 +87,7 @@ describe("static workflow registry", () => {
     // Plan row 42: the scheduled janitor is alone on `maintenance`. It is deliberately
     // NOT on git-ops — a nightly bucket sweep must never occupy a slot the user-facing
     // scaffold/commit/publish work is waiting on.
-    expect(WORKFLOW_QUEUE.cleanupOrphanedAssets).toBe("maintenance");
+    expect(WORKFLOW_QUEUE.cleanupOrphanedAssets).toBe(MAINTENANCE_QUEUE_NAME);
     for (const queue of Object.values(WORKFLOW_QUEUE)) {
       expect(Object.keys(QUEUE_CONFIG)).toContain(queue);
     }
@@ -93,6 +97,35 @@ describe("static workflow registry", () => {
   // SHARED db-lib constants (the API imports the SAME values for its enqueue lookup
   // table), so the two services can never drift. This is the "shared fixture" the API's
   // workflow-lookup unit test pins against.
+  /**
+   * Step-11 item 29 (R42-4) — row 42's two names come from db-lib TOO.
+   *
+   * Verified: the pinned db-lib exports `CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME` and
+   * `MAINTENANCE_QUEUE_NAME` from both `src/workflows.ts` and `dist/workflows.d.ts`, and its
+   * own docblock asserts that "the dbos static registry pins
+   * `WORKFLOW_NAMES.cleanupOrphanedAssets` against this exact constant". The registry
+   * hard-coded both strings instead, under a comment claiming the name "is authored LOCALLY
+   * rather than sourced from db-lib" — so db-lib documented a coupling the code did not honour,
+   * and the TDD plan recorded a false deviation note saying the constant had not shipped.
+   *
+   * These assertions are what make a literal drift fail: with the strings hard-coded, renaming
+   * either side was invisible to every test in both repos.
+   */
+  it("sources row 42's cleanup workflow name AND maintenance queue from db-lib (item 29)", () => {
+    expect(WORKFLOW_NAMES.cleanupOrphanedAssets).toBe(
+      CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME,
+    );
+    expect(WORKFLOW_QUEUE.cleanupOrphanedAssets).toBe(MAINTENANCE_QUEUE_NAME);
+    expect(Object.keys(QUEUE_CONFIG)).toContain(MAINTENANCE_QUEUE_NAME);
+    // And the registry must not carry a second, local copy of either string: an imported
+    // constant plus a hard-coded literal elsewhere is the same drift hazard with more steps.
+    const source = readFileSync(join(__dirname, "registry.ts"), "utf8");
+    expect(source).toContain("CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME");
+    expect(source).toContain("MAINTENANCE_QUEUE_NAME");
+    expect(source).not.toContain('"cleanupOrphanedAssets"');
+    expect(source).not.toContain('"maintenance"');
+  });
+
   it("sources the scaffold + import + commit + publish names + git-ops queue from the shared db-lib constants", () => {
     expect(WORKFLOW_NAMES.scaffoldProject).toBe(SCAFFOLD_PROJECT_WORKFLOW_NAME);
     expect(WORKFLOW_QUEUE.scaffoldProject).toBe(GIT_OPS_QUEUE_NAME);

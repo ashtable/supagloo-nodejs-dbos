@@ -146,8 +146,22 @@ describe("audio tracks in the generated composition (task #36)", () => {
     expect(video.match(/<Audio/g) ?? []).toHaveLength(2);
   });
 
+  it("emits <Audio> for the shelter fixture's own cached narration ref (item 15)", () => {
+    // Since Step-11 item 15 the golden subject itself carries a narration ref, so the golden
+    // `Video.tsx` is now a byte-level witness that `canonicalizeManifest` preserves it.
+    const video = fileMap(generateProjectFiles(shelterManifest)).get("src/Video.tsx") ?? "";
+    expect(video).toContain("projects/demo/narration/full.mp3");
+    expect(video.match(/<Audio/g) ?? []).toHaveLength(2);
+  });
+
   it("emits NO <Audio> when the manifest carries neither audio key", () => {
-    const noAudio = { ...shelterManifest, music: { style: "ambient" } };
+    // BOTH must be stripped now — the shelter fixture carries a narration ref of its own
+    // since Step-11 item 15, so dropping only `music` no longer means "neither".
+    const noAudio = {
+      ...shelterManifest,
+      narratorVoice: { description: shelterManifest.narratorVoice.description },
+      music: { style: "ambient" },
+    };
     const video = fileMap(generateProjectFiles(noAudio)).get("src/Video.tsx") ?? "";
     expect(video).not.toContain("<Audio");
   });
@@ -212,5 +226,70 @@ describe("supagloo.project.json round-trips ProjectManifestSchema", () => {
     const once = serializeManifest(shelterManifest);
     const twice = serializeManifest(ProjectManifestSchema.parse(JSON.parse(once)));
     expect(twice).toBe(once);
+  });
+
+  /**
+   * Step-11 item 15 (RX-4 / R4850-7) — `narratorVoice.assetKey` WAS BEING ERASED.
+   *
+   * `canonicalizeManifest` copied `music.assetKey` and silently dropped
+   * `narratorVoice.assetKey`, so every commit rewrote the manifest without the cached
+   * narration reference. The consequences are all real spend, not tidiness:
+   *
+   *   • `templates.ts:216` reads `manifest.narratorVoice.assetKey ?? null`, so the emitted
+   *     `Video.tsx` carried no narration `<Audio>` at all — a committed project's narration
+   *     was simply not in the video;
+   *   • `ensureNarrationAudio` could therefore NEVER see a cached ref, so every render of a
+   *     committed version re-synthesized narration through a live TTS provider;
+   *   • §10 R8's premise for row 45's published numbers ("use a manifest with cached audio
+   *     refs so N costs time, not money") was unsatisfiable for narration.
+   *
+   * Not a schema decision: db-lib's `VoiceDescriptorSchema` accepts the field,
+   * `schemas.test.ts:307` round-trips it, and `render/audio.ts:138` writes it back. It was a
+   * canonicalizer omission — the branch for `music` exists ten lines below.
+   */
+  it("round-trips narratorVoice.assetKey — SYMMETRICALLY with music.assetKey (item 15)", () => {
+    const withNarration = ProjectManifestSchema.parse({
+      ...shelterManifest,
+      narratorVoice: {
+        description: "Warm, reverent male narrator",
+        label: "Narrator",
+        assetKey: "projects/demo/narration/full.mp3",
+      },
+      music: { style: "ambient cinematic pads", assetKey: "projects/demo/music/bed.mp3" },
+    });
+
+    const parsed = ProjectManifestSchema.parse(
+      JSON.parse(serializeManifest(withNarration)),
+    );
+
+    expect(parsed.narratorVoice.assetKey).toBe("projects/demo/narration/full.mp3");
+    // The symmetry is the point — the same statement must hold for both audio beds.
+    expect(parsed.music?.assetKey).toBe("projects/demo/music/bed.mp3");
+    expect(parsed).toEqual(withNarration);
+  });
+
+  it("keeps an explicitly null narration assetKey as null, and omits an absent one", () => {
+    // `null` is a real value in this schema (the file header says so), and it is what
+    // `render/audio.ts` writes to mean "no cached ref"; `undefined` must stay absent so the
+    // canonical bytes do not gain a key.
+    const explicitNull = ProjectManifestSchema.parse({
+      ...shelterManifest,
+      narratorVoice: { description: "N", assetKey: null },
+    });
+    const json = JSON.parse(serializeManifest(explicitNull)) as {
+      narratorVoice: Record<string, unknown>;
+    };
+    expect("assetKey" in json.narratorVoice).toBe(true);
+    expect(json.narratorVoice.assetKey).toBeNull();
+
+    const absent = JSON.parse(
+      serializeManifest(
+        ProjectManifestSchema.parse({
+          ...shelterManifest,
+          narratorVoice: { description: "N" },
+        }),
+      ),
+    ) as { narratorVoice: Record<string, unknown> };
+    expect("assetKey" in absent.narratorVoice).toBe(false);
   });
 });

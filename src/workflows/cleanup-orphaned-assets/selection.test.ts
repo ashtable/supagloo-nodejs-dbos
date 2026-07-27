@@ -10,7 +10,6 @@ import {
   excludeReferencedKeys,
   generationAssetCandidates,
   isDeletableRenderObjectKey,
-  isExpiredSession,
   renderKeyCandidates,
   renderObjectPrefix,
   retentionCutoff,
@@ -217,22 +216,10 @@ describe("excludeReferencedKeys", () => {
   });
 });
 
-describe("isExpiredSession — sessions are SLIDING, so only expiresAt may decide", () => {
-  it("U-CL20: purges a session whose expiresAt is in the past", () => {
-    expect(
-      isExpiredSession({ expiresAt: new Date(NOW.getTime() - 1000) }, NOW),
-    ).toBe(true);
-  });
-
-  it("U-CL21: leaves a live session alone however old it is", () => {
-    // createdAt/lastUsedAt are DELIBERATELY not inputs: every authenticated request
-    // re-stamps expiresAt, so an ancient createdAt describes an active user.
-    expect(
-      isExpiredSession({ expiresAt: new Date(NOW.getTime() + 1000) }, NOW),
-    ).toBe(false);
-  });
-
-  it("U-CL22: the boundary is strict — expiresAt exactly now is NOT purged", () => {
-    expect(isExpiredSession({ expiresAt: NOW }, NOW)).toBe(false);
-  });
-});
+// U-CL20/21/22 covered `isExpiredSession`, which Step-11 item 20 (R42-5) DELETED. It had no
+// production consumer and structurally could not acquire one — `purgeExpiredSessions` selects
+// with a Prisma `where`, and a row predicate cannot build a query. Three green tests over a
+// function nothing calls read as coverage of the destructive purge's selection rule while
+// covering none of it. The rule itself is now pinned where it is actually decided:
+// `cleanup-orphaned-assets.test.ts` U-CLW4 asserts the whole `where` object (column AND the
+// instant), and U-CLW4b proves the instant is step 1's checkpointed clock under a replay.

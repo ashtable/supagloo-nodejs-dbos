@@ -35,6 +35,27 @@ describe("redactUrlCredentials", () => {
     expect(red).toContain("https://***@github.com/x.git");
   });
 
+  /**
+   * Step-11 item 19 (R4344-5) — the userinfo class used to stop at the FIRST `@`, so a
+   * password containing one leaked its tail. Reproduced exactly as measured.
+   */
+  it("redacts a password containing `@` to its END, not to its first @", () => {
+    const red = redactUrlCredentials("postgres://user:p@ssw0rdLong@db:5432/x");
+    expect(red).toBe("postgres://user:***@db:5432/x");
+    expect(red).not.toContain("ssw0rdLong");
+  });
+
+  it("keeps the widened greed LOCAL — `/` and whitespace still bound each authority", () => {
+    // This is what makes the greedy class safe: it can never run past one authority, so a
+    // second URL or a bare email address on the same line is unaffected.
+    const red = redactUrlCredentials(
+      `clone https://u1:p@1@h1/x then https://u2:p@2@h2/y — reported by dev@example.com`,
+    );
+    expect(red).toContain("https://u1:***@h1/x");
+    expect(red).toContain("https://u2:***@h2/y");
+    expect(red).toContain("dev@example.com");
+  });
+
   it("redacts EVERY occurrence and leaves credential-free URLs untouched", () => {
     const s =
       `a https://u:${SECRET}@h1/x ` +

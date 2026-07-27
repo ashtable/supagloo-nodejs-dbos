@@ -28,6 +28,19 @@ const withNarrationRef = (m: ProjectManifest): ProjectManifest => ({
   narratorVoice: { ...m.narratorVoice, assetKey: "projects/p1/assets/narr-1" },
 });
 
+/**
+ * The same fixture with NO cached narration ref.
+ *
+ * Explicit since Step-11 item 15: `shelterManifest` now carries `narratorVoice.assetKey`, so
+ * the "no ref" cases below can no longer rely on the fixture happening not to have one. That
+ * reliance was itself the shape of the defect item 15 fixed — `canonicalizeManifest` erased
+ * the field, so a narration ref was something no fixture in the repo could realistically hold.
+ */
+const withoutNarrationRef = (m: ProjectManifest): ProjectManifest => ({
+  ...m,
+  narratorVoice: { description: m.narratorVoice.description, label: m.narratorVoice.label },
+});
+
 const CONNECTED = { hasOpenRouterConnection: true } as const;
 
 describe("planAudioTrack — narration", () => {
@@ -47,7 +60,7 @@ describe("planAudioTrack — narration", () => {
   it("is `synthesize` when there is no ref but a model, script text, and a connection", () => {
     const plan = planAudioTrack({
       kind: "narration",
-      manifest: shelterManifest,
+      manifest: withoutNarrationRef(shelterManifest),
       modelId: "some-model",
       ...CONNECTED,
     });
@@ -65,7 +78,7 @@ describe("planAudioTrack — narration", () => {
   it("is `skipped` when no render narration model is configured", () => {
     const plan = planAudioTrack({
       kind: "narration",
-      manifest: shelterManifest,
+      manifest: withoutNarrationRef(shelterManifest),
       modelId: undefined,
       ...CONNECTED,
     });
@@ -75,7 +88,7 @@ describe("planAudioTrack — narration", () => {
   it("is `skipped` when the user has no OpenRouter connection", () => {
     const plan = planAudioTrack({
       kind: "narration",
-      manifest: shelterManifest,
+      manifest: withoutNarrationRef(shelterManifest),
       modelId: "some-model",
       hasOpenRouterConnection: false,
     });
@@ -139,23 +152,51 @@ describe("planAudioTrack — music", () => {
 
 describe("applyAudioPlans — the patch that makes synthesized audio reachable", () => {
   it("writes a render-local key onto the manifest ONLY for synthesized tracks", () => {
+    // Narration must have NO cached ref for this case to be about synthesis at all — since
+    // Step-11 item 15 the shelter fixture carries one, so it is stripped explicitly.
+    const subject = withoutNarrationRef(shelterManifest);
+    const narration = planAudioTrack({
+      kind: "narration",
+      manifest: subject,
+      modelId: "m",
+      ...CONNECTED,
+    });
+    const music = planAudioTrack({
+      kind: "music",
+      manifest: subject,
+      modelId: "m",
+      ...CONNECTED,
+    });
+    expect(narration.action).toBe("synthesize");
+    expect(music.action).toBe("cached");
+    const patched = applyAudioPlans(subject, { narration, music });
+
+    expect(patched.narratorVoice.assetKey).toBe(renderAudioAssetKey("narration"));
+    // music was `cached` — its existing key is left exactly as-is.
+    expect(patched.music?.assetKey).toBe("projects/demo/music/bed.mp3");
+  });
+
+  /**
+   * Step-11 item 15 (RX-4 / R4850-7) — THE POINT of the canonicalizer fix, stated as a test.
+   *
+   * With the fixture's cached narration ref preserved through a commit, `planAudioTrack`
+   * answers `cached` and the render performs NO TTS call. Before item 15,
+   * `canonicalizeManifest` erased the ref on every commit, so this could never happen for a
+   * committed version and every render of one re-synthesized narration through a live
+   * provider — real spend, per render. §10 R8's premise for row 45's published numbers
+   * ("cached audio refs so N costs time, not money") depended on exactly this.
+   */
+  it("performs NO synthesis for a manifest that round-tripped a cached narration ref", () => {
     const narration = planAudioTrack({
       kind: "narration",
       manifest: shelterManifest,
       modelId: "m",
       ...CONNECTED,
     });
-    const music = planAudioTrack({
-      kind: "music",
-      manifest: shelterManifest,
-      modelId: "m",
-      ...CONNECTED,
-    });
-    const patched = applyAudioPlans(shelterManifest, { narration, music });
-
-    expect(patched.narratorVoice.assetKey).toBe(renderAudioAssetKey("narration"));
-    // music was `cached` — its existing key is left exactly as-is.
-    expect(patched.music?.assetKey).toBe("projects/demo/music/bed.mp3");
+    expect(narration.action).toBe("cached");
+    expect(narration.action === "cached" && narration.assetKey).toBe(
+      "projects/demo/narration/full.mp3",
+    );
   });
 
   it("leaves the manifest untouched when both tracks are cached or skipped", () => {

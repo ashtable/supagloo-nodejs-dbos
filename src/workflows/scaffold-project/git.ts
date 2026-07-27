@@ -42,7 +42,21 @@ export const SCAFFOLD_COMMIT = {
  */
 export function redactUrlCredentials(text: string): string {
   return text.replace(
-    /(:\/\/)([^/@\s]*)@/g,
+    // Step-11 item 19 (R4344-5): the userinfo class is `[^/\s]*` — anything but a path
+    // separator or whitespace — and is GREEDY, so it runs to the LAST `@` before the
+    // authority. It used to be `[^/@\s]*`, which stopped at the FIRST `@` and therefore
+    // leaked the tail of any password containing one: reproduced as
+    // `postgres://user:p@ssw0rdLong@db:5432/x` → `postgres://user:***@ssw0rdLong@db:5432/x`,
+    // which is a legal and commonly-generated Postgres password.
+    //
+    // Excluding `/` and whitespace is what keeps the greed local: the match can never run
+    // past the end of one authority, so two URLs on one line, or a URL followed by an email
+    // address, still redact independently (asserted in `git.test.ts`).
+    //
+    // NOTE FOR THE api HALF: `supagloo-nodejs-api/src/logging/redact.ts` carries a
+    // byte-identical copy of this function. Nothing enforces that (R4344-7 was dropped), so
+    // keep the two in step by hand.
+    /(:\/\/)([^/\s]*)@/g,
     (_full, scheme: string, userinfo: string) => {
       const colon = userinfo.indexOf(":");
       const redacted = colon === -1 ? "***" : `${userinfo.slice(0, colon)}:***`;

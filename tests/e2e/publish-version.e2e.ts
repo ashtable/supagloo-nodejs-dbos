@@ -598,6 +598,37 @@ describe("publishVersionWorkflow — permanent failure reconciles the job row", 
     expect(stages.find((s) => s.key === "mintInstallationToken")?.state).toBe("done");
     // And nothing downstream was marked done on the way out.
     expect(stages.find((s) => s.key === "finalizeRecords")?.state).toBe("pending");
+
+    /**
+     * Step-11 item 35 (R4850-5) — the token probe's `error`-COLUMN half, finally against real
+     * data.
+     *
+     * `assertCheckpointedTokensSealed` scans both `output` and `error` for token-shaped text,
+     * but all five of its call sites (`scaffold:313`, `import:326`, `commit:376`,
+     * `publish:437`, `render:534`) sit on HAPPY paths, where every `error` column in the
+     * workflow's checkpoint rows is `NULL`. So the half that would catch item 4's leak class
+     * — an unredacted `err.message` carrying `x-access-token:ghs_…@github.com` into a
+     * checkpointed step error — was proven only by a synthetic unit row.
+     *
+     * This spec is the one place in the suite where a step genuinely FAILS and DBOS
+     * checkpoints the error, so the assertion belongs here. Its anti-vacuity conditions still
+     * hold: `mintInstallationToken` succeeded and checkpointed its ciphertext, so the probe
+     * finds a real sealed token to decrypt (checks 1, 2 and 4) — while check 3 finally reads a
+     * POPULATED `error` column. Reverting any of item 4's `redactSecretsFromText` calls turns
+     * this red.
+     *
+     * Reads the LANE schema deliberately: a default-`dbos` query from inside a lane finds zero
+     * rows and passes vacuously (brief §9 S8 / §10 R5).
+     */
+    await assertCheckpointedTokensSealed({
+      systemDatabaseUrl: env.DBOS_DATABASE_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: jobId,
+      encryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
+      // The whole point of calling it HERE: refuse to pass unless a checkpoint row really
+      // carries an error, so "the probe covers step errors" stops being an untested claim.
+      requirePopulatedErrorColumn: true,
+    });
   }, 150_000);
 });
 

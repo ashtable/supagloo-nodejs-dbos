@@ -10,6 +10,7 @@ import {
   openInstallationToken,
 } from "./shared/installation-token";
 import { markJobFailed, markJobRunning, markStageDone } from "./scaffold-project/stages";
+import { redactSecretsFromText } from "../logging/redact";
 import { retryUnlessPermanent } from "./scaffold-project/retry";
 import {
   commitBranch,
@@ -253,7 +254,12 @@ async function commitVersionFn(
             prisma,
             jobId,
             currentStage,
-            err instanceof Error ? err.message : String(err),
+            // Step-11 item 4 (R4850-3): this column is BROWSER-VISIBLE via
+            // `GET /v1/projects/:id/jobs/:jobId`, and the widened catch above records every
+            // escaping error class. `GitCommandError` self-redacts; `GithubAppError`, Prisma,
+            // Zod and anything a library throws do NOT, and a clone/push failure surfaced
+            // through one of those carries the full `x-access-token:ghs_…@github.com` remote.
+            redactSecretsFromText(err instanceof Error ? err.message : String(err)),
           );
         },
         { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },

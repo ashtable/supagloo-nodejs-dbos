@@ -355,10 +355,13 @@ async function renderInChild(
       height: composition.height,
       fps: composition.fps,
       durationInFrames: composition.durationInFrames,
-      // Plan row 45 (§9-Q8): Remotion's OWN per-frame timeout + optional frame
-      // concurrency. The child's env is scrubbed, so tuning crosses the boundary in the
-      // spec rather than through the environment.
-      timeoutInMilliseconds: cfg.mediaTimeoutMs,
+      // Plan row 45 (§9-Q8) + Step-11 item 9: the child-process kill deadline AND
+      // Remotion's own per-frame budget, which are two different numbers — passing the
+      // deadline as the per-frame budget (what row 45 first shipped) makes the per-frame
+      // budget unreachable. The child's env is scrubbed, so tuning crosses the boundary in
+      // the spec rather than through the environment.
+      mediaTimeoutMs: cfg.mediaTimeoutMs,
+      frameTimeoutMs: cfg.mediaFrameTimeoutMs,
       ...(cfg.mediaConcurrency !== undefined
         ? { concurrency: cfg.mediaConcurrency }
         : {}),

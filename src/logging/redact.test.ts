@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   __resetLogSecrets,
+  bootLogSecrets,
   redactForLog,
+  redactForLogSafe,
   redactSecretsFromText,
   registerLogSecrets,
 } from "./redact";
@@ -149,6 +151,169 @@ describe("redactForLog", () => {
   it("keeps a GithubRestError-shaped `status` readable", () => {
     const err = Object.assign(new Error("merge pull request failed: 503"), { status: 503 });
     expect(redactForLog(err)).toMatchObject({ status: 503 });
+  });
+
+  /**
+   * Step-11 item 18 (R4344-6) — a NON-STRING `message` used to make the redactor THROW.
+   *
+   * Reproduced: `redactSecretsFromText(err.message)` on an `Error` whose `message` had been
+   * reassigned to an object raised `TypeError: text.replace is not a function`. `Error.message`
+   * is a plain writable property, and libraries do reassign it (some AWS/Prisma/Zod wrappers
+   * attach a structured payload there, and `Object.assign(new Error(), {...})` is a common
+   * idiom in this very repo).
+   *
+   * In dbos the consequence is STRUCTURAL, not cosmetic. `main.ts` does
+   * `console.error(WORKER_FAILED_LOG, redactForLog(err))` — the argument is evaluated FIRST,
+   * so a throw inside the redactor suppresses the log line AND the `process.exit(1)` that
+   * follows it. `WORKER_FAILED_LOG` is grep-scraped from `docker compose logs dbos` by the
+   * nextjs render lane's `globalSetup` and treated as a hard failure signal (§0.7 / R4). So
+   * the cross-repo boot-failure signal vanished exactly when a boot failed in an unusual way,
+   * and the worker stayed up with a broken runtime instead of exiting.
+   */
+  it("does NOT throw on a non-string `message`, and still redacts it (item 18)", () => {
+    const err = Object.assign(new Error(), { message: { tok: SENTINEL } });
+    let out: unknown;
+    expect(() => {
+      out = redactForLog(err);
+    }).not.toThrow();
+    expect(out).toBeDefined();
+    expect(typeof (out as { message: unknown }).message).toBe("string");
+    expect(JSON.stringify(out)).not.toContain(SENTINEL);
+  });
+
+  it("survives every other non-string `message` shape a library might attach", () => {
+    for (const message of [undefined, null, 42, [SENTINEL], { a: { b: SENTINEL } }, true]) {
+      const err = Object.assign(new Error(), { message });
+      let out: unknown;
+      expect(() => {
+        out = redactForLog(err);
+      }, String(message)).not.toThrow();
+      expect(typeof (out as { message: unknown }).message, String(message)).toBe("string");
+      expect(JSON.stringify(out), String(message)).not.toContain(SENTINEL);
+    }
+  });
+});
+
+/**
+ * Step-11 item 18 (R4344-6), belt-and-braces half — the serializer `main.ts` calls cannot
+ * throw, because a throw there costs the cross-repo boot-failure signal AND the exit code.
+ */
+describe("redactForLogSafe", () => {
+  it("returns a payload for every throwable shape, never throwing", () => {
+    const shapes: unknown[] = [
+      new Error(`boom ${SENTINEL}`),
+      Object.assign(new Error(), { message: { tok: SENTINEL } }),
+      Object.assign(new Error(), { message: 42 }),
+      `bare string ${SENTINEL}`,
+      { token: SENTINEL },
+      undefined,
+      null,
+      // A getter that throws is the pathological case the guard exists for.
+      Object.defineProperty(new Error("x"), "message", {
+        get() {
+          throw new Error("message getter exploded");
+        },
+      }),
+    ];
+    shapes.forEach((shape, i) => {
+      // Labelled by INDEX, not `String(shape)`: the last shape's `message` getter throws, so
+      // stringifying it here would raise inside the assertion label rather than inside the
+      // thing under test.
+      const label = `shape[${i}]`;
+      let out: unknown;
+      expect(() => {
+        out = redactForLogSafe(shape);
+      }, label).not.toThrow();
+      expect(out, label).toBeDefined();
+      expect(JSON.stringify(out) ?? "", label).not.toContain(SENTINEL);
+    });
+  });
+
+  it("is indistinguishable from redactForLog on the normal path", () => {
+    const err = new Error(`clone failed for ${SENTINEL}`);
+    expect(redactForLogSafe(err)).toEqual(redactForLog(err));
+  });
+});
+
+/**
+ * Step-11 item 19 (R4344-5) — the DSN password.
+ *
+ * Reproduced: `postgres://user:p@ssw0rdLong@db:5432/x` redacted to
+ * `postgres://user:***@ssw0rdLong@db:5432/x`, because layer 1's userinfo class stopped at the
+ * FIRST `@`. Neither service registered its DSN password, so layer 2 did not catch it either
+ * — the two layers failed on the same input for two different reasons, which is why the
+ * fix is both of them.
+ */
+describe("DSN passwords (item 19)", () => {
+  const PW = "p@ssw0rdLongEnough";
+  const DBOS_DSN = `postgres://supagloo:${PW}@db:5432/supagloo_dbos`;
+  const APP_DSN = `postgres://supagloo:${PW}@db:5432/supagloo`;
+
+  const bootEnv = {
+    SECRETS_ENCRYPTION_KEY: "a".repeat(64),
+    GITHUB_APP_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----\nX\n-----END RSA PRIVATE KEY-----",
+    S3_SECRET_KEY: "s3-secret-value",
+    S3_ACCESS_KEY: "s3-access-value",
+    YOUVERSION_APP_KEY: undefined,
+    DATABASE_URL: APP_DSN,
+    DBOS_DATABASE_URL: DBOS_DSN,
+  };
+
+  it("U-RED-DSN1: layer 1 alone redacts a password containing `@` to its END, not its first @", () => {
+    // The regex half. No registration, so this is `redactUrlCredentials` on its own.
+    const out = redactSecretsFromText(DBOS_DSN);
+    expect(out).toBe("postgres://supagloo:***@db:5432/supagloo_dbos");
+    expect(out).not.toContain("ssw0rdLongEnough");
+  });
+
+  it("U-RED-DSN2: layer 1 still redacts each authority independently on a multi-URL line", () => {
+    // The greed must stay local — `/` and whitespace bound it.
+    const line =
+      `clone https://x-access-token:ghs_AAAAAAAAAAAAAAAAAAAA@github.com/a/b.git ` +
+      `then https://u:p@example.com/c reported by dev@example.com`;
+    const out = redactSecretsFromText(line);
+    expect(out).toContain("https://x-access-token:***@github.com/a/b.git");
+    expect(out).toContain("https://u:***@example.com/c");
+    // A bare email address is not URL userinfo and must be left alone.
+    expect(out).toContain("dev@example.com");
+  });
+
+  it("U-RED-DSN3: bootLogSecrets registers BOTH DSN passwords, so layer 2 catches a bare value", () => {
+    registerLogSecrets(bootLogSecrets(bootEnv));
+    // The case layer 1 structurally cannot reach: a Prisma/`pg` error that quotes the
+    // password alone, with no surrounding URL.
+    const out = redactSecretsFromText(
+      `PrismaClientInitializationError: authentication failed for user "supagloo" ` +
+        `(password: ${PW})`,
+    );
+    expect(out).not.toContain(PW);
+    expect(out).not.toContain("ssw0rdLongEnough");
+    expect(out).toContain("***");
+  });
+
+  it("U-RED-DSN4: registers the other non-shaped values too, and skips an absent one", () => {
+    registerLogSecrets(bootLogSecrets(bootEnv));
+    for (const value of [bootEnv.S3_SECRET_KEY, bootEnv.S3_ACCESS_KEY]) {
+      expect(redactSecretsFromText(`config: ${value}`)).not.toContain(value);
+    }
+    // An undefined YOUVERSION_APP_KEY must not become the string "undefined" in the set —
+    // that would redact the word "undefined" out of every log line in the process.
+    expect(redactSecretsFromText("value was undefined")).toBe("value was undefined");
+  });
+
+  it("U-RED-DSN5: a passwordless or unparseable DSN registers nothing rather than throwing", () => {
+    expect(() =>
+      registerLogSecrets(
+        bootLogSecrets({
+          ...bootEnv,
+          DATABASE_URL: "postgres://db:5432/supagloo",
+          DBOS_DATABASE_URL: "not a url at all",
+        }),
+      ),
+    ).not.toThrow();
+    expect(redactSecretsFromText("postgres://db:5432/supagloo")).toBe(
+      "postgres://db:5432/supagloo",
+    );
   });
 });
 

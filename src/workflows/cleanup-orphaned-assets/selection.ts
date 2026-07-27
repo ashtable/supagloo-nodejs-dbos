@@ -35,6 +35,32 @@ import {
 /** D42.2 — 7 days. See {@link retentionCutoff} for why the number is load-bearing. */
 export const CLEANUP_RETENTION_HOURS_DEFAULT = 168;
 
+/**
+ * D42.2's floor: the retention window may never be configured below 24 hours (Step-11
+ * item 21 / R42-6).
+ *
+ * §10 R3 states the two safety properties of this sweep are D42.1's structural fence AND
+ * this window, "neither alone sufficient". The fence keeps the SCHEDULE out of the fifteen
+ * in-process e2e lanes; the window is what keeps the Compose `dbos` container's own 03:00
+ * sweep away from the seconds-old fixtures those lanes leave in the SHARED app database and
+ * the SHARED `supagloo-dev` bucket. `z.coerce.number().positive()` accepted `0.001`, which
+ * would have made every fixture in the system deletable within four seconds of creation.
+ * 24 hours is the smallest window that puts an entire working day of fixtures out of reach.
+ */
+export const CLEANUP_RETENTION_HOURS_MIN = 24;
+
+/**
+ * `CLEANUP_MAX_ITEMS_PER_RUN`'s default (Step-11 item 12 / R42-3).
+ *
+ * The candidate set grows monotonically — a failed job whose objects never existed stays a
+ * candidate for ever — and the measured dev-DB trajectory was already 315 sequential S3
+ * LISTs inside ONE step, with a correspondingly large single `operation_outputs` checkpoint.
+ * 500 per model bounds a run at 2 × 500 LISTs worst case while comfortably exceeding the
+ * observed nightly arrival rate, so a healthy system still drains its backlog in one pass and
+ * an unhealthy one degrades into "several nights" rather than "one unbounded step".
+ */
+export const CLEANUP_MAX_ITEMS_PER_RUN_DEFAULT = 500;
+
 /** The only two job statuses whose objects are ever candidates for deletion. */
 export const ORPHAN_STATUSES = ["failed", "canceled"] as const;
 
@@ -185,13 +211,16 @@ export function excludeReferencedKeys(
 }
 
 /**
- * Is this session past its expiry?
+ * `isExpiredSession(session, now)` USED TO LIVE HERE, and was DELETED by Step-11 item 20
+ * (R42-5). It had no production consumer and could not have had one: `purgeExpiredSessions`
+ * issues a Prisma `deleteMany({ where: { expiresAt: { lt: … } } })`, and a row PREDICATE
+ * cannot build a query `where`. So its three unit tests exercised nothing that ships, while
+ * reading as coverage of the destructive purge's selection rule — the most dangerous kind of
+ * dead code, because it makes an untested line look tested.
  *
- * Sessions are SLIDING — every authenticated request re-stamps `expiresAt` — so
- * `createdAt` and `lastUsedAt` describe nothing about liveness and must never be inputs
- * here: keying on either would evict active users. STRICT comparison, matching the
- * retention boundary above.
+ * The rule it documented is REAL and still enforced, in the only place it can be: sessions are
+ * SLIDING (every authenticated request re-stamps `expiresAt`), so `createdAt`/`lastUsedAt`
+ * describe nothing about liveness and keying on either would evict active users. The purge's
+ * `where` is pinned whole — column AND shared instant — by U-CLW4/U-CLW4b in
+ * `cleanup-orphaned-assets.test.ts`.
  */
-export function isExpiredSession(session: { expiresAt: Date }, now: Date): boolean {
-  return session.expiresAt.getTime() < now.getTime();
-}

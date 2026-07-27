@@ -363,6 +363,18 @@ const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  *
  * A PERMANENT status (4xx except 429) fails fast and typed, so the step's
  * `shouldRetry: retryUnlessPermanent` does not burn its budget on a 404/401.
+ *
+ * **The `merged` gate is load-bearing (Step-11 item 2 / R4850-1).** `PUT /merge` answers
+ * `405` for TWO states with the SAME message: "already merged" (the idempotent replay
+ * this helper serves) and "not mergeable" (an OPEN PR — conflict, failing required check,
+ * branch protection). On an open PR `merge_commit_sha` is populated with GitHub's
+ * speculative **test-merge** commit under `refs/pull/N/merge`, which is NOT reachable
+ * from the base branch and is rewritten whenever the PR moves. Accepting it on `res.ok`
+ * alone would tag a release at a commit that is not on `main` and persist it as
+ * `ProjectVersion.headCommitSha` while the workflow reported success — the same green-lie
+ * class D50.2 removed the branch-tip fallback for. So the sha is accepted only when the
+ * body says the PR is merged; otherwise this throws PERMANENTLY (nothing about re-reading
+ * an unmerged PR can make it merged) and row 50's catch records a truthful failure.
  */
 async function resolveMergeCommitSha(
   cfg: GithubRestConfig,
@@ -377,7 +389,21 @@ async function resolveMergeCommitSha(
       fetchImpl(url, { headers: authHeaders(cfg.token) }),
     );
     if (res.ok) {
-      const body = (await res.json()) as { merge_commit_sha?: string | null };
+      const body = (await res.json()) as {
+        merged?: boolean | null;
+        merged_at?: string | null;
+        merge_commit_sha?: string | null;
+      };
+      // Either field alone is authoritative on real GitHub; both are read so a response
+      // carrying only one of them is still classified correctly.
+      const isMerged = body.merged === true || Boolean(body.merged_at);
+      if (!isMerged) {
+        throw new GithubRestError(
+          `pull request ${args.owner}/${args.repo}#${args.number} is NOT merged ` +
+            `(GitHub answered 405 "not mergeable"); refusing its test-merge sha`,
+          405,
+        );
+      }
       if (body.merge_commit_sha) return body.merge_commit_sha;
       // Merged, but the sha has not materialised yet — wait and re-read.
     } else if (isPermanentHttpStatus(res.status)) {
@@ -448,7 +474,10 @@ export async function mergePullRequest(
     return { merged: true, sha: await resolveMergeCommitSha(cfg, args) };
   }
   if (res.status === 405) {
-    // Already merged (idempotent replay) — read the sha the merge response cannot give us.
+    // 405 is AMBIGUOUS — "already merged" (idempotent replay) and "not mergeable" (an open
+    // PR) share the status AND the message. `resolveMergeCommitSha` re-reads the PR and
+    // resolves the ambiguity from `merged`/`merged_at`; only the merged case returns, the
+    // unmerged case throws permanently (Step-11 item 2 / R4850-1).
     return { merged: true, sha: await resolveMergeCommitSha(cfg, args) };
   }
   throw new GithubRestError(`merge pull request failed: ${res.status}`, res.status);

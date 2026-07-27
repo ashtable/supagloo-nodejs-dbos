@@ -61,6 +61,13 @@ const h = vi.hoisted(() => ({
   ensureCommitClone: vi.fn(),
   // publish
   capturePublishHead: vi.fn(),
+  projectVersionFindMany: vi.fn(),
+  // Step-11 item 13: MID-workflow seams, so a failure can be driven through a stage that is
+  // not step 1. Every case in the shared table below used to reject `mint`, which made
+  // `mintInstallationToken` the only stage key any of the four workflows ever proved.
+  materializeBaseVersion: vi.fn(),
+  commitBranch: vi.fn(),
+  cutNextBranch: vi.fn(),
 }));
 
 vi.mock("@dbos-inc/dbos-sdk", () => ({
@@ -90,7 +97,7 @@ vi.mock("../providers/config", () => ({
 vi.mock("../db/app-db", () => ({
   getAppDb: () => ({
     projectJob: { update: h.update, findUniqueOrThrow: h.findUniqueOrThrow },
-    projectVersion: { findMany: vi.fn(async () => []) },
+    projectVersion: { findMany: h.projectVersionFindMany },
   }),
 }));
 
@@ -106,7 +113,7 @@ vi.mock("./scaffold-project/workspace", async (importOriginal) => ({
   ensureClone: vi.fn(async () => {}),
   ensureBaseRef: vi.fn(async () => {}),
   ensureScaffold: h.ensureScaffold,
-  materializeBaseVersion: vi.fn(async () => ({ baseSha: "base-sha" })),
+  materializeBaseVersion: h.materializeBaseVersion,
   pushBranchFromWorkspace: vi.fn(async () => {}),
   cutWorkingBranchLocal: vi.fn(async () => ({ workingSha: "working-sha" })),
   removeWorkspace: vi.fn(async () => {}),
@@ -132,11 +139,7 @@ vi.mock("./commit-version/workspace", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   ensureCommitClone: h.ensureCommitClone,
   ensureManifestApplied: vi.fn(async () => {}),
-  commitBranch: vi.fn(async () => ({
-    committed: true,
-    headCommitSha: "commit-sha",
-    changedFiles: ["M src/scenes/A.tsx"],
-  })),
+  commitBranch: h.commitBranch,
   removeCommitWorkspace: vi.fn(async () => {}),
 }));
 vi.mock("./commit-version/finalize", () => ({
@@ -148,7 +151,7 @@ vi.mock("./publish-version/workspace", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   capturePublishHead: h.capturePublishHead,
   pushWorkingBranch: vi.fn(async () => {}),
-  cutNextBranch: vi.fn(async () => ({ headCommitSha: "next-sha" })),
+  cutNextBranch: h.cutNextBranch,
   removePublishWorkspace: vi.fn(async () => {}),
 }));
 vi.mock("./publish-version/github-rest", () => ({
@@ -253,6 +256,17 @@ beforeEach(() => {
   h.hasRemotionConfig.mockReturnValue(true);
   h.ensureCommitClone.mockResolvedValue("/tmp/commit");
   h.capturePublishHead.mockResolvedValue({ headCommitSha: "working-head" });
+  h.materializeBaseVersion.mockResolvedValue({ baseSha: "base-sha" });
+  h.commitBranch.mockResolvedValue({
+    committed: true,
+    headCommitSha: "commit-sha",
+    changedFiles: ["M src/scenes/A.tsx"],
+  });
+  h.cutNextBranch.mockResolvedValue({ headCommitSha: "next-sha" });
+  // `nextPatchVersion` needs at least one parseable semver, or publish fails at
+  // `cutNextVersionBranch` BEFORE reaching `cutNextBranch` — which would make item 13's
+  // publish case prove the wrong thing.
+  h.projectVersionFindMany.mockResolvedValue([{ semver: "0.0.1" }]);
   h.update.mockResolvedValue({});
   h.findUniqueOrThrow.mockResolvedValue({ stages: initialStages(), status: "running" });
 });
@@ -327,8 +341,116 @@ describe.each(workflows)(
 
       await expect(run()).rejects.toThrow("installation token exchange failed");
     });
+
+    /**
+     * Step-11 item 4 (R4850-3) — `ProjectJob.error` is BROWSER-VISIBLE
+     * (`GET /v1/projects/:id/jobs/:jobId`), and row 50 widened these catches to record
+     * EVERY escaping error class, not just the two that self-redact.
+     *
+     * `GitCommandError` scrubs its own `message` in `toGitCommandError`, which is why this
+     * was invisible: the failure classes row 50 newly admits — `GithubAppError`, a
+     * Prisma/Zod error, anything a library throws — do not. A clone/push failure surfaced
+     * through one of those carries the full `https://x-access-token:ghs_…@github.com/…`
+     * remote in its text, and the raw string was written straight into a column the studio
+     * renders. This run already ships `redactSecretsFromText`; it just was not applied here.
+     */
+    it("redacts a leaked installation token out of the recorded ProjectJob.error", async () => {
+      const leaky = new Error(
+        "spawn failed: unable to access " +
+          "'https://x-access-token:ghs_LEAKSENTINELa1b2c3d4e5f6@github.com/acme/psalm-91.git/': 403",
+      );
+      // Deliberately NOT a GitCommandError — that class self-redacts, and its coverage is
+      // exactly what hid this from every existing assertion.
+      expect(leaky.name).toBe("Error");
+      h.mint.mockRejectedValue(leaky);
+
+      await expect(run()).rejects.toThrow(/unable to access/);
+
+      const data = failureWrite();
+      expect(data).toBeDefined();
+      expect(data!.error).not.toContain("ghs_");
+      expect(data!.error).not.toContain("LEAKSENTINEL");
+      // Still diagnosable: the redaction replaces the credential, not the line.
+      expect(data!.error).toContain("x-access-token:***@github.com");
+      expect(data!.error).toContain("403");
+    });
   },
 );
+
+/**
+ * Step-11 item 13 (R4850-4) — STAGE CAPTURE, PROVEN PAST STEP 1.
+ *
+ * Every case in the table above drives its failure through `h.mint`, i.e. through the FIRST
+ * step of all four workflows. So `mintInstallationToken` was the only stage key any of them
+ * ever proved, and `commitVersionWorkflow` had no failure case anywhere. The consequence is
+ * a mutation that type-checks and leaves the whole suite green: reverting `at("commitAndPush")`
+ * back to `boundary("commitAndPush")` stops updating `currentStage`, so a push rejected by a
+ * branch-protection rule is recorded against `mintInstallationToken` — and wireframe 12b marks
+ * the WRONG stage failed, which is the entire user-visible point of D50.4.
+ *
+ * One mid-workflow rejection per workflow, each through a DIFFERENT seam, so the recorded
+ * stage key is load-bearing for all four:
+ *   scaffold → `materializeBaseVersion`   ⇒ stage `commitBaseVersion`
+ *   commit   → `commitBranch`             ⇒ stage `commitAndPush`
+ *   publish  → `cutNextBranch`            ⇒ stage `cutNextVersionBranch`
+ *   import   → `ensureImportClone`        ⇒ stage `cloneRepo` (already covered below)
+ */
+describe("item 13 — the recorded stage is the one that was IN FLIGHT, not step 1", () => {
+  const midFailures = [
+    {
+      name: "scaffoldProjectWorkflow",
+      seam: () => h.materializeBaseVersion,
+      stages: initialStages,
+      run: () => scaffoldProjectWorkflow(scaffoldPayload),
+      expectedStage: "commitBaseVersion",
+      message: "fatal: could not read from remote repository",
+    },
+    {
+      name: "commitVersionWorkflow",
+      seam: () => h.commitBranch,
+      stages: initialCommitStages,
+      run: () => commitVersionWorkflow(commitPayload),
+      expectedStage: "commitAndPush",
+      message: "remote: error: GH006: Protected branch update failed",
+    },
+    {
+      name: "publishVersionWorkflow",
+      seam: () => h.cutNextBranch,
+      stages: initialPublishStages,
+      run: () => publishVersionWorkflow(publishPayload),
+      expectedStage: "cutNextVersionBranch",
+      message: "fatal: a branch named 'v0.0.2' already exists",
+    },
+  ] as const;
+
+  it.each(midFailures)(
+    "$name records $expectedStage — NOT mintInstallationToken",
+    async ({ seam, stages, run, expectedStage, message }) => {
+      h.findUniqueOrThrow.mockResolvedValue({ stages: stages(), status: "running" });
+      // Step 1 SUCCEEDS here; that is the whole point.
+      seam().mockRejectedValue(new Error(message));
+
+      await expect(run()).rejects.toThrow(message.slice(0, 20));
+
+      const data = failureWrite();
+      expect(data).toBeDefined();
+      expect(data!.status).toBe("failed");
+      expect(data!.error).toContain(message);
+      expect(data!.stages.find((s) => s.key === expectedStage)?.state).toBe("failed");
+      // The mutation this kills: if `currentStage` stops advancing, step 1's key is what
+      // gets marked failed. It must NOT be — it succeeded. (It reads back as `pending`
+      // rather than `done` only because the mocked `findUniqueOrThrow` returns a fresh
+      // initial stage array; the real `markStageDone` write is a separate `update` call.)
+      expect(data!.stages.find((s) => s.key === "mintInstallationToken")?.state).not.toBe(
+        "failed",
+      );
+      // Exactly ONE stage is failed — the capture names a stage, it does not smear.
+      expect(data!.stages.filter((s) => s.state === "failed").map((s) => s.key)).toEqual([
+        expectedStage,
+      ]);
+    },
+  );
+});
 
 /**
  * D50.3's other half: widening import's catch must NOT cost the two typed CONTENT

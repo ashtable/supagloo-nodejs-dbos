@@ -1,6 +1,13 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -77,6 +84,10 @@ function scratchConsumer(
 const deps = (pkg: Record<string, unknown>): Record<string, string> =>
   pkg.dependencies as Record<string, string>;
 
+const OWN_PACKAGE_JSON = JSON.parse(
+  readFileSync(resolve(REPO_ROOT, "package.json"), "utf8"),
+) as { scripts?: Record<string, string> };
+
 beforeAll(() => {
   // If db-lib was never built, the CLI does not exist and every assertion below would be
   // measuring the wrong failure. Fail with that sentence rather than a bare ENOENT.
@@ -148,5 +159,52 @@ describe("prisma pin — CI-sim against the real check-prisma-version bin", () =
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  /**
+   * Step-11 item 24 (R4344-8) — row 44 says "BOTH repos", and until now only the api proved
+   * the half that matters.
+   *
+   * U-PIN1–U-PIN5 above prove the tool CAN fail. Nothing tied that exit code to anything dbos
+   * actually builds: adding `--ignore-scripts` to `Dockerfile:49` skips `postinstall`, so a
+   * drifted Prisma pin ships in the worker image with this entire suite green. The identical
+   * mutation on the api IS caught, by these two cases — copied here verbatim in intent, so the
+   * row's claim is true of both repos rather than one.
+   */
+  it("U-PIN-CLI-6: the exit code is genuinely wired to the build (postinstall + Dockerfile)", () => {
+    // Without this, the exit code above is ceremonial: it proves the tool can fail, not that
+    // anything fails WITH it. D44.2 — "fails the build" means `postinstall`, and the place
+    // that consumes it is the image build.
+    expect(OWN_PACKAGE_JSON.scripts?.postinstall ?? "").toContain(
+      "check-prisma-version",
+    );
+
+    const dockerfile = readFileSync(resolve(REPO_ROOT, "Dockerfile"), "utf8");
+    const installs = dockerfile
+      .split("\n")
+      .filter((l) => /^RUN\s+npm\s+(install|ci)\b/.test(l.trim()));
+    expect(installs.length).toBeGreaterThan(0);
+    for (const line of installs) {
+      // `--ignore-scripts` on THIS repo's own install would skip `postinstall` and let a
+      // drifted pin ship. The nested db-lib checkout's `npm ci` is a different line
+      // (`RUN npm --prefix supagloo-database-lib ci …`) and is not matched by the anchor
+      // above, so it stays free to carry the flag.
+      expect(line, line).not.toContain("--ignore-scripts");
+    }
+  });
+
+  it("U-PIN-CLI-7: D44.1 — no CI workflow is authored, and that is the decision", () => {
+    // current-design §5.4 item 7 and §6 both state plainly that no CI exists in any of the
+    // five repos, and design-delta §9-Q12 defers the secrets-into-CI design on purpose. This
+    // row satisfies "enforcement everywhere" through the postinstall arm §9-Q11 offers as
+    // the alternative, so the absence below is load-bearing: adding a workflow here would
+    // silently falsify two design sections a doc pass would then have to rewrite.
+    let hasWorkflows = true;
+    try {
+      accessSync(join(REPO_ROOT, ".github"), constants.F_OK);
+    } catch {
+      hasWorkflows = false;
+    }
+    expect(hasWorkflows).toBe(false);
   });
 });

@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { SecretCryptoError } from "@supagloo/database-lib";
 import { TEST_SECRETS_ENCRYPTION_KEY } from "../../testing/secrets-fixture";
 import { clearProviderConfig, setProviderConfig } from "../../providers/config";
@@ -119,5 +121,31 @@ describe("openInstallationToken", () => {
     clearProviderConfig();
 
     expect(() => openInstallationToken("anything")).toThrow(/provider config not initialized/);
+  });
+
+  /**
+   * Step-11 item 36 (R4850-6) — the KEY-ROTATION residual row 48 introduced must be STATED.
+   *
+   * U-IT6 above already proves the loudness. What it cannot show is the operational
+   * consequence: because the decrypt happens in the workflow BODY and the ciphertext is what
+   * `operation_outputs` holds, a rotation between the checkpointing execution and any later
+   * replay (`recoverPendingWorkflows`, an operator `resumeWorkflow`, or the `forkWorkflow` the
+   * publish e2e relies on) fails on the auth tag OUTSIDE any step — no retry budget, no
+   * classifier, and the workflow fails on every subsequent replay.
+   *
+   * Doc-only, so this is a PRESENCE pin, in the same spirit as U-IT6/U-IT7's loudness pins: a
+   * stated residual that a later edit silently deletes was never a residual, it was a comment.
+   */
+  it("U-IT14: the file states the key-rotation replay hazard AND its forkWorkflow recovery", () => {
+    const source = readFileSync(join(__dirname, "installation-token.ts"), "utf8");
+    // The hazard.
+    expect(source).toMatch(/SECRETS_ENCRYPTION_KEY.*ROTATION/i);
+    expect(source).toContain("recoverPendingWorkflows");
+    expect(source).toContain("resumeWorkflow");
+    // The recovery, named precisely enough to follow.
+    expect(source).toContain("forkWorkflow");
+    expect(source).toContain("mintInstallationToken");
+    // And it must not be recorded as fixed.
+    expect(source).toMatch(/Not fixed in code/i);
   });
 });

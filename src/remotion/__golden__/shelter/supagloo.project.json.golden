@@ -32,7 +32,8 @@
   ],
   "narratorVoice": {
     "description": "Warm, reverent male narrator",
-    "label": "Narrator"
+    "label": "Narrator",
+    "assetKey": "projects/demo/narration/full.mp3"
   },
   "music": {
     "style": "ambient cinematic pads",

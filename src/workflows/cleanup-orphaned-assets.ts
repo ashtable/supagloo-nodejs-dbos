@@ -91,9 +91,20 @@ async function cleanupOrphanedAssetsFn(
 
       // Status-filtered AT THE DATABASE: a succeeded render's rows never enter this
       // process, which is a stronger guarantee than filtering them out afterwards.
+      //
+      // Step-11 item 12 (R42-3) — BOUNDED, OLDEST FIRST. Without `take` the candidate set
+      // grows monotonically for ever (a failed job whose objects never existed stays a
+      // candidate every night, so nothing ever leaves the set), and the measured trajectory
+      // on the dev DB was already 134 + 181 = 315 sequential S3 LISTs inside the SINGLE
+      // step below. `orderBy: { createdAt: "asc" }` makes the cap a converging queue rather
+      // than an arbitrary slice: the oldest — i.e. the furthest past retention — go first,
+      // so consecutive nights make progress instead of re-reading the same rows.
+      // The per-run S3 LIST count is therefore bounded by 2 × maxItemsPerRun.
       const renders = await prisma.renderJob.findMany({
         where: { status: { in: [...ORPHAN_STATUSES] } },
         select: { id: true, status: true, createdAt: true, completedAt: true },
+        orderBy: { createdAt: "asc" },
+        take: cfg.maxItemsPerRun,
       });
       const generations = await prisma.aiGeneration.findMany({
         where: { status: { in: [...ORPHAN_STATUSES] } },
@@ -104,36 +115,74 @@ async function cleanupOrphanedAssetsFn(
           createdAt: true,
           completedAt: true,
         },
+        orderBy: { createdAt: "asc" },
+        take: cfg.maxItemsPerRun,
       });
 
-      // Every key a live row still points at. Read WHOLE-TABLE and unfiltered on purpose:
-      // the question is "does anything reference this key", and a `where` clause here
-      // would be a second place for the exclusion rule to be wrong.
-      const [projects, allRenders, allGenerations, gallery] = await Promise.all([
-        prisma.project.findMany({ select: { thumbnailAssetKey: true } }),
-        prisma.renderJob.findMany({
-          select: { outputAssetKey: true, thumbnailAssetKey: true },
-        }),
-        prisma.aiGeneration.findMany({ select: { resultAssetKey: true } }),
-        prisma.galleryItem.findMany({
-          select: { videoAssetKey: true, thumbnailAssetKey: true },
-        }),
-      ]);
+      const renderJobIds = selectOrphanedRenderJobs(renders, cutoff).map((r) => r.id);
+      const directCandidates = selectOrphanedGenerations(generations, cutoff).flatMap(
+        generationAssetCandidates,
+      );
 
-      const referencedKeys = [
-        ...projects.map((p) => p.thumbnailAssetKey),
-        ...allRenders.flatMap((r) => [r.outputAssetKey, r.thumbnailAssetKey]),
-        ...allGenerations.map((g) => g.resultAssetKey),
-        ...gallery.flatMap((g) => [g.videoAssetKey, g.thumbnailAssetKey]),
-      ].filter((k): k is string => typeof k === "string" && k !== "");
+      // EVERY key this run could conceivably delete, known in full right here — before any
+      // S3 call — because both candidate families have canonical, derivable key sets.
+      const candidateKeys = [
+        ...renderJobIds.flatMap((id) => renderKeyCandidates(id).map((c) => c.key)),
+        ...directCandidates.map((c) => c.key),
+      ];
+
+      // Every key a live row still points at, SCOPED TO `candidateKeys` (item 12b). This used
+      // to be four WHOLE-TABLE reads whose result was serialized into `operation_outputs` as
+      // one very large checkpoint every night. The narrowing is information-preserving rather
+      // than a weakening of the exclusion rule: the only question these reads answer is "does
+      // any live row point at one of THESE keys", and the keys are exactly the ones in scope.
+      // Note it is scoped by KEY, not by row — a GalleryItem or Project (never a cleanup
+      // candidate itself) referencing a candidate key is still found. U-CLW6/U-CLW17 hold it.
+      const referencedKeys =
+        candidateKeys.length === 0
+          ? []
+          : await (async () => {
+              const [projects, otherRenders, otherGenerations, gallery] = await Promise.all([
+                prisma.project.findMany({
+                  where: { thumbnailAssetKey: { in: candidateKeys } },
+                  select: { thumbnailAssetKey: true },
+                }),
+                prisma.renderJob.findMany({
+                  where: {
+                    OR: [
+                      { outputAssetKey: { in: candidateKeys } },
+                      { thumbnailAssetKey: { in: candidateKeys } },
+                    ],
+                  },
+                  select: { outputAssetKey: true, thumbnailAssetKey: true },
+                }),
+                prisma.aiGeneration.findMany({
+                  where: { resultAssetKey: { in: candidateKeys } },
+                  select: { resultAssetKey: true },
+                }),
+                prisma.galleryItem.findMany({
+                  where: {
+                    OR: [
+                      { videoAssetKey: { in: candidateKeys } },
+                      { thumbnailAssetKey: { in: candidateKeys } },
+                    ],
+                  },
+                  select: { videoAssetKey: true, thumbnailAssetKey: true },
+                }),
+              ]);
+              return [
+                ...projects.map((p) => p.thumbnailAssetKey),
+                ...otherRenders.flatMap((r) => [r.outputAssetKey, r.thumbnailAssetKey]),
+                ...otherGenerations.map((g) => g.resultAssetKey),
+                ...gallery.flatMap((g) => [g.videoAssetKey, g.thumbnailAssetKey]),
+              ].filter((k): k is string => typeof k === "string" && k !== "");
+            })();
 
       return {
         now: now.toISOString(),
         cutoff: cutoff.toISOString(),
-        renderJobIds: selectOrphanedRenderJobs(renders, cutoff).map((r) => r.id),
-        directCandidates: selectOrphanedGenerations(generations, cutoff).flatMap(
-          generationAssetCandidates,
-        ),
+        renderJobIds,
+        directCandidates,
         referencedKeys,
       };
     },
@@ -208,6 +257,48 @@ async function cleanupOrphanedAssetsFn(
     },
     { name: "purgeExpiredSessions" },
   );
+
+  // Step-11 item 11 (R42-2) — REPORT THE SWEEP. Not decoration: the nightly invoker is the
+  // SCHEDULER, so the result object below is returned to nobody, and root's `.env.example`
+  // documents `CLEANUP_DRY_RUN` as the rehearsal that "LOGS the exact delete set". Before
+  // this the rehearsal printed nothing at all, so an operator would see silence, conclude
+  // there were no orphans, and turn the flag off — and the next night the sweep would delete
+  // hundreds of objects unseen.
+  //
+  // Keys are NOT secrets (`renders/<id>/…`, `projects/<id>/<generationId>`), so `redactForLog`
+  // is deliberately not involved — redacting the diagnostic would defeat its only purpose.
+  //
+  // Logged from the WORKFLOW BODY, after the four steps, on purpose: it is the one place that
+  // sees the whole outcome, and DBOS re-emits body logs on replay rather than resurrecting a
+  // step's checkpointed output — so a recovered sweep says so again instead of going quiet.
+  DBOS.logger.info(
+    `cleanupOrphanedAssets: dryRun=${cfg.dryRun} now=${selection.now} ` +
+      `cutoff=${selection.cutoff} candidates=${
+        selection.renderJobIds.length + selection.directCandidates.length
+      } planned=${plannedKeys.length} deleted=${deletion.deletedKeys.length} ` +
+      `expiredSessions=${sessions.expired} sessionsPurged=${sessions.purged} ` +
+      `deleteErrors=${deletion.deleteErrors.length}`,
+  );
+  // The full list ONLY in dry run. A real 500-key sweep would otherwise bury every other
+  // line in the shared Compose stream every night, which is how log output stops being read.
+  if (cfg.dryRun && plannedKeys.length > 0) {
+    DBOS.logger.info(
+      `cleanupOrphanedAssets: DRY RUN would delete ${plannedKeys.length} object(s):\n` +
+        plannedKeys.map((k) => `  ${k}`).join("\n"),
+    );
+  }
+  // Per-key S3 failures used to be returned and read by nobody, so an `AccessDenied` bucket
+  // policy produced a SUCCESSFUL nightly no-op forever — the sweep reporting deleted=0 while
+  // the bucket grew without bound.
+  if (deletion.deleteErrors.length > 0) {
+    DBOS.logger.error(
+      `cleanupOrphanedAssets: ${deletion.deleteErrors.length} of ${plannedKeys.length} ` +
+        `delete(s) FAILED — the bucket is not being reclaimed:\n` +
+        deletion.deleteErrors
+          .map((e) => `  ${e.key ?? "(no key)"}: ${e.code ?? "?"} ${e.message ?? ""}`.trimEnd())
+          .join("\n"),
+    );
+  }
 
   return {
     dryRun: cfg.dryRun,

@@ -100,6 +100,18 @@ export interface SealedTokenProbe {
   workflowID: string;
   /** The `SECRETS_ENCRYPTION_KEY` this lane launched with. */
   encryptionKey: string;
+  /**
+   * Step-11 item 35 (R4850-5) — set on a FAILURE spec to make check (3)'s `error`-column half
+   * non-vacuous.
+   *
+   * The scan below reads `output` AND `error`, but every existing call site sits on a happy
+   * path where every `error` column is `NULL` — so the half that would catch an unredacted
+   * `err.message` carrying `x-access-token:ghs_…@github.com` into a checkpointed step error was
+   * proven only by a synthetic unit row. With this set, the probe REFUSES to pass unless at
+   * least one checkpoint row actually has a populated `error`, exactly as checks (1) and (2)
+   * refuse to pass on an empty row set.
+   */
+  requirePopulatedErrorColumn?: boolean;
 }
 
 function leakFailure(detail: string): Error {
@@ -120,6 +132,7 @@ export async function assertCheckpointedTokensSealed({
   schema,
   workflowID,
   encryptionKey,
+  requirePopulatedErrorColumn = false,
 }: SealedTokenProbe): Promise<void> {
   assertLaneSchemaName(schema);
 
@@ -148,6 +161,19 @@ export async function assertCheckpointedTokensSealed({
       throw leakFailure(
         `workflow "${workflowID}" recorded ${rows.length} checkpoint(s) in "${schema}" but none ` +
           `named "mintInstallationToken", so nothing about the token was actually inspected.`,
+      );
+    }
+
+    // (2b) Anti-vacuity for the ERROR-COLUMN half, on failure specs only (item 35). Without
+    //      it, "the probe covers checkpointed step errors" is a claim no run has tested: a
+    //      happy-path workflow has `error IS NULL` on every row, so check (3)'s error branch
+    //      never evaluates a single character.
+    if (requirePopulatedErrorColumn && !rows.some((r) => r.error !== null)) {
+      throw leakFailure(
+        `workflow "${workflowID}" recorded ${rows.length} checkpoint(s) in "${schema}" but NONE ` +
+          `with a populated \`error\` column, so this probe's error-column half would pass ` +
+          `vacuously. Call it with requirePopulatedErrorColumn only from a spec where a step ` +
+          `genuinely fails.`,
       );
     }
 

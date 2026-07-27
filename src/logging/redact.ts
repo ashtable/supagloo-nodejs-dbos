@@ -23,9 +23,14 @@ import { redactUrlCredentials } from "../workflows/scaffold-project/git";
  * a clone's `.git/config`. Redacting what we LOG changes neither. That residual is
  * documented, accepted, and outside this row's scope.
  *
- * SCOPE NOTE: this module is imported by `main.ts` (the process entry point), never from a
- * workflow or a step. `registerLogSecrets` mutates module state exactly once, before
- * `DBOS.launch()`, so no DBOS determinism rule is engaged.
+ * SCOPE NOTE: `registerLogSecrets` is called by `main.ts` (the process entry point) and
+ * nowhere else — it mutates module state exactly once, before `DBOS.launch()`, so no DBOS
+ * determinism rule is engaged. Step-11 item 4 additionally imports the PURE
+ * {@link redactSecretsFromText} into the four git-ops workflows, where it scrubs the
+ * message written to the browser-visible `ProjectJob.error`. That call sits INSIDE the
+ * `DBOS.runStep` that records the failure, and its output is checkpointed with the step, so
+ * it is a step-local read of boot-time state — not a workflow-body read of mutable module
+ * state. Keep it that way: never call `registerLogSecrets` from workflow or step code.
  */
 
 /** Registered exact secret values. Module state, written once at boot from `main.ts`. */
@@ -121,6 +126,29 @@ function scrub(value: unknown): string | undefined {
 }
 
 /**
+ * Coerce anything an `Error.message` might have been reassigned to into a string, WITHOUT
+ * losing a secret into an unscrubbed corner (Step-11 item 18).
+ *
+ * A structured message is JSON-stringified rather than `String(...)`ed, because
+ * `String({ tok: "ghs_…" })` is `"[object Object]"` — which does not throw, but silently
+ * discards the diagnostic the log line exists for. The result always goes through
+ * `redactSecretsFromText` at the call site, so serializing MORE of the payload is safe.
+ */
+function stringifyMessage(message: unknown): string {
+  if (typeof message === "string") return message;
+  if (message === undefined || message === null) return "";
+  if (typeof message === "object") {
+    try {
+      return JSON.stringify(message) ?? String(message);
+    } catch {
+      // Circular, or a throwing `toJSON`.
+      return String(message);
+    }
+  }
+  return String(message);
+}
+
+/**
  * The serializer. Turns anything throwable into a PLAIN object with every string scrubbed.
  *
  * Plain is load-bearing: an `Error` has no enumerable own properties, so handing one to a
@@ -142,7 +170,16 @@ export function redactForLog(err: unknown): RedactedError {
     };
     const out: RedactedError = {
       name: err.name,
-      message: redactSecretsFromText(err.message),
+      // Step-11 item 18 (R4344-6) — `String(...)` is load-bearing, not defensive noise.
+      // `Error.message` is a plain writable property and libraries DO reassign it to a
+      // structured payload (`Object.assign(new Error(), { message: {...} })` is a common
+      // idiom, including in this repo). Passing that straight to `redactSecretsFromText`
+      // raised `TypeError: text.replace is not a function` — and in `main.ts` the throw
+      // would take out BOTH `console.error(WORKER_FAILED_LOG, ...)` and the
+      // `process.exit(1)` after it, because the argument is evaluated first. That is the
+      // cross-repo hard-failure signal the nextjs render lane grep-scrapes (§0.7 / R4)
+      // disappearing at exactly the moment it matters.
+      message: redactSecretsFromText(stringifyMessage(err.message)),
     };
     const stack = scrub(err.stack);
     if (stack !== undefined) out.stack = stack;
@@ -163,4 +200,95 @@ export function redactForLog(err: unknown): RedactedError {
     asText = String(err);
   }
   return { name: "NonError", message: redactSecretsFromText(asText) };
+}
+
+/**
+ * {@link redactForLog} that CANNOT throw (Step-11 item 18 / R4344-6, the belt-and-braces half).
+ *
+ * `main.ts` does `console.error(WORKER_FAILED_LOG, redactForLogSafe(err))`, and the argument
+ * is evaluated before the call: a throw inside the serializer would suppress the log line AND
+ * the `process.exit(1)` that follows it, leaving a broken worker Up with no signal. That
+ * signal is scraped CROSS-REPO — the nextjs render lane's `globalSetup` greps
+ * `WORKER_FAILED_LOG` out of `docker compose logs --no-color dbos` and treats it as a hard
+ * failure (§0.7 / R4) — so losing it is another repo's lane hanging on a timeout.
+ *
+ * `stringifyMessage` already removes the ONE reproduced throw, so this is a second line of
+ * defence rather than the fix. It exists because the cost of being wrong about "the serializer
+ * can no longer throw" is a silent boot, and the cost of the guard is four lines.
+ */
+export function redactForLogSafe(err: unknown): unknown {
+  try {
+    return redactForLog(err);
+  } catch {
+    try {
+      // `String(err)` on an Error is `${name}: ${message}` and cannot throw for the reason
+      // above (it is already a string by the time the redactor sees it).
+      return redactSecretsFromText(String(err));
+    } catch {
+      return "(error payload could not be serialized)";
+    }
+  }
+}
+
+/**
+ * The exact set of values `main.ts` registers with {@link registerLogSecrets} at boot.
+ *
+ * A FUNCTION rather than an inline array in `main.ts` so it is unit-testable: `main.ts` is the
+ * process entry point (importing it launches DBOS), so anything asserted only there is
+ * asserted by reading source text.
+ *
+ * ── Step-11 item 19 (R4344-5): the DSN PASSWORDS are the addition ────────────────────────
+ *
+ * Layer 1 ({@link redactUrlCredentials}) matches URL userinfo, and its character class stops
+ * at an `@`. A Postgres password containing `@` — entirely legal, and common in generated
+ * credentials — therefore leaked its tail: `postgres://user:p@ssw0rdLong@db:5432/x` came out
+ * as `postgres://user:***@ssw0rdLong@db:5432/x`. The class has since been widened to the LAST
+ * `@` before the authority, but that alone is not a sufficient answer, because layer 1 can
+ * only ever redact what LOOKS like a URL. Registering the parsed password closes it by exact
+ * value, wherever it appears — in a Prisma error that quotes only the password, in a
+ * `pg` error's `cause` chain, in a stack frame.
+ *
+ * BOTH DSNs are registered. `DBOS_DATABASE_URL` is the one the SDK holds (and the one whose
+ * initialization errors quote it), `DATABASE_URL` is db-lib's; in Compose they share a
+ * password, and assuming that is exactly the assumption an operator changes.
+ */
+export function bootLogSecrets(env: {
+  SECRETS_ENCRYPTION_KEY: string;
+  GITHUB_APP_PRIVATE_KEY: string;
+  S3_SECRET_KEY: string;
+  S3_ACCESS_KEY: string;
+  YOUVERSION_APP_KEY?: string;
+  DATABASE_URL: string;
+  DBOS_DATABASE_URL: string;
+}): Array<string | undefined> {
+  return [
+    // The secrets with no recognisable SHAPE — a redactor cannot pattern-match an S3 secret
+    // key or a YouVersion app key, so the validated values are registered by exact match.
+    // `SECRETS_ENCRYPTION_KEY` and the App private key are shape-matched as well; registering
+    // them too costs nothing and closes the gap if a key format ever changes.
+    env.SECRETS_ENCRYPTION_KEY,
+    env.GITHUB_APP_PRIVATE_KEY,
+    env.S3_SECRET_KEY,
+    env.S3_ACCESS_KEY,
+    env.YOUVERSION_APP_KEY,
+    // Item 19: the DSN passwords, parsed. `registerLogSecrets` already ignores empty and
+    // implausibly short values, so a passwordless local DSN registers nothing.
+    dsnPassword(env.DBOS_DATABASE_URL),
+    dsnPassword(env.DATABASE_URL),
+  ];
+}
+
+/**
+ * The password out of a Postgres DSN, or `undefined` if there is none / it will not parse.
+ *
+ * Never throws: this runs at boot, immediately after `loadEnv`, and a URL the validator
+ * accepted but `new URL` rejects must not be the thing that stops redaction being armed.
+ */
+function dsnPassword(dsn: string): string | undefined {
+  try {
+    const password = new URL(dsn).password;
+    return password === "" ? undefined : decodeURIComponent(password);
+  } catch {
+    return undefined;
+  }
 }

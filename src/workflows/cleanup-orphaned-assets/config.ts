@@ -18,6 +18,16 @@ export interface CleanupConfig {
    * destructive steps.
    */
   dryRun: boolean;
+  /**
+   * `CLEANUP_MAX_ITEMS_PER_RUN` — the per-model batch cap on candidate rows (Step-11
+   * item 12 / R42-3), default
+   * {@link import("./selection").CLEANUP_MAX_ITEMS_PER_RUN_DEFAULT}.
+   *
+   * Applied as `take` on BOTH candidate queries, alongside `orderBy: { createdAt: "asc" }`,
+   * so the nightly sweep is a bounded, converging queue over the oldest orphans rather than
+   * an unbounded whole-table scan whose single step gets slower every night.
+   */
+  maxItemsPerRun: number;
 }
 
 let config: CleanupConfig | undefined;

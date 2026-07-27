@@ -51,19 +51,33 @@ describe("main.ts keeps the scraped constants in argument 0", () => {
   });
 
   it("logs WORKER_FAILED_LOG first and only REDACTS the payload", () => {
-    expect(source).toContain("console.error(WORKER_FAILED_LOG, redactForLog(err));");
+    // Step-11 item 18: the payload goes through `redactForLogSafe`, which cannot throw. The
+    // argument is evaluated BEFORE `console.error` runs, so a throwing serializer would
+    // suppress this line and the `process.exit(1)` after it — and the nextjs render lane
+    // would wait out its timeout on a marker that never arrives.
+    expect(source).toContain("console.error(WORKER_FAILED_LOG, redactForLogSafe(err));");
     // Neither label may be passed through the redactor itself.
-    expect(source).not.toMatch(/redactForLog\(\s*WORKER_/);
+    expect(source).not.toMatch(/redactForLog(?:Safe)?\(\s*WORKER_/);
     expect(source).not.toMatch(/redactSecretsFromText\(\s*WORKER_/);
   });
 
   it("routes every console.error payload through the redactor", () => {
     // The shutdown handler is the other one. A future third `console.error(…, err)` that
     // forgets the redactor fails here.
-    const rawErrorLogs = source.match(/console\.error\([^)]*\berr\b\s*\)/g) ?? [];
+    const rawErrorLogs = source.match(/console\.error\([^;]*?\berr\b\s*\)\s*\)?;?/g) ?? [];
+    expect(rawErrorLogs.length).toBeGreaterThan(0);
     for (const call of rawErrorLogs) {
-      expect(call).toContain("redactForLog(err)");
+      expect(call).toMatch(/redactForLog(?:Safe)?\(err\)/);
     }
+  });
+
+  it("uses the NON-throwing serializer on the boot-failure path specifically", () => {
+    // `redactForLog` is fine in the shutdown handler (the process is already exiting on a
+    // path nothing scrapes); the boot-failure handler is the one whose throw would cost the
+    // cross-repo signal AND the exit code, so it must be the safe variant.
+    const bootHandler = source.slice(source.indexOf("void main().catch("));
+    expect(bootHandler).toContain("redactForLogSafe(err)");
+    expect(bootHandler).toContain("process.exit(1)");
   });
 
   it("still exports both constants for the cross-repo gate to match", () => {

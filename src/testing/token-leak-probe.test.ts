@@ -74,6 +74,30 @@ describe("findTokenShapedCheckpoints", () => {
     expect(found).toHaveLength(1);
   });
 
+  /**
+   * Step-11 item 35 (R4850-5) — U-TLP5 above is the SYNTHETIC row that was, until item 35, the
+   * ONLY thing proving the error-column half. All five real call sites sat on happy paths where
+   * every `error` column is `NULL`, so on real data that branch never evaluated a character.
+   * `publish-version.e2e.ts`'s no-diff failure spec now calls the probe with
+   * `requirePopulatedErrorColumn: true`, which is the assertion that the branch is reached.
+   */
+  it("U-TLP5b: the scanner is INDIFFERENT to which column carries the token", () => {
+    const inOutput = findTokenShapedCheckpoints([
+      row({ function_name: "s", output: `{"json":"pushed ${leaky}"}` }),
+    ]);
+    const inError = findTokenShapedCheckpoints([
+      row({ function_name: "s", error: `pushed ${leaky}` }),
+    ]);
+    expect(inOutput).toHaveLength(1);
+    expect(inError).toHaveLength(1);
+    // And a row with BOTH populated is reported once, not twice.
+    expect(
+      findTokenShapedCheckpoints([
+        row({ function_name: "s", output: `{"json":"${leaky}"}`, error: `${leaky}` }),
+      ]),
+    ).toHaveLength(1);
+  });
+
   it("U-TLP6: returns nothing for an all-sealed workflow", () => {
     const sealed = encryptSecret(leaky, TEST_SECRETS_ENCRYPTION_KEY);
     expect(

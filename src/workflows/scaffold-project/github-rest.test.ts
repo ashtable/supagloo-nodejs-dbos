@@ -313,6 +313,87 @@ describe("mergePullRequest — 405 already-merged re-fetch (row 50 item 1)", () 
     // branch and reads again. That is the only correct recovery — a stale sha is not.
     expect(retryUnlessPermanent(err)).toBe(true);
   });
+
+  /**
+   * Step-11 item 2 (R4850-1) — `PUT /merge` returns **405 for two different states**:
+   * "already merged" (the idempotent replay this branch exists for) and "not mergeable"
+   * (an OPEN PR with a conflict, a failing required check, or a blocked branch
+   * protection). GitHub's message text is the same string in both cases.
+   *
+   * On an OPEN pull request `merge_commit_sha` is not the merge commit at all — it is
+   * GitHub's speculative **test-merge** commit under `refs/pull/N/merge`, which is not
+   * reachable from the base branch and disappears when the PR is updated. Returning it
+   * makes it the release tag's target and the permanently-stored
+   * `ProjectVersion.headCommitSha` while the workflow reports SUCCESS: exactly the "green
+   * lie" class D50.2 exists to forbid, one layer deeper than the fallback it removed.
+   *
+   * So the re-read must check `merged` (GitHub also sends `merged_at`), and a not-merged
+   * PR is a PERMANENT failure — row 50's widened catch then records a truthful terminal
+   * `ProjectJob.error` instead of shipping a wrong sha.
+   */
+  it("THROWS permanently on a 405 for an UNMERGED PR — never returns the test-merge sha", async () => {
+    const sleeps: number[] = [];
+    let gets = 0;
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        // Byte-identical to the already-merged 405 body: the status and the message
+        // cannot distinguish the two states, which is the whole defect.
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      gets += 1;
+      return jsonResponse(200, {
+        number: 7,
+        state: "open",
+        merged: false,
+        merged_at: null,
+        // `refs/pull/7/merge` — a real sha that is NOT on the base branch.
+        merge_commit_sha: "test-merge-sha-not-on-main",
+      });
+    }) as unknown as typeof fetch;
+
+    const err = await mergePullRequest(cfgWithSleep(fetchImpl, sleeps), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(GithubRestError);
+    expect(err.status).toBe(405);
+    expect(String(err.message)).toMatch(/not merged/i);
+    // The failure must name the PR so the recorded ProjectJob.error is actionable.
+    expect(String(err.message)).toContain("acme/empty-one#7");
+    // The poisoned value never escapes, in the message or as a return.
+    expect(String(err.message)).not.toContain("test-merge-sha-not-on-main");
+    // Permanent: re-reading an unmerged PR cannot make it merged, so burning the DBOS
+    // step budget on it only delays the truthful terminal failure.
+    expect(retryUnlessPermanent(err)).toBe(false);
+    // Fails on the FIRST read — no bounded wait, no backoff. The wait exists only for
+    // GitHub's asynchronous population of the sha on an actually-merged PR.
+    expect(gets).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
+  it("still accepts the merged-405 replay when `merged_at` is set but `merged` is absent", async () => {
+    // Defensive: the two fields are redundant on real GitHub, and keying off only one of
+    // them would turn a legitimate idempotent replay into a permanent failure.
+    const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        return jsonResponse(405, { message: "Pull Request is not mergeable" });
+      }
+      return jsonResponse(200, {
+        number: 7,
+        merged_at: "2026-07-27T00:00:00Z",
+        merge_commit_sha: "true-merge-sha",
+      });
+    }) as unknown as typeof fetch;
+
+    const res = await mergePullRequest(cfgWith(fetchImpl), {
+      owner: "acme",
+      repo: "empty-one",
+      number: 7,
+    });
+    expect(res).toEqual({ merged: true, sha: "true-merge-sha" });
+  });
 });
 
 // The retry-classification promised by the Task-17 plan: PR open / merge / repo-list

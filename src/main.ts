@@ -1,7 +1,12 @@
 import { loadEnv } from "./config/env";
 import { launchDbos, shutdownDbos } from "./dbos/runtime";
 import { WORKER_FAILED_LOG, WORKER_READY_LOG } from "./dbos/worker-log";
-import { redactForLog, registerLogSecrets } from "./logging/redact";
+import {
+  bootLogSecrets,
+  redactForLog,
+  redactForLogSafe,
+  registerLogSecrets,
+} from "./logging/redact";
 // Plan row 42 / D42.1 — THE ONLY IMPORT OF THIS MODULE, ANYWHERE. Importing it arms the
 // daily `cleanupOrphanedAssetsWorkflow` schedule (a module-load side effect). Because the
 // fifteen e2e lanes launch the runtime via `dbos/runtime.ts#launchDbos` and never load
@@ -25,17 +30,12 @@ import "./dbos/scheduled-cleanup";
  */
 async function main(): Promise<void> {
   const env = loadEnv();
-  // The secrets with no recognisable SHAPE — a redactor cannot pattern-match an S3 secret
-  // key or a YouVersion app key, so the validated values are registered by exact match.
-  // `SECRETS_ENCRYPTION_KEY` and the App private key are shape-matched as well; registering
-  // them too costs nothing and closes the gap if a key format ever changes.
-  registerLogSecrets([
-    env.SECRETS_ENCRYPTION_KEY,
-    env.GITHUB_APP_PRIVATE_KEY,
-    env.S3_SECRET_KEY,
-    env.S3_ACCESS_KEY,
-    env.YOUVERSION_APP_KEY,
-  ]);
+  // WHICH values are registered lives in `logging/redact.ts#bootLogSecrets`, so it can be
+  // unit-tested — importing this file launches the worker, so anything asserted only here is
+  // asserted by reading source text. Step-11 item 19 added the two parsed DSN passwords:
+  // layer 1's URL-userinfo redaction alone leaked the tail of a password containing `@`, and
+  // can only ever match text shaped like a URL.
+  registerLogSecrets(bootLogSecrets(env));
   await launchDbos(env);
   // The nextjs render-lane globalSetup scrapes this exact line out of
   // `docker compose logs dbos` to prove the containerised worker booted (task 62 D23),
@@ -60,6 +60,11 @@ void main().catch((err) => {
   // failure, so reformatting it breaks another repo's lane invisibly. Only the PAYLOAD is
   // redacted — and the payload is exactly where a bad `GITHUB_APP_PRIVATE_KEY` or a DSN
   // password would otherwise be printed at boot, in full, into a shared log stream.
-  console.error(WORKER_FAILED_LOG, redactForLog(err));
+  // `redactForLogSafe` CANNOT throw (item 18 / R4344-6). That matters structurally, not
+  // cosmetically: the argument is evaluated before `console.error` runs, so a throw inside the
+  // serializer would suppress BOTH this line and the `process.exit(1)` below — the worker
+  // would stay Up with a broken runtime and no signal, and the nextjs render lane would hang
+  // waiting for a marker that never arrives.
+  console.error(WORKER_FAILED_LOG, redactForLogSafe(err));
   process.exit(1);
 });

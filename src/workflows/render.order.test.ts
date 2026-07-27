@@ -124,6 +124,8 @@ vi.mock("./scaffold-project/config", () => ({
 vi.mock("./render/config", () => ({
   getRenderConfig: () => ({
     mediaTimeoutMs: 3_600_000,
+    // Step-11 item 9: Remotion's per-frame budget is now a separate, strictly-smaller knob.
+    mediaFrameTimeoutMs: 120_000,
     bundleTimeoutMs: 900_000,
     installTimeoutMs: 900_000,
     cancelPollMs: 2000,

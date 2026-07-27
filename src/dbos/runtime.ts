@@ -118,6 +118,7 @@ export async function launchDbos(env: Env): Promise<void> {
   // fallback audio models. The workflow's steps read getRenderConfig(), never process.env.
   setRenderConfig({
     mediaTimeoutMs: Math.round(env.RENDER_MEDIA_TIMEOUT_SECONDS * 1000),
+    mediaFrameTimeoutMs: env.RENDER_MEDIA_FRAME_TIMEOUT_MS,
     bundleTimeoutMs: Math.round(env.RENDER_BUNDLE_TIMEOUT_SECONDS * 1000),
     installTimeoutMs: Math.round(env.RENDER_INSTALL_TIMEOUT_SECONDS * 1000),
     cancelPollMs: Math.round(env.RENDER_CANCEL_POLL_SECONDS * 1000),
@@ -133,6 +134,7 @@ export async function launchDbos(env: Env): Promise<void> {
   setCleanupConfig({
     retentionMs: Math.round(env.CLEANUP_RETENTION_HOURS * 3_600_000),
     dryRun: env.CLEANUP_DRY_RUN,
+    maxItemsPerRun: env.CLEANUP_MAX_ITEMS_PER_RUN,
   });
 
   // `systemDatabaseSchemaName` is unset in Compose, so this forwards `undefined` and the
