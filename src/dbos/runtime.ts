@@ -116,9 +116,14 @@ export async function launchDbos(env: Env): Promise<void> {
     musicModel: env.RENDER_MUSIC_MODEL,
   });
 
+  // `systemDatabaseSchemaName` is unset in Compose, so this forwards `undefined` and the
+  // SDK's default "dbos" schema stands — the same schema the api's enqueuer writes into.
+  // The e2e lane passes a per-lane schema so an in-process runtime and the containerised
+  // worker cannot see each other's rows in either direction.
   DBOS.setConfig({
     name: DBOS_APP_NAME,
     systemDatabaseUrl: env.DBOS_DATABASE_URL,
+    systemDatabaseSchemaName: env.DBOS_SYSTEM_DATABASE_SCHEMA,
   });
   await DBOS.launch();
 

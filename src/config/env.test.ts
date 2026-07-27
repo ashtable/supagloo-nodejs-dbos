@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadEnv } from "./env";
 
 // The DBOS worker needs TWO distinct Postgres connection strings (design-delta
@@ -289,5 +291,50 @@ describe("Task #36 render env", () => {
   it("does NOT introduce REMOTION_ASSET_BASE_URL (assets resolve via staticFile, plan D1)", () => {
     const env = loadEnv(validEnv()) as Record<string, unknown>;
     expect(env.REMOTION_ASSET_BASE_URL).toBeUndefined();
+  });
+});
+
+describe("DBOS_SYSTEM_DATABASE_SCHEMA (the optional system-schema knob)", () => {
+  it("U-DBENV-DS1: DBOS_SYSTEM_DATABASE_SCHEMA is OPTIONAL — a valid env without it parses and the value is undefined", () => {
+    const env = loadEnv(validEnv());
+    // The pin that shipped behaviour is unchanged: unset ⇒ undefined ⇒ DBOS.setConfig
+    // receives `undefined` ⇒ the SDK's own default schema "dbos" stands, which is the
+    // schema the api's enqueuer (also unset) writes into.
+    expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
+
+    const set = loadEnv(
+      validEnv({ DBOS_SYSTEM_DATABASE_SCHEMA: "dbos_e2e_dbos_noop" }),
+    );
+    expect(set.DBOS_SYSTEM_DATABASE_SCHEMA).toBe("dbos_e2e_dbos_noop");
+  });
+
+  it("U-DBENV-DS2: a non-identifier DBOS_SYSTEM_DATABASE_SCHEMA is rejected with a message naming the var", () => {
+    for (const bad of ['a"b', "a;b", "a b", "Dbos", "1abc", "a-b"]) {
+      expect(
+        () => loadEnv(validEnv({ DBOS_SYSTEM_DATABASE_SCHEMA: bad })),
+        bad,
+      ).toThrow(/DBOS_SYSTEM_DATABASE_SCHEMA/);
+    }
+  });
+
+  it("U-DBENV-DS3: .env.example documents the key, ships it UNSET, and states the api↔dbos agreement rule", () => {
+    // The fifth reader of a config key is the operator, and `.env.example` is the only
+    // place they meet it. The wording here is deliberately IDENTICAL to the api's
+    // (`supagloo-nodejs-api/.env.example`, guarded by its U-ENV-DS3): the whole hazard
+    // is that the two services disagree, so the two docs must not.
+    const example = readFileSync(
+      join(__dirname, "..", "..", ".env.example"),
+      "utf8",
+    );
+
+    expect(example).toContain("DBOS_SYSTEM_DATABASE_SCHEMA");
+    // Shipped UNSET — a live value here would silently repartition a developer's stack.
+    expect(example).not.toMatch(/^DBOS_SYSTEM_DATABASE_SCHEMA=/m);
+    expect(example).toMatch(/^#\s*DBOS_SYSTEM_DATABASE_SCHEMA=/m);
+
+    const at = example.indexOf("DBOS_SYSTEM_DATABASE_SCHEMA");
+    const section = example.slice(Math.max(0, at - 1400), at + 500);
+    expect(section).toMatch(/same value/i);
+    expect(section).toMatch(/nothing polls|never polls|no worker polls/i);
   });
 });
