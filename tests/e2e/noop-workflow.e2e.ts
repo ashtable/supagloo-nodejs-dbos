@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { DBOSClient } from "@dbos-inc/dbos-sdk";
 import { createPrismaClient } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -61,7 +62,7 @@ const env: Env = loadEnv({
     "-----BEGIN RSA PRIVATE KEY-----\nnoop\n-----END RSA PRIVATE KEY-----",
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot; the noop workflow never
   // decrypts anything but launchDbos() validates env, so provide a dummy 64-hex key.
-  SECRETS_ENCRYPTION_KEY: "0".repeat(64),
+  SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // Task #32 made the S3 (writer) vars required at boot (unused by this workflow).
   S3_ENDPOINT: "http://minio:9000",
   S3_BUCKET: "supagloo-dev",

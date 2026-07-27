@@ -20,6 +20,7 @@
  * isolation story, not an accident.
  */
 import { bundle } from "@remotion/bundler";
+import { buildRenderMediaOptions } from "./media-options";
 import {
   ensureBrowser,
   makeCancelSignal,
@@ -47,6 +48,29 @@ export interface RenderSpec {
   height: number;
   fps: number;
   durationInFrames: number;
+  /**
+   * Plan row 45 (§9-Q8). The parent's child-process KILL DEADLINE, carried across the
+   * boundary only so `buildRenderMediaOptions` can enforce `frameTimeoutMs < mediaTimeoutMs`
+   * in the process that actually calls `renderMedia` (Step-11 item 9). The parent enforces
+   * its own copy of the deadline with a timer; this is not a second timeout.
+   */
+  mediaTimeoutMs: number;
+  /**
+   * Plan row 45 / Step-11 item 9. Remotion's OWN per-frame budget — a DIFFERENT quantity
+   * from the kill deadline above, and necessarily strictly below it. Without it a single
+   * wedged frame is invisible until the deadline SIGTERMs the whole child with no
+   * attribution; equal to it (what row 45 first shipped) it can never fire at all, because
+   * Remotion's clock starts only after browser launch and composition resolution. See
+   * `render/media-options.ts`.
+   */
+  frameTimeoutMs: number;
+  /**
+   * Plan row 45. Remotion resolves an unset concurrency to `round(min(8, max(1, cpus / 2)))`,
+   * and each unit is a Chromium tab holding decoded frames — the biggest unbounded memory
+   * lever here. OMITTED unless the operator sets `RENDER_MEDIA_CONCURRENCY`, so the default
+   * behaviour is unchanged until a measurement justifies a number.
+   */
+  concurrency?: number;
 }
 
 export interface StillSpec {
@@ -150,6 +174,14 @@ async function main(): Promise<void> {
       outputLocation: s.outputLocation,
       overwrite: true,
       cancelSignal,
+      // Plan row 45 (§9-Q8) — the tuned knobs, built by `render/media-options.ts` in the
+      // parent and carried across the process boundary in the spec (the child reads no
+      // configuration of its own; its env is scrubbed by design).
+      ...buildRenderMediaOptions({
+        mediaTimeoutMs: s.mediaTimeoutMs,
+        frameTimeoutMs: s.frameTimeoutMs,
+        concurrency: s.concurrency,
+      }),
       onProgress: ({ renderedFrames, encodedFrames }) => {
         // Emit only on change — the parent throttles again before it touches the DB.
         if (renderedFrames === lastReported) return;

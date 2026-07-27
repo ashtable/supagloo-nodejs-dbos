@@ -1,12 +1,16 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import {
-  mintInstallationToken,
   type CommitVersionPayload,
 } from "@supagloo/database-lib";
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getScaffoldConfig } from "./scaffold-project/config";
-import { markJobRunning, markStageDone } from "./scaffold-project/stages";
+import {
+  mintEncryptedInstallationToken,
+  openInstallationToken,
+} from "./shared/installation-token";
+import { markJobFailed, markJobRunning, markStageDone } from "./scaffold-project/stages";
+import { redactSecretsFromText } from "../logging/redact";
 import { retryUnlessPermanent } from "./scaffold-project/retry";
 import {
   commitBranch,
@@ -105,106 +109,169 @@ async function commitVersionFn(
   const prisma = getAppDb();
   const cfg = getScaffoldConfig();
 
-  // 0) markJobRunning — flip queued → running (status only, not a stage).
-  await boundary("markJobRunning");
-  await DBOS.runStep(
-    async () => {
-      await markJobRunning(prisma, jobId);
-    },
-    { name: "markJobRunning" },
-  );
-
-  // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
-  await boundary("mintInstallationToken");
-  const token = await DBOS.runStep(
-    async () => {
-      const minted = await mintInstallationToken({
-        appId: cfg.githubAppId,
-        privateKey: cfg.githubAppPrivateKey,
-        installationId: payload.installationId,
-        apiBaseUrl: cfg.githubApiBaseUrl,
-      });
-      await markStageDone(prisma, jobId, "mintInstallationToken");
-      return minted.token;
-    },
-    { name: "mintInstallationToken", ...NETWORK_RETRY },
-  );
-
-  const ctx: CommitContext = {
-    jobId,
-    cloneUrl: authenticatedCloneUrl(
-      cfg.githubGitBaseUrl,
-      payload.repoOwner,
-      payload.repoName,
-      token,
-    ),
-    branchName: payload.branchName,
-    manifest: payload.manifest,
-    message: payload.message,
+  // Which stage is in flight, for the terminal-failure record below (plan row 50 item 2 /
+  // D50.4, copied from `scaffold-project.ts`). Free: `boundary(label)` already receives
+  // EXACTLY the stage key at every step, so `at()` just remembers it on the way past. A
+  // workflow-LOCAL variable (never module state), deterministically re-derived on replay,
+  // and safe under the git-ops queue's worker_concurrency > 1.
+  let currentStage = "markJobRunning";
+  const at = async (label: string): Promise<void> => {
+    currentStage = label;
+    await boundary(label);
   };
 
-  // 2) cloneBranchShallow — depth-2 clone of the working branch into the workspace.
-  await boundary("cloneBranchShallow");
-  await DBOS.runStep(
-    async () => {
-      await ensureCommitClone(ctx);
-      await markStageDone(prisma, jobId, "cloneBranchShallow");
-    },
-    { name: "cloneBranchShallow", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+  try {
+    // 0) markJobRunning — flip queued → running (status only, not a stage).
+    await at("markJobRunning");
+    await DBOS.runStep(
+      async () => {
+        await markJobRunning(prisma, jobId);
+      },
+      { name: "markJobRunning" },
+    );
 
-  // 3) applyManifest — regenerate the manifest-derived sources (full overwrite). Self-
-  //    heals the clone first so a fresh-worker replay rebuilds the tree.
-  await boundary("applyManifest");
-  await DBOS.runStep(
-    async () => {
-      await ensureManifestApplied(ctx);
-      await markStageDone(prisma, jobId, "applyManifest");
-    },
-    { name: "applyManifest", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+    // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
+    await at("mintInstallationToken");
+    // PLAN ROW 48: the step returns the token SEALED (AES-256-GCM), because a step's
+    // return value is what DBOS checkpoints into `operation_outputs`. The body opens it
+    // in memory; body locals are never checkpointed. Step name, step count and every
+    // `functionID` are unchanged, so the `countStepExecutions === 1` durability proof and
+    // the crash/replay step counts stand. See `shared/installation-token.ts`.
+    const sealedToken = await DBOS.runStep(
+      async () => {
+        const sealed = await mintEncryptedInstallationToken({
+          appId: cfg.githubAppId,
+          privateKey: cfg.githubAppPrivateKey,
+          installationId: payload.installationId,
+          apiBaseUrl: cfg.githubApiBaseUrl,
+        });
+        await markStageDone(prisma, jobId, "mintInstallationToken");
+        return sealed;
+      },
+      { name: "mintInstallationToken", ...NETWORK_RETRY },
+    );
+    const token = openInstallationToken(sealedToken);
 
-  // 4) commitAndPush — commit (real message + jobId trailer) + push, IDEMPOTENTLY. Self-
-  //    heals (re-clone + re-apply) and recognises its own prior push, so a replay never
-  //    double-commits. Returns the durable head + change set to record.
-  await boundary("commitAndPush");
-  const outcome = await DBOS.runStep(
-    async () => {
-      const outcome = await commitBranch(ctx);
-      await markStageDone(prisma, jobId, "commitAndPush");
-      return outcome;
-    },
-    { name: "commitAndPush", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
-  );
+    const ctx: CommitContext = {
+      jobId,
+      cloneUrl: authenticatedCloneUrl(
+        cfg.githubGitBaseUrl,
+        payload.repoOwner,
+        payload.repoName,
+        token,
+      ),
+      branchName: payload.branchName,
+      manifest: payload.manifest,
+      message: payload.message,
+    };
 
-  // 5) updateVersionRecord — update the working ProjectVersion in place + finish the job.
-  await boundary("updateVersionRecord");
-  await DBOS.runStep(
-    async () => {
-      await updateCommitVersionRecord(prisma, jobId, {
-        projectId: payload.projectId,
+    // 2) cloneBranchShallow — depth-2 clone of the working branch into the workspace.
+    await at("cloneBranchShallow");
+    await DBOS.runStep(
+      async () => {
+        await ensureCommitClone(ctx);
+        await markStageDone(prisma, jobId, "cloneBranchShallow");
+      },
+      { name: "cloneBranchShallow", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
+
+    // 3) applyManifest — regenerate the manifest-derived sources (full overwrite). Self-
+    //    heals the clone first so a fresh-worker replay rebuilds the tree.
+    await at("applyManifest");
+    await DBOS.runStep(
+      async () => {
+        await ensureManifestApplied(ctx);
+        await markStageDone(prisma, jobId, "applyManifest");
+      },
+      { name: "applyManifest", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
+
+    // 4) commitAndPush — commit (real message + jobId trailer) + push, IDEMPOTENTLY. Self-
+    //    heals (re-clone + re-apply) and recognises its own prior push, so a replay never
+    //    double-commits. Returns the durable head + change set to record.
+    await at("commitAndPush");
+    const outcome = await DBOS.runStep(
+      async () => {
+        const outcome = await commitBranch(ctx);
+        await markStageDone(prisma, jobId, "commitAndPush");
+        return outcome;
+      },
+      { name: "commitAndPush", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
+    );
+
+    // 5) updateVersionRecord — update the working ProjectVersion in place + finish the job.
+    await at("updateVersionRecord");
+    await DBOS.runStep(
+      async () => {
+        await updateCommitVersionRecord(prisma, jobId, {
+          projectId: payload.projectId,
+          semver: payload.semver,
+          branchName: payload.branchName,
+          headCommitSha: outcome.headCommitSha,
+          commitMessage: payload.message,
+          changedFiles: outcome.changedFiles,
+        });
+        await removeCommitWorkspace(ctx);
+      },
+      { name: "updateVersionRecord", retriesAllowed: true, maxAttempts: 3 },
+    );
+
+    return {
+      workflowId: jobId,
+      projectId: payload.projectId,
+      committed: outcome.committed,
+      version: {
         semver: payload.semver,
         branchName: payload.branchName,
         headCommitSha: outcome.headCommitSha,
-        commitMessage: payload.message,
-        changedFiles: outcome.changedFiles,
-      });
-      await removeCommitWorkspace(ctx);
-    },
-    { name: "updateVersionRecord", retriesAllowed: true, maxAttempts: 3 },
-  );
-
-  return {
-    workflowId: jobId,
-    projectId: payload.projectId,
-    committed: outcome.committed,
-    version: {
-      semver: payload.semver,
-      branchName: payload.branchName,
-      headCommitSha: outcome.headCommitSha,
-    },
-    changedFiles: outcome.changedFiles,
-  };
+      },
+      changedFiles: outcome.changedFiles,
+    };
+  } catch (err) {
+    // Plan row 50 item (2). Until now this function had NO try/catch and no
+    // `markJobFailed` at all, so a permanent failure — a revoked installation at step 1, a
+    // push rejected by a branch-protection rule at `commitAndPush` — left
+    // `ProjectJob.status` at `"running"` with every stage `pending` forever while DBOS
+    // reported ERROR. The poller has no other source of truth (design-delta §5.1:741-746:
+    // no HTTP between api and dbos), so the user-visible face of the defect is a studio
+    // "Saving…" state that never resolves.
+    //
+    // UNGATED, exactly like scaffold's (row 63 / review finding DR4): the errors most
+    // likely to be permanent here — db-lib's `GithubAppError` from step 1, a Zod/Prisma
+    // error from `updateVersionRecord` — carry no git/HTTP type, so any classifier-gated
+    // catch reproduces the very stuck job it was written to kill. Recording unconditionally
+    // is not a guess about transience: by the time an error reaches this catch DBOS has
+    // already spent that step's retry budget and CHECKPOINTED the error, so it re-throws on
+    // every replay; and a crash — the case that IS recoverable — unwinds the process
+    // instead of running this catch. `markJobFailed` refuses to overwrite an
+    // already-`succeeded` job, which is what keeps the widened catch honest if
+    // `updateVersionRecord`'s trailing `removeCommitWorkspace` ever throws after the
+    // success write.
+    try {
+      await DBOS.runStep(
+        async () => {
+          await markJobFailed(
+            prisma,
+            jobId,
+            currentStage,
+            // Step-11 item 4 (R4850-3): this column is BROWSER-VISIBLE via
+            // `GET /v1/projects/:id/jobs/:jobId`, and the widened catch above records every
+            // escaping error class. `GitCommandError` self-redacts; `GithubAppError`, Prisma,
+            // Zod and anything a library throws do NOT, and a clone/push failure surfaced
+            // through one of those carries the full `x-access-token:ghs_…@github.com` remote.
+            redactSecretsFromText(err instanceof Error ? err.message : String(err)),
+          );
+        },
+        { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },
+      );
+    } catch {
+      // The bookkeeping write must never REPLACE the real failure. It fails when the app DB
+      // is unreachable, and (harmlessly) when the workflow was cancelled — DBOS rejects a
+      // `runStep` in a CANCELLED workflow before it records anything, so this step cannot
+      // poison the function-ID sequence a later `resumeWorkflow` replays.
+    }
+    throw err;
+  }
 }
 
 export const commitVersionWorkflow = DBOS.registerWorkflow(commitVersionFn, {

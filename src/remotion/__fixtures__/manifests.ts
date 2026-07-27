@@ -37,7 +37,16 @@ export const shelterManifest: ProjectManifest = {
       visualAssetKey: "projects/demo/scenes/scene-2.jpg",
     },
   ],
-  narratorVoice: { description: "Warm, reverent male narrator", label: "Narrator" },
+  // Step-11 item 15: the shelter fixture now carries a CACHED NARRATION REF, symmetrically
+  // with `music.assetKey`. It is the golden subject, so this is what makes
+  // `canonicalizeManifest` dropping `narratorVoice.assetKey` a byte-level golden failure
+  // rather than something only a bespoke assertion could see — and the emitted `Video.tsx`
+  // golden now shows the narration `<Audio>` that `templates.ts` derives from it.
+  narratorVoice: {
+    description: "Warm, reverent male narrator",
+    label: "Narrator",
+    assetKey: "projects/demo/narration/full.mp3",
+  },
   music: { style: "ambient cinematic pads", assetKey: "projects/demo/music/bed.mp3" },
   endCard: { headline: "Find shelter today", subtext: "Psalm 91" },
 };

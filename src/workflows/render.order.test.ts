@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { decryptSecret } from "@supagloo/database-lib";
 import { shelterManifest } from "../remotion/__fixtures__/manifests";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 /**
  * Task #36 — STEP ORDERING (plan row 36's headline unit test).
@@ -22,21 +24,36 @@ import { shelterManifest } from "../remotion/__fixtures__/manifests";
 
 const stepNames: string[] = [];
 
+/**
+ * Plan row 48: every value a step handed back — i.e. exactly what DBOS would have
+ * checkpointed into `<schema>.operation_outputs.output`. `renderWorkflow` is the FIFTH
+ * `mintInstallationToken` site (brief §9 S7 — the plan row lists four and the in-code
+ * comment claimed render had two; it has exactly one, at `render.ts:493`), so its
+ * no-plaintext-token proof lives here rather than duplicating this file's very large
+ * mock surface into the git-ops checkpoint spec.
+ */
+const stepResults: Array<{ name: string; value: unknown }> = [];
+
 vi.mock("@dbos-inc/dbos-sdk", () => ({
   DBOS: {
     workflowID: "rj-1",
     registerWorkflow: (fn: unknown) => fn,
     runStep: async (fn: () => unknown, opts: { name: string }) => {
       stepNames.push(opts.name);
-      return fn();
+      const value = await fn();
+      stepResults.push({ name: opts.name, value });
+      return value;
     },
     getWorkflowStatus: async () => ({ status: "PENDING" }),
   },
 }));
 
+/** Token-shaped, and distinctive enough that a substring match cannot be accidental. */
+const TOKEN_SENTINEL = "ghs_SUPAGLOOsentinelTOKEN0123456789abcd";
+
 vi.mock("@supagloo/database-lib", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  mintInstallationToken: vi.fn(async () => ({ token: "ghs_token" })),
+  mintInstallationToken: vi.fn(async () => ({ token: TOKEN_SENTINEL })),
 }));
 
 const fakePrisma = {
@@ -76,7 +93,7 @@ vi.mock("../db/app-db", () => ({ getAppDb: () => fakePrisma }));
 vi.mock("../providers/config", () => ({
   getProviderConfig: () => ({
     openrouterBaseUrl: "https://openrouter.invalid",
-    secretsEncryptionKey: "0".repeat(64),
+    secretsEncryptionKey: TEST_SECRETS_ENCRYPTION_KEY,
   }),
 }));
 vi.mock("../providers/credentials", () => ({
@@ -107,6 +124,8 @@ vi.mock("./scaffold-project/config", () => ({
 vi.mock("./render/config", () => ({
   getRenderConfig: () => ({
     mediaTimeoutMs: 3_600_000,
+    // Step-11 item 9: Remotion's per-frame budget is now a separate, strictly-smaller knob.
+    mediaFrameTimeoutMs: 120_000,
     bundleTimeoutMs: 900_000,
     installTimeoutMs: 900_000,
     cancelPollMs: 2000,
@@ -177,6 +196,7 @@ import { RENDER_STEP_SEQUENCE, renderWorkflow } from "./render";
 
 beforeEach(() => {
   stepNames.length = 0;
+  stepResults.length = 0;
 });
 
 describe("renderWorkflow — step ordering", () => {
@@ -236,5 +256,40 @@ describe("renderWorkflow — step ordering", () => {
     expect(result.outputAssetKey).toBe("renders/rj-1/output.mp4");
     expect(result.thumbnailAssetKey).toBe("renders/rj-1/thumb.jpg");
     expect(result.framesTotal).toBe(360);
+  });
+});
+
+/**
+ * Plan row 48 — renderWorkflow is the fifth mint site, and the one the plan row's own
+ * text got wrong twice (it lists only "workflows 17/21/22 and render", and the in-code
+ * comment at `scaffold-project.ts` claimed "render.ts x2"). Same property as the four
+ * git-ops workflows: nothing DBOS checkpoints may carry the plaintext token.
+ */
+describe("renderWorkflow — checkpointed step results carry no plaintext installation token", () => {
+  const asCheckpoint = (value: unknown): string => JSON.stringify(value ?? null);
+
+  it("U-IT12: no step's return value contains the token, or even the ghs_ prefix", async () => {
+    await renderWorkflow({ renderJobId: "rj-1" });
+
+    expect(stepResults.length).toBeGreaterThan(3);
+    for (const step of stepResults) {
+      expect(
+        asCheckpoint(step.value),
+        `step "${step.name}" checkpointed a plaintext installation token`,
+      ).not.toContain(TOKEN_SENTINEL);
+      expect(asCheckpoint(step.value), `step "${step.name}"`).not.toMatch(
+        /gh[soupr]_[A-Za-z0-9]/,
+      );
+    }
+  });
+
+  it("U-IT13: mintInstallationToken runs exactly once and its result decrypts back to the token", async () => {
+    await renderWorkflow({ renderJobId: "rj-1" });
+
+    const mints = stepResults.filter((s) => s.name === "mintInstallationToken");
+    expect(mints).toHaveLength(1);
+    expect(decryptSecret(mints[0].value as string, TEST_SECRETS_ENCRYPTION_KEY)).toBe(
+      TOKEN_SENTINEL,
+    );
   });
 });

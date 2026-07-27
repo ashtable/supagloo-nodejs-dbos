@@ -7,6 +7,7 @@ import {
   GeneratedStoryboardSchema,
 } from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -53,7 +54,7 @@ import {
 // repair) were reclassified to injected-fetch UNIT tests in task 34-E1 (§10.6); they cannot and
 // should not be scripted against a real host.
 
-const ENCRYPTION_KEY = "0".repeat(64);
+const ENCRYPTION_KEY = TEST_SECRETS_ENCRYPTION_KEY;
 
 // ISOLATION, NOT A PRECONDITION. This spec launches the REAL DBOS runtime in-process and
 // registers the REAL static workflow names on the REAL shared queues — exactly what the

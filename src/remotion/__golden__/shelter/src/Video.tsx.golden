@@ -5,13 +5,16 @@ import { getAssetUrl } from "./lib/assets";
 import { Shelter } from "./scenes/Shelter";
 import { Refuge } from "./scenes/Refuge";
 
+const narrationAssetKey = "projects/demo/narration/full.mp3";
 const musicAssetKey = "projects/demo/music/bed.mp3";
 
 export const VideoComposition = () => {
+  const narrationAssetKeySrc = getAssetUrl(narrationAssetKey);
   const musicAssetKeySrc = getAssetUrl(musicAssetKey);
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000000" }}>
+      {narrationAssetKeySrc ? <Audio src={narrationAssetKeySrc} /> : null}
       {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} /> : null}
       <Sequence name="Shelter" from={0} durationInFrames={150}>
         <Shelter />

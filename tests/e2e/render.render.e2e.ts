@@ -18,6 +18,7 @@ import {
 } from "@supagloo/database-lib";
 import { getVideoMetadata } from "@remotion/renderer";
 import { loadEnv, type Env } from "../../src/config/env";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
 import {
   assertLaneRuntimeIsolated,
@@ -44,6 +45,7 @@ import {
   type FixtureRepo,
 } from "../../src/testing/github-e2e";
 import { countStepExecutions } from "../../src/testing/step-introspection";
+import { assertCheckpointedTokensSealed } from "../../src/testing/token-leak-probe";
 import {
   __setRenderBoundaryHook,
   renderWorkspaceRoot,
@@ -88,7 +90,7 @@ import {
 
 const S3_PUBLIC = process.env.S3_PUBLIC_ENDPOINT ?? "http://localhost:9000";
 const S3_BUCKET = process.env.S3_BUCKET ?? "supagloo-dev";
-const ENCRYPTION_KEY = "0".repeat(64);
+const ENCRYPTION_KEY = TEST_SECRETS_ENCRYPTION_KEY;
 
 // Real GitHub App credentials from the root `.env` (loaded into this worker by
 // `tests/e2e/load-root-env.ts`). Fails fast, by name, if any is missing — never a
@@ -524,6 +526,17 @@ describe("renderWorkflow — happy path (real npm install, real bundle, real Chr
       await countStepExecutions(client, seeded.renderJobId, "installDependencies"),
     ).toBe(1);
     expect(await countStepExecutions(client, seeded.renderJobId, "renderMedia")).toBe(1);
+
+    // PLAN ROW 48 — no plaintext installation token in any DBOS checkpoint. The probe
+    // reads the LANE schema (a default-`dbos` query from inside a lane finds zero rows
+    // and passes vacuously — brief §9 S8) and proves the mint step's checkpoint is a
+    // real ciphertext of a real token, not merely the absence of one.
+    await assertCheckpointedTokensSealed({
+      systemDatabaseUrl: DBOS_URL,
+      schema: SYSTEM_SCHEMA,
+      workflowID: seeded.renderJobId,
+      encryptionKey: ENCRYPTION_KEY,
+    });
   });
 });
 

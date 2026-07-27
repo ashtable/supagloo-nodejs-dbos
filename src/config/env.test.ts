@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadEnv } from "./env";
+import { envSchema, loadEnv } from "./env";
+import { maxRenderConcurrency } from "../workflows/render/media-options";
+import { TEST_SECRETS_ENCRYPTION_KEY } from "../testing/secrets-fixture";
 
 // The DBOS worker needs TWO distinct Postgres connection strings (design-delta
 // §4): the APP db (`supagloo`, where workflows write domain rows via db-lib's
@@ -25,7 +27,11 @@ const GITHUB_APP = {
 // provider secrets (via db-lib's decryptSecret) inside the generation workflows.
 // Required (fail-fast at boot), a 64-hex-char value — copied verbatim from
 // supagloo-nodejs-api's loader so API and DBOS agree on the same key contract.
-const SECRETS_ENCRYPTION_KEY = "0".repeat(64);
+//
+// Plan row 43 / D43.1: this used to be `"0".repeat(64)`, which the loader now REJECTS
+// (§11.7:2309-2318's real decryption incident). One authored fixture for the whole repo —
+// see `src/testing/secrets-fixture.ts` and its structural guard.
+const SECRETS_ENCRYPTION_KEY = TEST_SECRETS_ENCRYPTION_KEY;
 
 // Task #32 S3 (writer role): required for the asset-uploading workflows.
 const S3_ENV = {
@@ -254,11 +260,16 @@ describe("Task #36 render env", () => {
         RENDER_MEDIA_TIMEOUT_SECONDS: "120",
         RENDER_BUNDLE_TIMEOUT_SECONDS: "60",
         RENDER_INSTALL_TIMEOUT_SECONDS: "45",
+        // Step-11 item 9: a 120 s kill deadline is BELOW the 120 000 ms default per-frame
+        // budget, and that combination is now a boot refusal (see U-DBENV-FT4). Lowered here
+        // so this case keeps testing coercion rather than the new invariant.
+        RENDER_MEDIA_FRAME_TIMEOUT_MS: "30000",
       }),
     );
     expect(env.RENDER_MEDIA_TIMEOUT_SECONDS).toBe(120);
     expect(env.RENDER_BUNDLE_TIMEOUT_SECONDS).toBe(60);
     expect(env.RENDER_INSTALL_TIMEOUT_SECONDS).toBe(45);
+    expect(env.RENDER_MEDIA_FRAME_TIMEOUT_MS).toBe(30_000);
   });
 
   it("rejects a non-positive timeout", () => {
@@ -291,6 +302,191 @@ describe("Task #36 render env", () => {
   it("does NOT introduce REMOTION_ASSET_BASE_URL (assets resolve via staticFile, plan D1)", () => {
     const env = loadEnv(validEnv()) as Record<string, unknown>;
     expect(env.REMOTION_ASSET_BASE_URL).toBeUndefined();
+  });
+});
+
+/**
+ * Step-11 item 9 (R45-1) — `RENDER_MEDIA_FRAME_TIMEOUT_MS`, and the invariant that makes it
+ * mean anything.
+ *
+ * Row 45 passed the child-process KILL DEADLINE as Remotion's per-frame budget, so the
+ * per-frame budget could never fire (Remotion's clock starts after browser launch and
+ * composition resolution, +3 000 ms on `waitForReady`; the parent's SIGTERM always wins).
+ * The two are now separate knobs, and the boot refuses any configuration where the per-frame
+ * budget is not STRICTLY BELOW the deadline — because the alternative enforcement point,
+ * `buildRenderMediaOptions`, runs in the render child at the LAST step of the workflow, after
+ * the clone, the `npm ci` and the bundle.
+ */
+describe("plan row 45 / item 9 — RENDER_MEDIA_FRAME_TIMEOUT_MS", () => {
+  it("U-DBENV-FT1: defaults to 120 000 ms — docs/render-sizing.md §3.4's recommendation", () => {
+    expect(loadEnv(validEnv()).RENDER_MEDIA_FRAME_TIMEOUT_MS).toBe(120_000);
+  });
+
+  it("U-DBENV-FT2: the default is STRICTLY BELOW the default kill deadline", () => {
+    const env = loadEnv(validEnv());
+    expect(env.RENDER_MEDIA_FRAME_TIMEOUT_MS).toBeLessThan(
+      env.RENDER_MEDIA_TIMEOUT_SECONDS * 1000,
+    );
+  });
+
+  it("U-DBENV-FT3: coerces a string override and rejects a non-positive one", () => {
+    expect(
+      loadEnv(validEnv({ RENDER_MEDIA_FRAME_TIMEOUT_MS: "45000" }))
+        .RENDER_MEDIA_FRAME_TIMEOUT_MS,
+    ).toBe(45_000);
+    expect(() =>
+      loadEnv(validEnv({ RENDER_MEDIA_FRAME_TIMEOUT_MS: "0" })),
+    ).toThrow(/RENDER_MEDIA_FRAME_TIMEOUT_MS/);
+  });
+
+  it("U-DBENV-FT4: REFUSES TO BOOT when the frame budget is not below the kill deadline", () => {
+    // The exact shape row 45 shipped: frame budget == kill deadline.
+    const err = (() => {
+      try {
+        loadEnv(
+          validEnv({
+            RENDER_MEDIA_TIMEOUT_SECONDS: "3600",
+            RENDER_MEDIA_FRAME_TIMEOUT_MS: "3600000",
+          }),
+        );
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("RENDER_MEDIA_FRAME_TIMEOUT_MS");
+    expect(err!.message).toMatch(/strictly below/i);
+    expect(err!.message).toContain("src/config/env.ts");
+    // And above it, too.
+    expect(() =>
+      loadEnv(
+        validEnv({
+          RENDER_MEDIA_TIMEOUT_SECONDS: "60",
+          RENDER_MEDIA_FRAME_TIMEOUT_MS: "120000",
+        }),
+      ),
+    ).toThrow(/RENDER_MEDIA_FRAME_TIMEOUT_MS/);
+    // A shorter deadline is fine as long as the inequality holds.
+    expect(() =>
+      loadEnv(
+        validEnv({
+          RENDER_MEDIA_TIMEOUT_SECONDS: "300",
+          RENDER_MEDIA_FRAME_TIMEOUT_MS: "120000",
+        }),
+      ),
+    ).not.toThrow();
+  });
+});
+
+/**
+ * Step-11 item 31 (R45-5) — `RENDER_MEDIA_CONCURRENCY` is range-checked AT BOOT.
+ *
+ * Remotion's `resolveConcurrency` THROWS `Maximum for --concurrency is <n> (number of cores
+ * on this system)` for any value above the CPU count it sees. That throw lands at the LAST
+ * step of the render workflow — after the clone, the `npm ci` and the bundle — so a single
+ * mistyped digit burns an entire render, every render, with nothing complaining at boot.
+ *
+ * The bound is read from Remotion itself (`RenderInternals.getMaxConcurrency()`, via
+ * `render/media-options.ts#maxRenderConcurrency`) rather than recomputed here, so it cannot
+ * drift from the value that actually throws — and so this assertion is machine-independent.
+ */
+describe("plan row 45 / item 31 — RENDER_MEDIA_CONCURRENCY range check", () => {
+  it("U-DBENV-RC1: stays optional and undefined when unset (Remotion's own default stands)", () => {
+    expect(loadEnv(validEnv()).RENDER_MEDIA_CONCURRENCY).toBeUndefined();
+    expect(
+      loadEnv(validEnv({ RENDER_MEDIA_CONCURRENCY: "" })).RENDER_MEDIA_CONCURRENCY,
+    ).toBeUndefined();
+  });
+
+  it("U-DBENV-RC2: accepts exactly the CPU count Remotion would accept", () => {
+    const max = maxRenderConcurrency();
+    expect(
+      loadEnv(validEnv({ RENDER_MEDIA_CONCURRENCY: String(max) }))
+        .RENDER_MEDIA_CONCURRENCY,
+    ).toBe(max);
+  });
+
+  it("U-DBENV-RC3: REFUSES TO BOOT one above the CPU count, naming the bound", () => {
+    const max = maxRenderConcurrency();
+    const err = (() => {
+      try {
+        loadEnv(validEnv({ RENDER_MEDIA_CONCURRENCY: String(max + 1) }));
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("RENDER_MEDIA_CONCURRENCY");
+    expect(err!.message).toContain(String(max));
+    expect(err!.message).toContain("src/config/env.ts");
+  });
+
+  it("U-DBENV-RC4: the bound is Remotion's own, so it cannot drift from the value that throws", () => {
+    const max = maxRenderConcurrency();
+    // `resolveConcurrency` is the function that fails a render; assert the boot check and it
+    // agree on the boundary rather than trusting two independently-written formulas.
+    const { RenderInternals } = require("@remotion/renderer") as typeof import("@remotion/renderer");
+    expect(() => RenderInternals.resolveConcurrency(max)).not.toThrow();
+    expect(() => RenderInternals.resolveConcurrency(max + 1)).toThrow(
+      /Maximum for --concurrency/,
+    );
+  });
+});
+
+/**
+ * Step-11 items 21 (R42-6) and 12 (R42-3) — the two `CLEANUP_*` numbers that are SAFETY
+ * properties rather than preferences.
+ */
+describe("plan row 42 — cleanup env floors and caps", () => {
+  it("U-DBENV-CL1: CLEANUP_RETENTION_HOURS defaults to 168 (7 days) and CLEANUP_DRY_RUN to off", () => {
+    const env = loadEnv(validEnv());
+    expect(env.CLEANUP_RETENTION_HOURS).toBe(168);
+    expect(env.CLEANUP_DRY_RUN).toBe(false);
+  });
+
+  it("U-DBENV-CL2: REJECTS a retention window below 24 hours — the window is a safety property", () => {
+    // §10 R3: the two safety properties are D42.1's structural fence AND this window,
+    // "neither alone sufficient". `positive()` alone accepted 0.001 h — 3.6 seconds — which
+    // would make every e2e fixture in the SHARED bucket and SHARED app DB deletable by the
+    // Compose container's own 03:00 sweep almost immediately after creation.
+    for (const bad of ["0.001", "1", "23", "23.99"]) {
+      const err = (() => {
+        try {
+          loadEnv(validEnv({ CLEANUP_RETENTION_HOURS: bad }));
+          return undefined;
+        } catch (e) {
+          return e as Error;
+        }
+      })();
+      expect(err, bad).toBeDefined();
+      expect(err!.message, bad).toContain("CLEANUP_RETENTION_HOURS must be at least 24");
+      // The message must send the reader to the fence, not just state a number.
+      expect(err!.message, bad).toContain("scheduled-cleanup");
+    }
+  });
+
+  it("U-DBENV-CL3: accepts exactly 24 and anything above it", () => {
+    expect(loadEnv(validEnv({ CLEANUP_RETENTION_HOURS: "24" })).CLEANUP_RETENTION_HOURS).toBe(24);
+    expect(loadEnv(validEnv({ CLEANUP_RETENTION_HOURS: "720" })).CLEANUP_RETENTION_HOURS).toBe(720);
+  });
+
+  it("U-DBENV-CL4: CLEANUP_MAX_ITEMS_PER_RUN defaults to 500 and must be a positive integer", () => {
+    expect(loadEnv(validEnv()).CLEANUP_MAX_ITEMS_PER_RUN).toBe(500);
+    expect(
+      loadEnv(validEnv({ CLEANUP_MAX_ITEMS_PER_RUN: "50" })).CLEANUP_MAX_ITEMS_PER_RUN,
+    ).toBe(50);
+    expect(() => loadEnv(validEnv({ CLEANUP_MAX_ITEMS_PER_RUN: "0" }))).toThrow(
+      /CLEANUP_MAX_ITEMS_PER_RUN/,
+    );
+    expect(() => loadEnv(validEnv({ CLEANUP_MAX_ITEMS_PER_RUN: "1.5" }))).toThrow(
+      /CLEANUP_MAX_ITEMS_PER_RUN/,
+    );
+    // Compose substitutes `${VAR:-}` to "" when the operator has not set it.
+    expect(
+      loadEnv(validEnv({ CLEANUP_MAX_ITEMS_PER_RUN: "" })).CLEANUP_MAX_ITEMS_PER_RUN,
+    ).toBe(500);
   });
 });
 
@@ -336,5 +532,191 @@ describe("DBOS_SYSTEM_DATABASE_SCHEMA (the optional system-schema knob)", () => 
     const section = example.slice(Math.max(0, at - 1400), at + 500);
     expect(section).toMatch(/same value/i);
     expect(section).toMatch(/nothing polls|never polls|no worker polls/i);
+  });
+});
+
+// ---------------------------------------------------------------------- plan row 43
+// Secrets/env BOOT HARDENING, dbos half (design-delta §2.10; brief §2).
+//
+// Two of the row's three claims were already true here and are pinned, not rebuilt:
+// `SECRETS_ENCRYPTION_KEY` length/presence has been enforced since task 29 (brief finding
+// S4), and "distinct-per-env" does NOT mean per-SERVICE distinct — api and dbos must carry
+// the IDENTICAL key within an environment or `decryptSecret` fails (brief finding S5,
+// design-delta §11.7:2309-2318, root `compose-config.test.ts` PART V invariant 5). What is
+// NEW: the all-zeros key is rejected in-process, and every error names the FILE as well as
+// the variable.
+//
+// The obvious weak-key gate — reject the well-known dev key when `NODE_ENV === "production"`
+// — is deliberately NOT used (D43.1). `docker-compose.yml` pins `NODE_ENV: production` on
+// BOTH api and dbos and hardcodes the dev key, so that gate would refuse to boot the shipped
+// stack in every lane. The "distinct per environment" half is enforced structurally in root,
+// over Compose and `.env.example`, where it can actually be seen.
+describe("plan row 43 — SECRETS_ENCRYPTION_KEY weak-key rejection", () => {
+  it("U-DBENV-R43-1: rejects the all-zeros key, naming the variable AND the file", () => {
+    const err = (() => {
+      try {
+        loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "0".repeat(64) }));
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("SECRETS_ENCRYPTION_KEY");
+    // design-delta §8:1414-1418 / §11.3:2034-2042 / §11.8:2392-2396: the operator must be
+    // told WHICH variable and WHERE it is read, not just that "the environment is invalid".
+    expect(err!.message).toContain("src/config/env.ts");
+    // The remedy is the same string the length check already recommends.
+    expect(err!.message).toContain("openssl rand -hex 32");
+  });
+
+  it("U-DBENV-R43-2: rejects all-zeros in EITHER hex case, and accepts a real 64-hex key", () => {
+    expect(() => loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: "0".repeat(64) }))).toThrow();
+    // Not a case-sensitivity trap: "0" has no case. What must NOT happen is a
+    // near-miss being rejected — only the literal placeholder is refused.
+    const almost = "0".repeat(63) + "1";
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: almost })).SECRETS_ENCRYPTION_KEY).toBe(
+      almost,
+    );
+    expect(
+      loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY }))
+        .SECRETS_ENCRYPTION_KEY,
+    ).toBe(TEST_SECRETS_ENCRYPTION_KEY);
+  });
+
+  it("U-DBENV-R43-3: the Compose dev key still boots — the weak-key gate is not NODE_ENV-gated", () => {
+    // `docker-compose.yml:87`/`:134` hardcode exactly this value for api AND dbos, with
+    // `NODE_ENV: production`. A production-gated rejection would break the `dbos` container
+    // in all fourteen lanes; this test is the standing proof that it does not.
+    const devKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    for (const nodeEnv of ["development", "test", "production"] as const) {
+      const env = loadEnv(
+        validEnv({ SECRETS_ENCRYPTION_KEY: devKey, NODE_ENV: nodeEnv }),
+      );
+      expect(env.SECRETS_ENCRYPTION_KEY).toBe(devKey);
+    }
+  });
+
+  it("U-DBENV-R43-4: api and dbos take the SAME key — no per-service-distinct rule exists here", () => {
+    // Brief finding S5. Encryption is symmetric across the two services: the api encrypts a
+    // user's provider credential and this worker decrypts it. A validator that demanded a
+    // dbos-specific key would break decryption in production and turn root's PART V
+    // invariant 5 red. The absence of such a rule is the assertion.
+    const shared = TEST_SECRETS_ENCRYPTION_KEY;
+    expect(loadEnv(validEnv({ SECRETS_ENCRYPTION_KEY: shared })).SECRETS_ENCRYPTION_KEY).toBe(
+      shared,
+    );
+  });
+});
+
+// The row's Unit column asks for "validator matrices per service" — plural, because the
+// three services' required sets are DELIBERATELY different (brief §2.2 constraint 6). This
+// is dbos's matrix. Required-ness tiers are asserted as they are, not normalised: promoting
+// an optional key to required would falsify current-design §5.3 and break every Compose file.
+describe("plan row 43 — dbos required-variable matrix", () => {
+  const REQUIRED = [
+    "DATABASE_URL",
+    "DBOS_DATABASE_URL",
+    "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY",
+    "SECRETS_ENCRYPTION_KEY",
+    "S3_ENDPOINT",
+    "S3_BUCKET",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+  ] as const;
+
+  it.each(REQUIRED)(
+    "U-DBENV-R43-M: a missing %s refuses to boot, naming the variable and the file",
+    (name) => {
+      const err = (() => {
+        try {
+          loadEnv(validEnv({ [name]: undefined }));
+          return undefined;
+        } catch (e) {
+          return e as Error;
+        }
+      })();
+      expect(err).toBeDefined();
+      expect(err!.message).toContain(name);
+      expect(err!.message).toContain("src/config/env.ts");
+    },
+  );
+
+  it.each(REQUIRED)("U-DBENV-R43-M: an EMPTY %s is refused too, not silently accepted", (name) => {
+    expect(() => loadEnv(validEnv({ [name]: "" }))).toThrow(new RegExp(name));
+  });
+
+  it("U-DBENV-R43-5: every optional key stays optional", () => {
+    // current-design §5.3:615-633 spends nineteen lines arguing DBOS_SYSTEM_DATABASE_SCHEMA
+    // is optional-and-unset-everywhere; S3_PUBLIC_ENDPOINT exists for name-parity with the
+    // api and is unused here; YOUVERSION_APP_KEY has a public-domain fallback; the two
+    // RENDER_*_MODEL keys mean "no fallback synthesis" when unset.
+    const env = loadEnv(validEnv());
+    expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
+    expect(env.S3_PUBLIC_ENDPOINT).toBeUndefined();
+    expect(env.YOUVERSION_APP_KEY).toBeUndefined();
+    expect(env.RENDER_NARRATION_MODEL).toBeUndefined();
+    expect(env.RENDER_MUSIC_MODEL).toBeUndefined();
+    // Provider base URLs default to the REAL hosts — production needs zero config.
+    expect(env.OPENROUTER_BASE_URL).toBe("https://openrouter.ai");
+    expect(env.GLOO_BASE_URL).toBe("https://platform.ai.gloo.com");
+    expect(env.YOUVERSION_BASE_URL).toBe("https://api.youversion.com");
+    expect(env.S3_REGION).toBe("us-east-1");
+  });
+
+  it("U-DBENV-R43-6: the api-only GitHub OAuth trio is NOT required by dbos", () => {
+    // The asymmetry is by design (brief §2.2 constraint 6): dbos has no user context, so it
+    // never performs the OAuth hop and must not be made to carry its credentials. A
+    // "required provider vars" matrix copied wholesale from the api would be wrong here, and
+    // adding a var carries its own burden of argument (design-delta §11.2:1983-1994).
+    //
+    // Step-11 item 23 (R4344-10): the names below are the api's REAL ones. This test used to
+    // assert `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET`, which no service in the
+    // system defines — so two of its three assertions were tautological, and the invariant was
+    // one-third proven. Adding `GITHUB_APP_CLIENT_ID` to this schema would have been invisible.
+    // (`GITHUB_APP_SLUG` was always a real api name and always meaningful.)
+    //
+    // Asserted over `envSchema.shape` as well as the parsed output, because `not.toHaveProperty`
+    // ALONE is too weak to be the guard: an `.optional()` key absent from the input yields no
+    // property at all, so declaring `GITHUB_APP_CLIENT_ID: z.string().optional()` in this
+    // schema would pass a parsed-output check while making dbos carry an api credential.
+    // The schema shape is where the declaration lives, so that is what must be asserted.
+    const declared = Object.keys(envSchema.shape);
+    const env = loadEnv(validEnv());
+    for (const name of [
+      "GITHUB_APP_SLUG",
+      "GITHUB_APP_CLIENT_ID",
+      "GITHUB_APP_CLIENT_SECRET",
+    ]) {
+      expect(declared, name).not.toContain(name);
+      expect(env, name).not.toHaveProperty(name);
+    }
+    // And supplying them is not an error either — they are simply ignored.
+    expect(() =>
+      loadEnv(
+        validEnv({
+          GITHUB_APP_SLUG: "supagloo",
+          GITHUB_APP_CLIENT_ID: "Iv1.deadbeef",
+          GITHUB_APP_CLIENT_SECRET: "shhh",
+        }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("U-DBENV-R43-7: a multi-problem env reports EVERY offending variable at once", () => {
+    // Fail-fast at boot is only actionable if it does not make the operator play
+    // whack-a-mole one restart at a time.
+    const err = (() => {
+      try {
+        loadEnv(validEnv({ S3_BUCKET: undefined, GITHUB_APP_ID: undefined }));
+        return undefined;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("S3_BUCKET");
+    expect(err!.message).toContain("GITHUB_APP_ID");
   });
 });

@@ -1,11 +1,12 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import {
-  mintInstallationToken,
-  type ScaffoldProjectPayload,
-} from "@supagloo/database-lib";
+import { type ScaffoldProjectPayload } from "@supagloo/database-lib";
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getScaffoldConfig } from "./scaffold-project/config";
+import {
+  mintEncryptedInstallationToken,
+  openInstallationToken,
+} from "./shared/installation-token";
 import {
   ensureRepoReachable,
   mergePullRequest,
@@ -31,6 +32,7 @@ import {
   markJobRunning,
   markStageDone,
 } from "./scaffold-project/stages";
+import { redactSecretsFromText } from "../logging/redact";
 import { finalizeRecords } from "./scaffold-project/finalize";
 
 /**
@@ -152,12 +154,19 @@ async function scaffoldProjectFn(
       { name: "markJobRunning" },
     );
 
-    // 1) mintInstallationToken — App JWT → ~1h installation token (never persisted).
+    // 1) mintInstallationToken — App JWT → ~1h installation token.
     //
-    // NO `shouldRetry` HERE, DELIBERATELY (plan row 64 / D64.5). Every one of the six
-    // `mintInstallationToken` steps in this repo omits it — `import-project.ts`,
-    // `publish-version.ts`, `commit-version.ts` and `render.ts` x2 — and row 64 leaves
-    // all six alone on purpose. Adding `shouldRetry: retryUnlessPermanent` here would
+    // PLAN ROW 48: the step returns the token SEALED (AES-256-GCM), because a step's
+    // return value is what DBOS checkpoints into `operation_outputs`. The body opens it
+    // in memory; body locals are never checkpointed. See `shared/installation-token.ts`
+    // for why sealing beats re-minting per step.
+    //
+    // NO `shouldRetry` HERE, DELIBERATELY (plan row 64 / D64.5). Every one of the FIVE
+    // `mintInstallationToken` steps in this repo omits it — this one plus
+    // `import-project.ts`, `commit-version.ts`, `publish-version.ts` and `render.ts`
+    // (which has exactly ONE, at `render.ts:493`; the count and the "render.ts x2" this
+    // comment used to claim were both wrong — brief §9 S7). Row 64 leaves all five alone
+    // on purpose. Adding `shouldRetry: retryUnlessPermanent` here would
     // classify a `GithubAppError` as permanent and fail fast, which sounds like an
     // improvement and is the opposite: a **secondary-limit `403 + Retry-After` is
     // survivable**, and db-lib's `mintInstallationToken` already honours it in-process
@@ -167,19 +176,20 @@ async function scaffoldProjectFn(
     // leaving it is bounded and known: a genuinely bad private key burns the 4-attempt
     // NETWORK_RETRY budget (~7s) before failing, which is cheap insurance.
     await at("mintInstallationToken");
-    const token = await DBOS.runStep(
+    const sealedToken = await DBOS.runStep(
       async () => {
-        const minted = await mintInstallationToken({
+        const sealed = await mintEncryptedInstallationToken({
           appId: cfg.githubAppId,
           privateKey: cfg.githubAppPrivateKey,
           installationId: payload.installationId,
           apiBaseUrl: cfg.githubApiBaseUrl,
         });
         await markStageDone(prisma, jobId, "mintInstallationToken");
-        return minted.token;
+        return sealed;
       },
       { name: "mintInstallationToken", ...NETWORK_RETRY },
     );
+    const token = openInstallationToken(sealedToken);
 
     // 2) ensureRepoAccessible — idempotent reachability (NOT repo creation).
     await at("ensureRepoAccessible");
@@ -240,9 +250,12 @@ async function scaffoldProjectFn(
       { name: "writeRemotionScaffold" },
     );
 
-    // 5) commitBaseVersion — deterministic v0.0.0 commit.
+    // 5) commitBaseVersion — deterministic v0.0.0 commit. Its sha is CHECKPOINTED (that is
+    //    what makes the deterministic-commit property observable and what a replay compares
+    //    against) but no longer READ by a later step: plan row 50 item (1) removed the
+    //    `?? baseSha` merge-sha fallback it used to feed.
     await at("commitBaseVersion");
-    const baseSha = await DBOS.runStep(
+    await DBOS.runStep(
       async () => {
         const { baseSha } = await materializeBaseVersion(ctx);
         await markStageDone(prisma, jobId, "commitBaseVersion");
@@ -279,9 +292,14 @@ async function scaffoldProjectFn(
         return {
           number: opened.number,
           url: opened.url,
-          // The merge sha (base version's recorded head); falls back to the local
-          // base sha on the idempotent 405-already-merged replay path.
-          mergeSha: merged.sha ?? baseSha,
+          // The merge sha — the base version's PERMANENTLY recorded head. Plan row 50
+          // item (1) deleted the `?? baseSha` fallback that used to stand in for it on the
+          // idempotent 405-already-merged replay path: `baseSha` is the LOCAL pre-merge
+          // commit, and the squash merge produces a different one, so the fallback wrote a
+          // commit that is not on `main` into `ProjectVersion.headCommitSha`.
+          // `mergePullRequest` now re-reads the true sha itself (D50.1) and throws rather
+          // than guess (D50.2).
+          mergeSha: merged.sha,
         };
       },
       // Push (git) + PR open/merge (REST): fail fast on a permanent git auth failure
@@ -370,7 +388,12 @@ async function scaffoldProjectFn(
             prisma,
             jobId,
             currentStage,
-            err instanceof Error ? err.message : String(err),
+            // Step-11 item 4 (R4850-3): this column is BROWSER-VISIBLE via
+            // `GET /v1/projects/:id/jobs/:jobId`, and the widened catch above records every
+            // escaping error class. `GitCommandError` self-redacts; `GithubAppError`, Prisma,
+            // Zod and anything a library throws do NOT, and a clone/push failure surfaced
+            // through one of those carries the full `x-access-token:ghs_…@github.com` remote.
+            redactSecretsFromText(err instanceof Error ? err.message : String(err)),
           );
         },
         { name: "recordFailure", retriesAllowed: true, maxAttempts: 3 },

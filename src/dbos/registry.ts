@@ -1,5 +1,6 @@
 import {
   AI_GENERATION_QUEUE_NAME,
+  CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME,
   COMMIT_VERSION_WORKFLOW_NAME,
   GENERATE_AUDIO_WORKFLOW_NAME,
   GENERATE_IMAGE_WORKFLOW_NAME,
@@ -7,6 +8,7 @@ import {
   GENERATE_VIDEO_WORKFLOW_NAME,
   GIT_OPS_QUEUE_NAME,
   IMPORT_PROJECT_WORKFLOW_NAME,
+  MAINTENANCE_QUEUE_NAME,
   PUBLISH_VERSION_WORKFLOW_NAME,
   RENDER_QUEUE_NAME,
   RENDER_WORKFLOW_NAME,
@@ -34,16 +36,28 @@ import {
  */
 
 /**
- * The three design-mandated queues and their per-worker concurrency (design-delta
- * §7). `git-ops` ~4 and `ai-generation` ~8 are deliberate design-time
- * approximations (tuning deferred to the load-testing task 45); `render` = exactly
- * 1/worker is firm (Remotion/Chromium is CPU/memory heavy). These names are
- * load-bearing for every later workflow task — never renamed.
+ * The design-mandated queues and their per-worker concurrency (design-delta §7).
+ * `git-ops` ~4 and `ai-generation` ~8 are deliberate design-time approximations;
+ * `render` = exactly 1/worker is firm (Remotion/Chromium is CPU/memory heavy). These
+ * names are load-bearing for every later workflow task — never renamed.
+ *
+ * CORRECTED by plan row 45 (D45.4): this comment used to say the git-ops and
+ * ai-generation numbers were "deferred to the load-testing task 45". They were not —
+ * row 45's scope is the `render` queue alone (§9-Q8), and it CONFIRMS `render: 1` rather
+ * than changing it. The git-ops and ai-generation approximations remain untuned and are
+ * owned by no task; pointing at one that never covered them made them look scheduled.
  */
 export const QUEUE_CONFIG = {
   "git-ops": { workerConcurrency: 4 },
   "ai-generation": { workerConcurrency: 8 },
   render: { workerConcurrency: 1 },
+  // Plan row 42: the fourth queue, for the scheduled janitor. It is not optional —
+  // `WORKFLOW_QUEUE` below is `satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>`,
+  // so adding a workflow name without a queue is a COMPILE error. Deliberately its own
+  // queue rather than `git-ops`: a nightly bucket sweep must never occupy a slot the
+  // user-facing scaffold/commit/publish work is waiting on. Concurrency 1 because two
+  // overlapping sweeps would race on the same delete set for no throughput benefit.
+  [MAINTENANCE_QUEUE_NAME]: { workerConcurrency: 1 },
 } as const satisfies Record<string, { workerConcurrency: number }>;
 
 export type QueueName = keyof typeof QUEUE_CONFIG;
@@ -89,6 +103,19 @@ export const WORKFLOW_NAMES = {
   // git-ops/ai-generation work). Same shared-constant discipline: the API's render-enqueue
   // path (task 37) imports this exact name from db-lib.
   render: RENDER_WORKFLOW_NAME,
+  // Plan row 42: the scheduled daily janitor (design-delta §7 workflow 10). Sourced from
+  // db-lib exactly like every name above.
+  //
+  // Step-11 item 29 (R42-4) CORRECTED a comment here that claimed this name "is authored
+  // LOCALLY rather than sourced from db-lib" because nothing enqueues the workflow. Both
+  // halves were wrong: the pinned db-lib DOES export
+  // `CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME` (and `MAINTENANCE_QUEUE_NAME`) from
+  // `src/workflows.ts` and `dist/workflows.d.ts`, and its own docblock states that "the dbos
+  // static registry pins `WORKFLOW_NAMES.cleanupOrphanedAssets` against this exact constant".
+  // A hard-coded literal left db-lib asserting a coupling the code did not honour. The second
+  // consumer is not an enqueuer: it is any operator-facing `listWorkflows` filter, plus the
+  // `DBOS.registerScheduled({ name })` call in `./scheduled-cleanup`.
+  cleanupOrphanedAssets: CLEANUP_ORPHANED_ASSETS_WORKFLOW_NAME,
 } as const;
 
 export type WorkflowName = (typeof WORKFLOW_NAMES)[keyof typeof WORKFLOW_NAMES];
@@ -119,4 +146,7 @@ export const WORKFLOW_QUEUE = {
   generateVideo: AI_GENERATION_QUEUE_NAME,
   // render (task 36) is alone on the dedicated `render` queue at 1/worker.
   render: RENDER_QUEUE_NAME,
+  // cleanupOrphanedAssets (row 42) is alone on the `maintenance` queue — the shared db-lib
+  // constant, for the same reason as the name above (item 29).
+  cleanupOrphanedAssets: MAINTENANCE_QUEUE_NAME,
 } as const satisfies Record<keyof typeof WORKFLOW_NAMES, QueueName>;

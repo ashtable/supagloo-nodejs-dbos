@@ -18,6 +18,10 @@ import {
   setVideoPollConfig,
 } from "../workflows/generate-video/config";
 import { clearRenderConfig, setRenderConfig } from "../workflows/render/config";
+import {
+  clearCleanupConfig,
+  setCleanupConfig,
+} from "../workflows/cleanup-orphaned-assets/config";
 // Importing the workflow modules performs their STATIC registration
 // (DBOS.registerWorkflow at module load) — this MUST happen before DBOS.launch().
 import "../workflows/noop-proof";
@@ -30,6 +34,11 @@ import "../workflows/generate-image";
 import "../workflows/generate-audio";
 import "../workflows/generate-video";
 import "../workflows/render";
+// Plan row 42. The WORKFLOW registers here like every other one, so its name is in the
+// frozen registry in EVERY runtime (including the e2e lanes, which invoke it directly).
+// The SCHEDULE that arms it deliberately does NOT live here — see ./scheduled-cleanup,
+// which only src/main.ts imports, and src/dbos/scheduled-cleanup.fence.test.ts.
+import "../workflows/cleanup-orphaned-assets";
 
 let appDb: PrismaClient | undefined;
 
@@ -109,11 +118,23 @@ export async function launchDbos(env: Env): Promise<void> {
   // fallback audio models. The workflow's steps read getRenderConfig(), never process.env.
   setRenderConfig({
     mediaTimeoutMs: Math.round(env.RENDER_MEDIA_TIMEOUT_SECONDS * 1000),
+    mediaFrameTimeoutMs: env.RENDER_MEDIA_FRAME_TIMEOUT_MS,
     bundleTimeoutMs: Math.round(env.RENDER_BUNDLE_TIMEOUT_SECONDS * 1000),
     installTimeoutMs: Math.round(env.RENDER_INSTALL_TIMEOUT_SECONDS * 1000),
     cancelPollMs: Math.round(env.RENDER_CANCEL_POLL_SECONDS * 1000),
+    mediaConcurrency: env.RENDER_MEDIA_CONCURRENCY,
     narrationModel: env.RENDER_NARRATION_MODEL,
     musicModel: env.RENDER_MUSIC_MODEL,
+  });
+
+  // Inject the cleanup config (plan row 42): the retention window that decides which
+  // failed/canceled jobs' objects may be swept, and the dry-run switch. Injected here so
+  // the janitor's steps read getCleanupConfig(), never process.env — and so an
+  // un-launched runtime cannot sweep at all (getCleanupConfig throws).
+  setCleanupConfig({
+    retentionMs: Math.round(env.CLEANUP_RETENTION_HOURS * 3_600_000),
+    dryRun: env.CLEANUP_DRY_RUN,
+    maxItemsPerRun: env.CLEANUP_MAX_ITEMS_PER_RUN,
   });
 
   // `systemDatabaseSchemaName` is unset in Compose, so this forwards `undefined` and the
@@ -141,6 +162,7 @@ export async function shutdownDbos(): Promise<void> {
   clearS3Config();
   clearVideoPollConfig();
   clearRenderConfig();
+  clearCleanupConfig();
   if (appDb) {
     await appDb.$disconnect().catch(() => {});
     appDb = undefined;

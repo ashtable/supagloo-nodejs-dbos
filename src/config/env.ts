@@ -1,4 +1,13 @@
 import { z } from "zod";
+import {
+  CLEANUP_MAX_ITEMS_PER_RUN_DEFAULT,
+  CLEANUP_RETENTION_HOURS_DEFAULT,
+  CLEANUP_RETENTION_HOURS_MIN,
+} from "../workflows/cleanup-orphaned-assets/selection";
+import {
+  maxRenderConcurrency,
+  RENDER_MEDIA_FRAME_TIMEOUT_MS_DEFAULT,
+} from "../workflows/render/media-options";
 
 /**
  * Zod-validated environment for the DBOS worker. Scope grows per task (same
@@ -27,6 +36,26 @@ const HTTP_URL = /^https?:\/\/.+/;
 // `SECRETS_KEY_HEX`; validated here so a misconfigured key fails fast at boot rather
 // than on the first decrypt inside a generation workflow.
 const SECRETS_KEY_HEX = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * The all-zeros key: 64 hex characters, so it passes {@link SECRETS_KEY_HEX}, and a real
+ * incident (design-delta §11.7:2309-2318) — `docker-compose.test.yml` overrode the API's
+ * key to this value while dbos kept the Compose dev key, so every provider credential the
+ * API ENCRYPTED failed `decryptSecret` in this worker. Row 62 deleted that override; plan
+ * row 43 / D43.1 makes the value itself un-loadable so it cannot return by another door.
+ *
+ * WHY NOT the obvious `NODE_ENV === "production"` weak-key gate: `docker-compose.yml`
+ * pins `NODE_ENV: production` on BOTH api and dbos AND hardcodes the well-known dev key, so
+ * a production-gated rejection would refuse to boot the shipped stack in every lane. The
+ * "distinct per environment" half of the row lives where it can actually be checked —
+ * root's Compose/`.env.example` guard — and this in-process half rejects only the value
+ * with a recorded history of breaking decryption.
+ *
+ * NOT a per-service rule. api and dbos must carry the IDENTICAL key within an environment
+ * (current-design §2.2:99, root `compose-config.test.ts` PART V invariant 5); the message
+ * below is byte-identical to the API's for exactly that reason.
+ */
+const WEAK_SECRETS_KEYS = new Set(["0".repeat(64)]);
 
 /** The DBOS application name (DBOS.setConfig `name`). Fixed, not env-configured. */
 export const DBOS_APP_NAME = "supagloo-dbos";
@@ -66,6 +95,23 @@ const optionalModelId = () =>
       z.string().min(1).optional(),
     )
     .optional();
+
+
+/**
+ * An optional boolean env var. Compose substitutes `${FOO:-}` to the EMPTY STRING when the
+ * operator has not defined it, so "" must mean the default rather than a parse failure —
+ * the same normalization `optionalModelId` performs for model ids.
+ */
+const booleanFlag = (label: string) =>
+  z
+    .preprocess(
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z
+        .union([z.boolean(), z.enum(["true", "false", "1", "0"])])
+        .optional(),
+    )
+    .transform((v) => v === true || v === "true" || v === "1")
+    .describe(label);
 
 export const envSchema = z.object({
   // App database (`supagloo`) — the workflow's app-DB writes go here.
@@ -138,6 +184,14 @@ export const envSchema = z.object({
       message:
         "SECRETS_ENCRYPTION_KEY must be a 64-character hex string (32 bytes); " +
         "generate one with `openssl rand -hex 32`",
+    })
+    // Plan row 43 / D43.1 — see WEAK_SECRETS_KEYS. Keep this message byte-identical to
+    // supagloo-nodejs-api's: the two services share one key, so they must reject the same
+    // values with the same words or an operator will think only one of them is unhappy.
+    .refine((value) => !WEAK_SECRETS_KEYS.has(value), {
+      message:
+        "SECRETS_ENCRYPTION_KEY must not be a placeholder key (all zeros); " +
+        "generate a real one with `openssl rand -hex 32`",
     }),
 
   // Task #32 S3 (design-delta §4/§8). The asset-uploading workflows PUT generated media
@@ -201,6 +255,61 @@ export const envSchema = z.object({
   // `DBOS.cancelWorkflow` can COOPERATIVELY abort the in-flight Chromium render. Without
   // this, DBOS's own cancellation (which preempts only at the NEXT step boundary) would
   // let a cancelled render burn CPU to completion.
+  // Plan row 45 / Step-11 item 9 — Remotion's OWN per-frame budget, in milliseconds.
+  //
+  // A DIFFERENT quantity from RENDER_MEDIA_TIMEOUT_SECONDS above, which is the deadline after
+  // which the parent SIGTERMs the render child. Row 45 originally passed the kill deadline AS
+  // the per-frame budget, which makes the per-frame budget dead by construction: Remotion's
+  // clock starts only after browser launch and composition resolution (+3 000 ms on
+  // `waitForReady`), so the parent's kill always won and no per-frame timeout could ever
+  // fire. It must therefore be STRICTLY BELOW the kill deadline — enforced at boot in
+  // `loadEnv` below, and again in `buildRenderMediaOptions`.
+  //
+  // Default 120 000 ms: `docs/render-sizing.md` §3.4's own recommendation, 4× Remotion's
+  // built-in DEFAULT_TIMEOUT of 30 000 ms and 30× below the 3 600 s deadline.
+  RENDER_MEDIA_FRAME_TIMEOUT_MS: z.coerce
+    .number()
+    .positive("RENDER_MEDIA_FRAME_TIMEOUT_MS must be a positive number of milliseconds")
+    .default(RENDER_MEDIA_FRAME_TIMEOUT_MS_DEFAULT),
+  // Plan row 45 (§9-Q8). Remotion's frame concurrency inside ONE render. Optional with NO
+  // default: Remotion resolves an unset value to `round(min(8, max(1, cpus / 2)))` — bounded
+  // and cpuset-aware, so a better default than a shipped guess — and each unit is a Chromium
+  // tab holding decoded frames, the biggest unbounded memory lever in the pipeline. Unset
+  // means "leave Remotion's default alone", because the sizing numbers are extrapolated
+  // from Compose (api/dbos are not deployed to Railway), and shipping a guessed default
+  // would change every render on the strength of a measurement not yet made.
+  // NOT the same knob as QUEUE_CONFIG.render.workerConcurrency (renders per worker = 1,
+  // firm since task 36).
+  //
+  // Step-11 item 31 (R45-5): RANGE-CHECKED AT BOOT. Remotion's `resolveConcurrency` THROWS
+  // `Maximum for --concurrency is <n>` for any value above the CPU count it sees, and that
+  // throw lands at the LAST step of the render workflow — after the clone, the `npm ci` and
+  // the bundle. Without this check a single mistyped digit fails every render minutes in,
+  // forever, with no boot complaint. The bound is Remotion's own
+  // `RenderInternals.getMaxConcurrency()`, read through `render/media-options.ts` so it can
+  // never drift from the value that actually throws.
+  RENDER_MEDIA_CONCURRENCY: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.coerce
+      .number()
+      .int("RENDER_MEDIA_CONCURRENCY must be a positive integer")
+      .positive("RENDER_MEDIA_CONCURRENCY must be a positive integer")
+      .optional()
+      .superRefine((value, ctx) => {
+        if (value === undefined) return;
+        const max = maxRenderConcurrency();
+        if (value > max) {
+          ctx.addIssue({
+            code: "custom",
+            message:
+              `RENDER_MEDIA_CONCURRENCY must be at most ${max} — the CPU count Remotion sees ` +
+              `on this machine. Remotion's resolveConcurrency throws above it, and that throw ` +
+              `would land at the LAST step of every render (after the clone, the npm ci and ` +
+              `the bundle). See src/workflows/render/media-options.ts`,
+          });
+        }
+      }),
+  ),
   RENDER_CANCEL_POLL_SECONDS: z.coerce
     .number()
     .positive("RENDER_CANCEL_POLL_SECONDS must be a positive number of seconds")
@@ -220,14 +329,81 @@ export const envSchema = z.object({
   // not defined it, and an empty optional model must mean "no fallback", not "fail boot".
   RENDER_NARRATION_MODEL: optionalModelId(),
   RENDER_MUSIC_MODEL: optionalModelId(),
+
+  // Plan row 42 — `cleanupOrphanedAssetsWorkflow`, the scheduled daily janitor.
+  //
+  // How long a FAILED/CANCELED job's S3 objects are kept before they may be swept.
+  // OPTIONAL with a 7-day default, and the default is a SAFETY property rather than a
+  // preference: the Compose `dbos` container runs this sweep nightly against the SAME app
+  // database and the SAME `supagloo-dev` bucket that the in-process e2e lanes use, and
+  // those lanes' fixtures are seconds old. Seven days puts every fixture out of reach by
+  // days. (The other half of that safety argument is structural — the schedule is armed
+  // only from `src/main.ts`, which no lane loads. See `src/dbos/scheduled-cleanup.ts`.)
+  // Session purging is NOT governed by this: sessions go strictly on `expiresAt`.
+  //
+  // Step-11 item 21 (R42-6): FLOORED at 24 hours, not merely `positive()`. §10 R3 states the
+  // two safety properties of this sweep are D42.1's structural fence AND this window,
+  // "neither alone sufficient" — and `positive()` accepted `0.001`, i.e. 3.6 seconds, which
+  // would put every e2e fixture in the shared bucket inside the Compose container's nightly
+  // delete set almost as soon as it was created. A floor is the right shape here because the
+  // number is not a preference an operator may trade off.
+  CLEANUP_RETENTION_HOURS: z.coerce
+    .number()
+    .positive("CLEANUP_RETENTION_HOURS must be a positive number of hours")
+    .min(
+      CLEANUP_RETENTION_HOURS_MIN,
+      `CLEANUP_RETENTION_HOURS must be at least ${CLEANUP_RETENTION_HOURS_MIN} — the window ` +
+        `is a safety property, see src/dbos/scheduled-cleanup.ts`,
+    )
+    .default(CLEANUP_RETENTION_HOURS_DEFAULT),
+
+  // Step-11 item 12 (R42-3) — the per-model batch cap on the nightly sweep's candidate rows.
+  //
+  // Without it the candidate set grows monotonically (a failed job whose objects never
+  // existed stays a candidate every night, so nothing ever leaves the set): the measured
+  // dev-DB trajectory was already 134 + 181 = 315 sequential S3 LISTs inside ONE DBOS step,
+  // with a correspondingly large single `operation_outputs` checkpoint written every night.
+  // All in one step also means a crash at LIST 300 discards all 300.
+  //
+  // Applied as `take` on both candidate queries with `orderBy: { createdAt: "asc" }`, so the
+  // cap is a converging queue over the OLDEST orphans rather than an arbitrary slice.
+  // Empty string is normalized to the default — Compose substitutes `${VAR:-}` to "".
+  CLEANUP_MAX_ITEMS_PER_RUN: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.coerce
+      .number()
+      .int("CLEANUP_MAX_ITEMS_PER_RUN must be a positive integer")
+      .positive("CLEANUP_MAX_ITEMS_PER_RUN must be a positive integer")
+      .default(CLEANUP_MAX_ITEMS_PER_RUN_DEFAULT),
+  ),
+
+  // Plan the sweep and report it, mutate nothing. A real operator mode, not a test hook:
+  // it defaults to off, carries no `NODE_ENV` branch, and the two destructive steps are
+  // SKIPPED wholesale rather than a flag being checked inside a mutation helper.
+  CLEANUP_DRY_RUN: booleanFlag("CLEANUP_DRY_RUN"),
 });
 
 export type Env = z.infer<typeof envSchema>;
 
 /**
+ * Where this validator lives, named in the failure message.
+ *
+ * Plan row 43 (design-delta §8:1414-1418, §11.3:2034-2042, §11.8:2392-2396): a boot
+ * refusal must name the VARIABLE **and** the FILE. "Invalid environment configuration —
+ * S3_BUCKET: Required" tells an operator which knob; it does not tell them which of five
+ * repos owns it, and `S3_BUCKET` is a name three of them use. Repo-qualified because the
+ * message is read out of a merged `docker compose logs` stream.
+ */
+const ENV_SOURCE_FILE = "supagloo-nodejs-dbos/src/config/env.ts";
+
+/**
  * Parse and validate the environment. Throws a single, actionable error listing
- * every problem when validation fails (fail-fast at boot). Accepts an injected
- * source for testing; defaults to `process.env`.
+ * EVERY problem when validation fails (fail-fast at boot) — one restart per bad config,
+ * not one per bad variable. Accepts an injected source for testing; defaults to
+ * `process.env`.
+ *
+ * Every failure throws; none warns and continues (design-delta §8:1414-1418). The message
+ * carries variable names and human remedies but never a VALUE, so it is safe to log as-is.
  */
 export function loadEnv(
   source: Record<string, string | undefined> = process.env,
@@ -237,7 +413,28 @@ export function loadEnv(
     const details = result.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
       .join("; ");
-    throw new Error(`Invalid environment configuration — ${details}`);
+    throw new Error(
+      `Invalid environment configuration in ${ENV_SOURCE_FILE} — ${details}`,
+    );
   }
-  return result.data;
+  const env = result.data;
+
+  // Step-11 item 9 — the one CROSS-FIELD render invariant, checked here rather than in the
+  // schema so `envSchema` stays a plain ZodObject.
+  //
+  // Remotion's per-frame budget must be strictly below the child-process kill deadline or it
+  // can never fire (see `render/media-options.ts`). `buildRenderMediaOptions` enforces it too,
+  // but that runs in the render CHILD at the last step of the workflow — after the clone, the
+  // `npm ci` and the bundle. Failing at boot instead is the difference between one restart
+  // and one wasted render per job, forever.
+  const killDeadlineMs = Math.round(env.RENDER_MEDIA_TIMEOUT_SECONDS * 1000);
+  if (env.RENDER_MEDIA_FRAME_TIMEOUT_MS >= killDeadlineMs) {
+    throw new Error(
+      `Invalid environment configuration in ${ENV_SOURCE_FILE} — ` +
+        `RENDER_MEDIA_FRAME_TIMEOUT_MS must be strictly below ` +
+        `RENDER_MEDIA_TIMEOUT_SECONDS × 1000 (${killDeadlineMs} ms), or Remotion's per-frame ` +
+        `timeout can never fire — the render child is SIGTERMed first`,
+    );
+  }
+  return env;
 }

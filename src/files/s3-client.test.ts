@@ -1,7 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { GetObjectCommand, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  type S3Client,
+} from "@aws-sdk/client-s3";
 import { buildAssetKey } from "@supagloo/database-lib";
-import { downloadAsset, makeInternalS3Client, uploadAsset } from "./s3-client";
+import {
+  deleteAssets,
+  downloadAsset,
+  listAssets,
+  makeInternalS3Client,
+  uploadAsset,
+} from "./s3-client";
 
 // Task #32 — the FIRST real S3 WRITE in the codebase. The DBOS image/audio/video
 // workflows upload generated assets against the INTERNAL endpoint (`S3_ENDPOINT`,
@@ -101,5 +113,155 @@ describe("downloadAsset", () => {
     await expect(
       downloadAsset(fakeClient, { bucket: "b", key: "missing" }),
     ).rejects.toThrow();
+  });
+});
+
+// --- Plan row 42: the ONLY S3 LIST + DELETE path in the entire design ---------------
+//
+// design-delta §8:1401-1403 dropped `presign-upload` and `DELETE /v1/files` *because*
+// workflow 10 (`cleanupOrphanedAssetsWorkflow`) exists, so there was no delete helper
+// anywhere in product code to copy — these two are it. They are the mechanism by which a
+// bug in the selection rules would become permanent data loss in the one shared bucket,
+// which is why they get their own tests rather than riding on the workflow's.
+
+describe("listAssets", () => {
+  it("U-S3L1: lists a single page, prefix-scoped to exactly the requested prefix", async () => {
+    const sent: ListObjectsV2Command[] = [];
+    const fakeClient = {
+      send: (cmd: ListObjectsV2Command) => {
+        sent.push(cmd);
+        return Promise.resolve({
+          Contents: [{ Key: "renders/rj-1/output.mp4" }, { Key: "renders/rj-1/thumb.jpg" }],
+          IsTruncated: false,
+        });
+      },
+    } as unknown as S3Client;
+
+    const keys = await listAssets(fakeClient, {
+      bucket: "supagloo-dev",
+      prefix: "renders/rj-1/",
+    });
+
+    expect(keys).toEqual(["renders/rj-1/output.mp4", "renders/rj-1/thumb.jpg"]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toBeInstanceOf(ListObjectsV2Command);
+    expect(sent[0].input.Bucket).toBe("supagloo-dev");
+    // A widened prefix here would enumerate every render in the bucket.
+    expect(sent[0].input.Prefix).toBe("renders/rj-1/");
+  });
+
+  it("U-S3L2: follows ContinuationToken until the listing is complete", async () => {
+    const tokens: Array<string | undefined> = [];
+    let call = 0;
+    const fakeClient = {
+      send: (cmd: ListObjectsV2Command) => {
+        tokens.push(cmd.input.ContinuationToken);
+        call += 1;
+        if (call === 1) {
+          return Promise.resolve({
+            Contents: [{ Key: "a" }],
+            IsTruncated: true,
+            NextContinuationToken: "page-2",
+          });
+        }
+        return Promise.resolve({ Contents: [{ Key: "b" }], IsTruncated: false });
+      },
+    } as unknown as S3Client;
+
+    // Truncation is not hypothetical: S3/MinIO cap a page at 1000 keys, and a cleanup that
+    // silently stopped at page 1 would leave orphans behind forever while reporting success.
+    expect(
+      await listAssets(fakeClient, { bucket: "supagloo-dev", prefix: "renders/" }),
+    ).toEqual(["a", "b"]);
+    expect(tokens).toEqual([undefined, "page-2"]);
+  });
+
+  it("U-S3L3: an empty prefix listing is an empty array, not a throw", async () => {
+    const fakeClient = {
+      send: () => Promise.resolve({ IsTruncated: false }),
+    } as unknown as S3Client;
+    expect(
+      await listAssets(fakeClient, { bucket: "supagloo-dev", prefix: "renders/none/" }),
+    ).toEqual([]);
+  });
+});
+
+describe("deleteAssets", () => {
+  it("U-S3D1: sends one DeleteObjectsCommand carrying exactly the requested keys", async () => {
+    const sent: DeleteObjectsCommand[] = [];
+    const fakeClient = {
+      send: (cmd: DeleteObjectsCommand) => {
+        sent.push(cmd);
+        return Promise.resolve({
+          Deleted: (cmd.input.Delete?.Objects ?? []).map((o) => ({ Key: o.Key })),
+        });
+      },
+    } as unknown as S3Client;
+
+    const result = await deleteAssets(fakeClient, {
+      bucket: "supagloo-dev",
+      keys: ["renders/rj-1/output.mp4", "renders/rj-1/thumb.jpg"],
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].input.Bucket).toBe("supagloo-dev");
+    expect(sent[0].input.Delete?.Objects?.map((o) => o.Key)).toEqual([
+      "renders/rj-1/output.mp4",
+      "renders/rj-1/thumb.jpg",
+    ]);
+    expect(result.deleted).toEqual([
+      "renders/rj-1/output.mp4",
+      "renders/rj-1/thumb.jpg",
+    ]);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("U-S3D2: no keys ⇒ NO request at all (an empty Delete request is an S3 400)", async () => {
+    const fakeClient = {
+      send: () => {
+        throw new Error("deleteAssets must not call S3 with an empty key set");
+      },
+    } as unknown as S3Client;
+    expect(await deleteAssets(fakeClient, { bucket: "supagloo-dev", keys: [] })).toEqual({
+      deleted: [],
+      errors: [],
+    });
+  });
+
+  it("U-S3D3: chunks at S3's 1000-key-per-request limit", async () => {
+    const batches: number[] = [];
+    const fakeClient = {
+      send: (cmd: DeleteObjectsCommand) => {
+        const objs = cmd.input.Delete?.Objects ?? [];
+        batches.push(objs.length);
+        return Promise.resolve({ Deleted: objs.map((o) => ({ Key: o.Key })) });
+      },
+    } as unknown as S3Client;
+
+    const keys = Array.from({ length: 1001 }, (_, i) => `renders/rj-${i}/output.mp4`);
+    const result = await deleteAssets(fakeClient, { bucket: "supagloo-dev", keys });
+
+    expect(batches).toEqual([1000, 1]);
+    expect(result.deleted).toHaveLength(1001);
+  });
+
+  it("U-S3D4: surfaces S3's per-key Errors instead of reporting a silent success", async () => {
+    const fakeClient = {
+      send: () =>
+        Promise.resolve({
+          Deleted: [{ Key: "ok" }],
+          Errors: [{ Key: "denied", Code: "AccessDenied", Message: "no" }],
+        }),
+    } as unknown as S3Client;
+
+    const result = await deleteAssets(fakeClient, {
+      bucket: "supagloo-dev",
+      keys: ["ok", "denied"],
+    });
+
+    expect(result.deleted).toEqual(["ok"]);
+    expect(result.errors).toEqual([
+      { key: "denied", code: "AccessDenied", message: "no" },
+    ]);
   });
 });
