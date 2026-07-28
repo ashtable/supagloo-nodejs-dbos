@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  canonicalizeManifest,
-  serializeManifest,
-  type ManifestWithAiSettings,
-} from "./manifest-json";
+import type { ProjectManifest } from "@supagloo/database-lib";
+import { canonicalizeManifest, serializeManifest } from "./manifest-json";
 
 /**
  * U-AS4 — `aiSettings` survives canonicalization.
@@ -26,7 +23,7 @@ import {
  * the nextjs adapter's round-trip identity).
  */
 
-const baseManifest: ManifestWithAiSettings = {
+const baseManifest: ProjectManifest = {
   manifestVersion: 1 as const,
   composition: { width: 1080, height: 1920, fps: 30, aspectRatio: "9:16" },
   scenes: [
@@ -51,7 +48,7 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
   });
 
   it("U-AS4b: a FULL aiSettings block survives canonicalization intact", () => {
-    const manifest: ManifestWithAiSettings = {
+    const manifest: ProjectManifest = {
       ...baseManifest,
       aiSettings: {
         faithAlignment: "catholic" as const,
@@ -76,7 +73,7 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
     // The common shape: the user picked a provider for images and nothing else. An
     // over-eager canonicalizer that materialized every kind would write four objects the
     // user never chose, and the studio would then read them back as deliberate choices.
-    const manifest: ManifestWithAiSettings = {
+    const manifest: ProjectManifest = {
       ...baseManifest,
       aiSettings: { image: { provider: "gloo" as const } },
     };
@@ -86,7 +83,7 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
   });
 
   it("U-AS4d: faithAlignment alone survives (it is independent of any model choice)", () => {
-    const manifest: ManifestWithAiSettings = {
+    const manifest: ProjectManifest = {
       ...baseManifest,
       aiSettings: { faithAlignment: "mainline" as const },
     };
@@ -99,8 +96,8 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
     // Byte stability is the whole contract of this module: a commit that reorders keys
     // produces a spurious diff in the user's repo on every save.
     const withSettings = (
-      aiSettings: ManifestWithAiSettings["aiSettings"],
-    ): ManifestWithAiSettings => ({ ...baseManifest, aiSettings });
+      aiSettings: ProjectManifest["aiSettings"],
+    ): ProjectManifest => ({ ...baseManifest, aiSettings });
 
     const forward = canonicalizeManifest(
       withSettings({
@@ -126,7 +123,7 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
   });
 
   it("U-AS4f: a model-less choice does not gain an empty `model` key", () => {
-    const manifest: ManifestWithAiSettings = {
+    const manifest: ProjectManifest = {
       ...baseManifest,
       aiSettings: { narration: { provider: "openrouter" } },
     };

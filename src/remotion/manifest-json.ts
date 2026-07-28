@@ -1,30 +1,4 @@
-import type { ProjectManifest } from "@supagloo/database-lib";
-
-/**
- * The genesis-1 Inspector's project-level AI settings, forward-declared.
- *
- * db-lib's `ProjectManifestSchema` carries `aiSettings` as of the genesis-1 Inspector
- * work, but this repo resolves db-lib through its PINNED submodule, which is bumped in
- * the release step rather than this one. Declaring the shape locally keeps this module
- * correct at runtime today (it is a structural read over a JSON object) without faking
- * the submodule resolution, which is forbidden.
- *
- * DELETE THIS TYPE at the db-lib bump and read `manifest.aiSettings` directly.
- */
-export interface AiModelChoiceLike {
-  provider: string;
-  model?: string;
-}
-export interface AiSettingsLike {
-  faithAlignment?: string;
-  image?: AiModelChoiceLike;
-  narration?: AiModelChoiceLike;
-  music?: AiModelChoiceLike;
-  video?: AiModelChoiceLike;
-}
-export type ManifestWithAiSettings = ProjectManifest & {
-  aiSettings?: AiSettingsLike;
-};
+import type { AiModelChoice, ProjectManifest } from "@supagloo/database-lib";
 
 /** The kinds the Inspector offers a model selector for, in their canonical on-disk
  *  order. Iterating a FIXED list (rather than the input object's keys) is what makes the
@@ -33,7 +7,7 @@ const AI_SETTING_KINDS = ["image", "narration", "music", "video"] as const;
 
 /** Rebuild one `{provider, model?}` choice with `model` omitted when unset — an
  *  `undefined` key would break the byte-stable on-disk form. */
-function canonicalizeChoice(choice: AiModelChoiceLike): Record<string, unknown> {
+function canonicalizeChoice(choice: AiModelChoice): Record<string, unknown> {
   const out: Record<string, unknown> = { provider: choice.provider };
   if (choice.model !== undefined) out.model = choice.model;
   return out;
@@ -134,7 +108,7 @@ export function canonicalizeManifest(
   // until the next commit, and then reverting to the system default with nothing to
   // indicate it -- which is worse than not persisting at all, because there is no reason
   // to go and look.
-  const aiSettings = (manifest as ManifestWithAiSettings).aiSettings;
+  const aiSettings = manifest.aiSettings;
   if (aiSettings !== undefined) {
     const out2: Record<string, unknown> = {};
     if (aiSettings.faithAlignment !== undefined) {
