@@ -27,6 +27,7 @@ import {
   retryUnlessPermanentRender,
 } from "./render/errors";
 import { parseRenderRequest, type RenderRequest } from "./render/request";
+import { manifestAssetKeys } from "./render/assets";
 import { applyOutputSpec, type ResolvedComposition } from "./render/composition";
 import {
   applyAudioPlans,
@@ -179,17 +180,6 @@ function authenticatedCloneUrl(
   url.username = "x-access-token";
   url.password = token;
   return url.toString();
-}
-
-/** Every S3 asset key the manifest references (scene visuals + cached audio beds). */
-function manifestAssetKeys(manifest: ProjectManifest): string[] {
-  const keys = new Set<string>();
-  for (const scene of manifest.scenes) {
-    if (scene.visualAssetKey) keys.add(scene.visualAssetKey);
-  }
-  if (manifest.narratorVoice.assetKey) keys.add(manifest.narratorVoice.assetKey);
-  if (manifest.music?.assetKey) keys.add(manifest.music.assetKey);
-  return [...keys];
 }
 
 /** Everything the workspace-rebuild helpers need — all of it CHECKPOINTED step output. */

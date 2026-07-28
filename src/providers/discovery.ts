@@ -6,8 +6,20 @@ import { ProviderHttpError } from "./errors";
  *   - text / speech / image → `GET /api/v1/models?output_modalities=<csv>`
  *   - video                 → `GET /api/v1/videos/models`
  * The generation workflows call these and pick an id (e.g. a configured preference or
- * the first result). `output_modalities` values (`"text"`, `"audio"`, …) are provider
- * QUERY tokens, not model ids.
+ * the first result). `output_modalities` values (`"text"`, `"speech"`, `"audio"`, `"image"`,
+ * …) are provider QUERY tokens, not model ids.
+ *
+ * CORRECTION (2026-07-27). A comment here previously asserted, as a confirmed fact:
+ * "Real OpenRouter's TTS/narration modality token is `audio`, not `speech` — do not drift."
+ * That is FALSE, and it is the same shape of confidently-worded wrong comment that caused
+ * bug 1 (narration read as conversation). Verified live against real OpenRouter:
+ *   - `GET /api/v1/models?output_modalities=speech` is a real catalogue — 15 models live —
+ *     and it is what backs the dedicated `POST /api/v1/audio/speech` endpoint narration uses.
+ *   - It is DISJOINT from `output_modalities=audio`, which lists the conversational
+ *     audio-modality chat models. The two are different catalogues, not aliases.
+ * See the matching CORRECTION paragraph in `media-client.ts`. Nothing here is on the
+ * production narration path (models arrive from the BFF via `ai-config.ts`), which is why
+ * believing the old comment cost nothing at runtime — only in the next reader's head.
  *
  * A process-level TTL cache avoids re-listing on every generation (model catalogues
  * change infrequently). The clock is injectable so expiry is testable without real
@@ -15,7 +27,6 @@ import { ProviderHttpError } from "./errors";
  * refresh).
  */
 
-// Real OpenRouter's TTS/narration modality token is "audio", not "speech" — do not drift.
 export interface DiscoveryConfig {
   /** Provider ROOT (e.g. `https://openrouter.ai`); discovery paths are appended. */
   openrouterBaseUrl: string;

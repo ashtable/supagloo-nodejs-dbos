@@ -406,7 +406,20 @@ describe("bug 1 — narration is mounted per scene, inside that scene's own Sequ
     const legacy = fileMap(generateManifestFiles(shelterManifest)).get(
       "src/Video.tsx",
     ) as string;
-    expect(legacy).toContain("narrationAssetKey");
+    // The emitted LINE, not a substring of the const NAME. `toContain("narrationAssetKey")`
+    // was satisfied by `const narrationAssetKey = …` and would have stayed green through any
+    // change to how (or whether) that key is actually mounted.
+    expect(legacy).toContain(
+      "{narrationAssetKeySrc ? <Audio src={narrationAssetKeySrc} /> : null}",
+    );
+    // ...and it is the WHOLE-VIDEO track: emitted before the first <Sequence>.
+    expect(legacy.indexOf("narrationAssetKeySrc ? <Audio")).toBeLessThan(
+      legacy.indexOf("<Sequence"),
+    );
+    // ...with no per-scene narration const anywhere. Per-scene consts are named
+    // `${lowerFirst(component)}NarrationKey` (templates.ts), so this is the discriminator
+    // that a v1 manifest did not silently acquire the new per-scene shape.
+    expect(legacy).not.toMatch(/NarrationKey/);
   });
 });
 
@@ -453,8 +466,9 @@ describe("bug 3 — Ken Burns on stills, OffthreadVideo on clips", () => {
     expect(alpha).toContain("<Img");
     expect(alpha).toContain("scale: interpolate(");
     expect(alpha).toContain("translate: interpolate(");
-    // Normalized over the scene's OWN length (15 frames for the stretched sc-1... 2s = 20),
-    // so the motion always completes exactly once per scene regardless of duration.
+    // Normalized over the scene's OWN frame count, so the motion completes exactly once per
+    // scene whatever its length. sc-1 is authored at 2s and its narration measured 1.5s, so
+    // it does NOT stretch: effective 2s × 10fps = 20 frames.
     expect(alpha).toContain("[0, 20]");
   });
 
@@ -467,8 +481,20 @@ describe("bug 3 — Ken Burns on stills, OffthreadVideo on clips", () => {
     expect(a).toEqual(b);
     const alpha = files.get("src/scenes/Alpha.tsx") as string;
     const beta = files.get("src/scenes/Beta.tsx") as string;
-    // Adjacent scenes get different motion so a cut never looks like a continuation.
-    expect(alpha).not.toBe(beta);
+    // Adjacent scenes get different motion so a cut never looks like a continuation. The
+    // VALUES are asserted, not merely that the two files differ — Alpha.tsx and Beta.tsx also
+    // differ in component name, scriptText, reference, visualAssetKey and frame count, so
+    // `expect(alpha).not.toBe(beta)` was satisfied even if both scenes used variant 0.
+    //
+    // BOTH scale and translate, deliberately: variants 0 and 2 share `["1", "1.1"]`, so a
+    // scale-only assertion would survive an `index % 2` regression. Alpha is index 0 (20
+    // frames, pinned by U-T8), Beta is index 1 (34 frames, pinned by U-T3).
+    expect(alpha).toContain('scale: interpolate(frame, [0, 20], ["1", "1.1"]');
+    expect(alpha).toContain('translate: interpolate(frame, [0, 20], ["0% 0%", "1.5% 1%"]');
+    expect(beta).toContain('scale: interpolate(frame, [0, 34], ["1.1", "1"]');
+    expect(beta).toContain(
+      'translate: interpolate(frame, [0, 34], ["-1.5% -1%", "0% 0%"]',
+    );
     for (const src of [alpha, beta]) {
       expect(src).not.toContain("Math.random");
       expect(src).not.toContain("Date.now");
@@ -476,9 +502,17 @@ describe("bug 3 — Ken Burns on stills, OffthreadVideo on clips", () => {
   });
 
   it("U-T10: a VIDEO-kind asset renders through <OffthreadVideo> and gets NO pan", () => {
-    // Latent second bug, closed here: before the manifest could distinguish a still from a
-    // clip, EVERY visual — including a generated video — went through <Img>, which renders
-    // a single frame of it at best.
+    // Latent second bug: before the manifest could distinguish a still from a clip, EVERY
+    // visual — including a generated video — went through <Img>, which renders a single
+    // frame of it at best.
+    //
+    // SCOPE OF THIS TEST, stated plainly: it drives `visualAssetKind: "video"` EXPLICITLY
+    // via the fixture. Nothing in this suite — or anywhere else — asserts that the field is
+    // ever POPULATED, because no producer writes it: it is read here and in the nextjs
+    // preview, and plumbed through all four schema mirrors, but `setSceneVisual` /
+    // `IMAGE_GENERATED` write only `visualAssetKey`. So this makes closing the latent bug
+    // possible; it does not close it. A generated video asset is still rendered through
+    // <Img> in production until a producer sets the kind.
     const gamma = files.get("src/scenes/Gamma.tsx") as string;
     expect(gamma).toContain("<OffthreadVideo");
     expect(gamma).not.toContain("<Img");

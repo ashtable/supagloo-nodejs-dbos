@@ -32,24 +32,36 @@ import {
  * the row's `kind` (the generateScript storyboard/script precedent). Both are openrouter-only
  * (§9-Q2). NO repair loop (audio output is opaque bytes, not schema-validated JSON).
  *
- * Steps: loadRequestAndCredentials → synthesizeAndUploadAudio (MEDIA_RETRY) → persistResult.
+ * Steps — the middle one differs BY KIND, which is the shape the per-scene narration work
+ * introduced:
+ *   narration: loadRequestAndCredentials → `synthesizeNarrationScene:{sceneId}` ONE PER
+ *              SCENE (MEDIA_RETRY, in scene order) → persistResult
+ *   music:     loadRequestAndCredentials → synthesizeAndUploadAudio (MEDIA_RETRY) → persistResult
  * It ONLY writes the `AiGeneration` row (status + resultAssetKey + a small resultJson metadata
  * blob) — never `ProjectVersion` or the manifest.
  *
- * SECRET HANDLING: `loadRequestAndCredentials` verifies the OpenRouter connection exists but
- * returns NO plaintext; the key is (re)loaded INSIDE `synthesizeAndUploadAudio` so it never
- * lands in a DBOS checkpoint (same discipline as generateScript/generateImage).
+ * ONE ROW, N ASSETS. A narration generation now produces one clip per scene at
+ * `buildSceneNarrationAssetKey(projectId, genId, sceneId)`, because a single whole-video
+ * track has no sync mechanism — each clip has to be mountable inside its own `<Sequence>`.
+ * The row's single `resultAssetKey` invariant is unchanged: it holds scene 1's clip as the
+ * representative key, and the full `{sceneId, assetKey, durationSeconds?}` list travels in
+ * `resultJson.narration.scenes` (db-lib `NarrationResultSchema`).
  *
- * WHY callSpeechEndpoint + uploadAssetToS3 are ONE DBOS step (design §7 names them as two —
- * decision D1): a step's return value is CHECKPOINTED, and `requestSpeech` returns the audio
+ * SECRET HANDLING: `loadRequestAndCredentials` verifies the OpenRouter connection exists but
+ * returns NO plaintext; the key is (re)loaded INSIDE the synthesis step so it never lands in
+ * a DBOS checkpoint (same discipline as generateScript/generateImage).
+ *
+ * WHY synthesis + upload are ONE DBOS step (design §7 names them as two — decision D1): a
+ * step's return value is CHECKPOINTED, and `requestSpeech`/`requestMusic` return the audio
  * BYTES directly (a Buffer JSON-serializes to `{type:"Buffer",data:[...]}`, ~10x bloat) — so a
- * standalone callSpeech step would checkpoint the audio. Folding keeps the bytes in step-local
- * memory and makes synth→upload atomically retryable against the deterministic idempotent key
- * (`buildAssetKey(projectId, genId)`; re-PUT overwrites). The step returns only the small,
- * checkpoint-safe `{ providerGenerationId }` (parsed from the SSE body's `delta.audio.id` field —
- * decision D6, persisted in resultJson for traceability). This mirrors the task-32 image precedent
- * (there callImageModel returned a URL; here requestSpeech returns bytes, so the fold is even
- * more clear-cut). Registered STATICALLY at module load.
+ * standalone call step would checkpoint the audio. Folding keeps the bytes in step-local
+ * memory and makes synth→upload atomically retryable against a deterministic idempotent key
+ * (per-scene for narration, `buildAssetKey(projectId, genId)` for music; re-PUT overwrites).
+ * Each step returns only small, checkpoint-safe scalars — the MEASURED `durationSeconds`, and
+ * for music the `providerGenerationId` (parsed from the SSE body's `delta.audio.id` field —
+ * decision D6, persisted in resultJson for traceability). This mirrors the task-32 image
+ * precedent (there callImageModel returned a URL; here the request returns bytes, so the fold
+ * is even more clear-cut). Registered STATICALLY at module load.
  */
 
 export const GENERATE_AUDIO_WORKFLOW_NAME = WORKFLOW_NAMES.generateAudio;

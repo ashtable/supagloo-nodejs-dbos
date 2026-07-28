@@ -467,9 +467,17 @@ export function buildSceneSource(
     "      {src ? (",
   );
   if (isVideo) {
-    // A video-kind asset used to be rendered through <Img> — a latent second bug that the
-    // manifest had no way to express, since the image and video workflows write the same
-    // extensionless S3 key and the content-type is discarded on download.
+    // Renders a video-kind asset as a video rather than through <Img>, which shows a single
+    // frame of it at best. The manifest had no way to express the distinction at all before
+    // `visualAssetKind` — the image and video workflows write the same extensionless S3 key
+    // and the content-type is discarded on download.
+    //
+    // SCOPE: this MAKES CLOSING that latent bug possible; it does not close it. No producer
+    // writes `visualAssetKind` yet — the field is read here and in the nextjs preview, and
+    // plumbed through all four schema mirrors, but `setSceneVisual` / `IMAGE_GENERATED` write
+    // only `visualAssetKey`. So in production a generated video asset still reaches this
+    // function with the kind absent and is still rendered through <Img>. This branch is
+    // reachable only from a hand-written manifest and from tests until a producer sets it.
     lines.push(
       "        <OffthreadVideo",
       "          src={src}",

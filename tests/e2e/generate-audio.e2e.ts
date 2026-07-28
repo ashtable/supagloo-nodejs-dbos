@@ -6,7 +6,11 @@ import {
   GetObjectCommand,
   type S3Client,
 } from "@aws-sdk/client-s3";
-import { buildAssetKey, createPrismaClient } from "@supagloo/database-lib";
+import {
+  buildAssetKey,
+  buildSceneNarrationAssetKey,
+  createPrismaClient,
+} from "@supagloo/database-lib";
 import { loadEnv, type Env } from "../../src/config/env";
 import { TEST_SECRETS_ENCRYPTION_KEY } from "../../src/testing/secrets-fixture";
 import { launchDbos, shutdownDbos } from "../../src/dbos/runtime";
@@ -240,34 +244,74 @@ describe("lane isolation", () => {
 });
 
 describe("generateAudioWorkflow — lands a real wav in MinIO", () => {
-  it("narration: synthesizes the combined script, uploads audio to projects/{id}/assets/{genId}, records resultAssetKey", async () => {
+  it("narration: synthesizes ONE clip PER SCENE, uploads each to its own per-scene key, records scene 1's as resultAssetKey", async () => {
+    // N scenes ⇒ N provider calls ⇒ N objects in MinIO. Narration used to concatenate every
+    // scene's script into a single synthesis call, producing one whole-video track the
+    // composition could only mount at frame 0 — no sync mechanism at all. Splitting per scene
+    // is what lets each clip live inside its own <Sequence>, so "one asset per scene" is the
+    // property this lane has to hold end-to-end.
     const { genId, projectId, payload } = await seedAudioGeneration("narration");
 
     const result = await runAudio(genId, payload);
     expect(result.generationId).toBe(genId);
     expect(result.kind).toBe("narration");
 
-    const expectedKey = buildAssetKey(projectId, genId);
+    const sceneIds = NARRATION_INPUT.scenes.map((s) => s.sceneId);
+    const sceneKeys = sceneIds.map((id) =>
+      buildSceneNarrationAssetKey(projectId, genId, id),
+    );
+
     const row = await prisma.aiGeneration.findUniqueOrThrow({ where: { id: genId } });
     expect(row.status).toBe("succeeded");
     expect(row.completedAt).toBeInstanceOf(Date);
-    expect(row.resultAssetKey).toBe(expectedKey);
-    // Decision D6: metadata is captured into resultJson (the provider request id, if any, is
-    // provider-specific — its presence/format is not asserted against a real host).
+    // The one-resultAssetKey-per-row invariant is unchanged: scene 1's clip is the
+    // representative key, and the rest travel in resultJson.
+    expect(row.resultAssetKey).toBe(sceneKeys[0]);
     expect(row.resultJson).toMatchObject({ kind: "narration" });
 
-    // The speech endpoint was called exactly once (happy path, no retry) — proven via the
-    // DBOS system-DB step count (replaces the stub's speechRequests counter, §10.7).
-    expect(await countStepExecutions(client, genId, "synthesizeAndUploadAudio")).toBe(1);
+    // ONE speech step per scene, named for the scene — proven via the DBOS system-DB step
+    // count (replaces the stub's speechRequests counter, §10.7). Exactly 1 each ⇒ happy path,
+    // no retry, and no scene silently sharing another's clip.
+    for (const id of sceneIds) {
+      expect(
+        await countStepExecutions(client, genId, `synthesizeNarrationScene:${id}`),
+        `step count for scene ${id}`,
+      ).toBe(1);
+    }
+    // DISCRIMINATING CONTROL. The pre-change workflow ran exactly one
+    // `synthesizeAndUploadAudio` for narration; music still does. Without this, a regression
+    // back to a single combined track could leave every assertion above satisfiable by a
+    // future shim, and the count above would not notice a SECOND, whole-video synthesis.
+    expect(await countStepExecutions(client, genId, "synthesizeAndUploadAudio")).toBe(0);
 
-    // A REAL object exists in MinIO at the asset key with non-empty provider bytes.
-    const bytes = await readObject(expectedKey);
-    expect(bytes.length).toBeGreaterThan(0);
+    // resultJson carries the full per-scene map, in scene order, with MEASURED lengths.
+    // The durations are what makes a scene stretch to fit its verse rather than clip it, so
+    // a zero/absent duration here is a silent failure of the headline fix.
+    const narration = (row.resultJson as { narration?: { scenes?: unknown[] } }).narration;
+    expect(narration?.scenes).toHaveLength(sceneIds.length);
+    const scenes = narration?.scenes as Array<{
+      sceneId: string;
+      assetKey: string;
+      durationSeconds?: number;
+    }>;
+    scenes.forEach((scene, i) => {
+      expect(scene.sceneId, `resultJson scene ${i}`).toBe(sceneIds[i]);
+      expect(scene.assetKey, `resultJson scene ${i}`).toBe(sceneKeys[i]);
+      expect(scene.durationSeconds, `measured duration for scene ${i}`).toBeGreaterThan(0);
+    });
 
-    await s3
-      .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: expectedKey }))
-      .catch(() => {});
-  }, 120_000);
+    // A REAL object exists in MinIO at EVERY per-scene key with non-empty provider bytes.
+    for (const key of sceneKeys) {
+      const bytes = await readObject(key);
+      expect(bytes.length, `bytes at ${key}`).toBeGreaterThan(0);
+    }
+
+    for (const key of sceneKeys) {
+      await s3
+        .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }))
+        .catch(() => {});
+    }
+  }, 180_000);
 
   it("music: same step shape via the same speech endpoint — audio lands in MinIO", async () => {
     const { genId, projectId, payload } = await seedAudioGeneration("music");
