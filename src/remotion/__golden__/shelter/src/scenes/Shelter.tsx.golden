@@ -44,6 +44,7 @@ export const Shelter = () => {
         }}
       >
         <p
+          dir="auto"
           style={{
             margin: 0,
             color: "#ffffff",
@@ -56,6 +57,7 @@ export const Shelter = () => {
           {scriptText}
         </p>
         <p
+          dir="auto"
           style={{
             margin: 0,
             color: "#ffffff",

@@ -538,3 +538,43 @@ describe("canonicalizeManifest symmetry for the new fields", () => {
     if (parsed.success) expect(parsed.data).toEqual(richManifest);
   });
 });
+
+describe("RTL — text direction is resolved from the text itself, in BOTH paths", () => {
+  const files = fileMap(generateProjectFiles(shelterManifest));
+
+  it("U-T-DIR1: the caption and the reference carry dir=\"auto\"", () => {
+    // Task item 1 asks for the picked verse to render "respecting RTL/LTR".
+    //
+    // `dir="auto"` is the HTML first-strong-character algorithm. It is chosen over a new
+    // `language`/`direction` field on `ManifestScene` for one decisive reason: the studio
+    // preview (@remotion/player) and this render (@remotion/renderer) are BOTH Chromium,
+    // so they resolve direction with the same engine and cannot disagree. A manifest
+    // field would have had to be mirrored in db-lib's ManifestSceneSchema, nextjs's
+    // hand-copied contracts, manifest-json.ts's canonicalizer and this generator — four
+    // mirrors and a db-lib release — to reach the same place.
+    //
+    // Asserted BEHAVIOURALLY here as well as byte-for-byte in the goldens: a golden alone
+    // could be "fixed" by deleting the attribute and re-recording the file.
+    for (const path of ["src/scenes/Shelter.tsx", "src/scenes/Refuge.tsx"]) {
+      const source = files.get(path) as string;
+      // both <p> elements — the caption and the reference line beneath it
+      const dirs = source.match(/dir="auto"/g) ?? [];
+      expect(dirs.length, `${path} must mark both text runs`).toBe(2);
+      // and the caption stays centred: centring is direction-neutral, so `dir` only
+      // fixes punctuation and mixed-content ordering, not the layout.
+      expect(source).toContain('textAlign: "center"');
+    }
+  });
+
+  it("U-T-DIR2: a caption-less scene emits exactly one dir=\"auto\" (the reference), not a stray caption", () => {
+    const noCaptions = {
+      ...shelterManifest,
+      scenes: shelterManifest.scenes.map((s) => ({ ...s, captions: false })),
+    };
+    const source = fileMap(generateManifestFiles(noCaptions)).get(
+      "src/scenes/Shelter.tsx",
+    ) as string;
+    expect((source.match(/dir="auto"/g) ?? []).length).toBe(1);
+    expect(source).not.toContain("scriptText");
+  });
+});

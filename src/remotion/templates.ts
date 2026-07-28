@@ -523,9 +523,25 @@ export function buildSceneSource(
     "        }}",
     "      >",
   );
+  // `dir="auto"` on both text runs is how a non-English verse renders correctly.
+  //
+  // It is the HTML first-strong-character bidi algorithm, resolved by the SAME engine in
+  // both places the text appears: the studio preview runs @remotion/player in the user's
+  // browser, this render runs @remotion/renderer in headless Chromium. So the preview and
+  // the MP4 cannot disagree about direction — which is the failure mode that matters, and
+  // one that a per-scene `direction` field on the manifest would not have prevented any
+  // better (it would only have added four schema mirrors and a db-lib release).
+  //
+  // It matters most on the reference line: YouVersion's own reference strings for RTL
+  // translations arrive pre-marked with U+200E around the numerals ("التكوين ‎1:1"), and
+  // rendering them in an LTR context reorders the numerals.
+  //
+  // `textAlign: "center"` stays: centring is direction-neutral, so `dir` is only fixing
+  // punctuation placement and mixed-content ordering, never the layout.
   if (scene.captions) {
     lines.push(
       "        <p",
+      '          dir="auto"',
       "          style={{",
       "            margin: 0,",
       '            color: "#ffffff",',
@@ -541,6 +557,7 @@ export function buildSceneSource(
   }
   lines.push(
     "        <p",
+    '          dir="auto"',
     "          style={{",
     "            margin: 0,",
     '            color: "#ffffff",',
