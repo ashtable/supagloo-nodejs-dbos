@@ -352,48 +352,129 @@ export async function resolveVideoModel(env: E2eModelEnv): Promise<ResolvedVideo
   return selectTextToVideoModel(await fetchVideoModels(env));
 }
 
-// --- Gloo (task 34-E8) --------------------------------------------------------------------
+// --- Gloo (task 34-E8; corrected 2026-07-28) ----------------------------------------------
 // Gloo is NOT on OpenRouter's discovery endpoints — it exposes its OWN authenticated model
-// catalogue at `GET {GLOO_BASE_URL}/platform/v2/models` (nextjs CLAUDE.md "LLM Provider: Gloo
-// AI Studio"), ids namespaced like `gloo-openai-gpt-5-mini`. The reworked providers.e2e.ts uses
-// this to resolve a Gloo model id at RUN TIME for a real `.chat()` round-trip — never hardcoded
-// (§10.9). Gloo's catalogue carries no reliable per-model pricing, so "cheapest ADEQUATE"
-// degrades to a cheap-tier id heuristic (mini/nano/…), with a safe fallback to the first entry.
+// catalogue at `GET {GLOO_BASE_URL}/platform/v2/models`. The reworked providers.e2e.ts uses this
+// to resolve a Gloo model id at RUN TIME for a real `.chat()` round-trip — never hardcoded
+// (§10.9).
+//
+// CORRECTED 2026-07-28. Two claims in the previous version of this comment were measured false
+// against the live host, and both mattered:
+//
+//   1. "Gloo's catalogue carries no reliable per-model pricing" — FALSE. Pricing is present on
+//      106/106 entries, as decimal STRINGS under `pricing.input|output.rate_per_1k_tokens`. So
+//      "cheapest adequate" no longer has to degrade to a name heuristic; it can be computed.
+//   2. The cheap-tier substring heuristic (`mini|nano|small|lite|flash|haiku`) is no longer safe.
+//      Gloo's catalogue now carries 11 image-capable models and FOUR of them match that filter.
+//      An image model handed to `.chat()` answers 400 ("does not support text output and cannot
+//      be used with the Chat Completions API"), which would fail the e2e for a reason that looks
+//      like a broken provider. It has been working only by ACCIDENT of catalogue ORDERING — the
+//      image entries sit at indices 93–103 while index 0 happens to be a cheap text model — and
+//      Gloo controls that order.
+//
+// The selector below therefore filters on `output_modalities` and sorts by real price, which is
+// correct rather than merely lucky.
 
 /** The subset of a Gloo `/platform/v2/models` entry the resolver reads. */
 export interface GlooModelInfo {
   id: string;
+  /** e.g. `["text"]`, `["image"]`, `["image","text"]`. Empty when the catalogue omits it. */
+  outputModalities: string[];
+  /** Per-TOKEN (converted from the published per-1k rate) so it is directly comparable
+   *  with OpenRouter's `pricing.prompt`. Undefined when unpublished. */
+  inputTokenPrice?: number;
+  outputTokenPrice?: number;
 }
 
 interface RawGlooModel {
   id?: unknown;
+  output_modalities?: unknown;
+  pricing?: {
+    input?: { rate_per_1k_tokens?: unknown };
+    output?: { rate_per_1k_tokens?: unknown };
+  };
+}
+
+/** Parse a published per-1k decimal string into a per-token number. */
+function per1kToPerToken(raw: unknown): number | undefined {
+  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n / 1000 : undefined;
 }
 
 /** Normalize one raw Gloo catalogue entry into a {@link GlooModelInfo}. */
 export function toGlooModelInfo(raw: RawGlooModel): GlooModelInfo {
-  return { id: typeof raw.id === "string" ? raw.id : "" };
+  const modalities = Array.isArray(raw.output_modalities)
+    ? raw.output_modalities.filter((m): m is string => typeof m === "string")
+    : [];
+  const info: GlooModelInfo = {
+    id: typeof raw.id === "string" ? raw.id : "",
+    outputModalities: modalities,
+  };
+  const input = per1kToPerToken(raw.pricing?.input?.rate_per_1k_tokens);
+  const output = per1kToPerToken(raw.pricing?.output?.rate_per_1k_tokens);
+  if (input !== undefined) info.inputTokenPrice = input;
+  if (output !== undefined) info.outputTokenPrice = output;
+  return info;
 }
 
-// Substrings that signal a cheaper/smaller tier when no real pricing metadata is available.
-const GLOO_CHEAP_TIER = ["mini", "nano", "small", "lite", "flash", "haiku"];
+/** Can this entry serve a chat/completions round-trip? An entry with NO modality metadata
+ *  is treated as text: the catalogue publishing less than it does today must degrade to the
+ *  old behaviour rather than resolving nothing and reddening the whole e2e lane. */
+function servesText(m: GlooModelInfo): boolean {
+  return m.outputModalities.length === 0 || m.outputModalities.includes("text");
+}
+
+/** Sort key: cheapest first, unpriced last (an unpriced model is still better than none). */
+function priceOf(m: GlooModelInfo): number {
+  const input = m.inputTokenPrice;
+  const output = m.outputTokenPrice;
+  if (input === undefined && output === undefined) return Number.POSITIVE_INFINITY;
+  return (input ?? 0) + (output ?? 0);
+}
 
 /**
- * Pick a Gloo chat model at run time: prefer a cheap-tier id (to minimize live cost, §10.9),
- * else fall back to the first non-empty catalogue id. Throws (actionable) if the catalogue is
- * empty — a Gloo round-trip with no discoverable model would force a hardcode, which §10.9
- * forbids.
+ * Pick a Gloo chat model at run time: the cheapest TEXT-capable entry by real published
+ * price (§10.9's "resolve cheapest at run time" mitigation). Throws (actionably) when the
+ * catalogue yields no text-capable model — resolving one by hardcoding is what §10.9 forbids.
  */
 export function selectGlooChatModel(models: GlooModelInfo[]): string {
-  const ids = models.map((m) => m.id).filter((id) => id.length > 0);
-  const cheap = ids.find((id) => {
-    const lower = id.toLowerCase();
-    return GLOO_CHEAP_TIER.some((tier) => lower.includes(tier));
-  });
-  const pick = cheap ?? ids[0];
+  const candidates = models
+    .filter((m) => m.id.length > 0 && servesText(m))
+    .sort((a, b) => priceOf(a) - priceOf(b));
+  const pick = candidates[0]?.id;
   if (!pick) {
     throw new Error(
-      "no Gloo model found via the /platform/v2/models catalogue — cannot resolve an adequate " +
-        "Gloo chat model at run time without hardcoding one (design-delta §10.9).",
+      "no text-capable Gloo model found via the /platform/v2/models catalogue — cannot resolve " +
+        "an adequate Gloo chat model at run time without hardcoding one (design-delta §10.9). " +
+        "NOTE: image-only entries are excluded on purpose; they answer 400 on chat/completions.",
+    );
+  }
+  return pick;
+}
+
+/**
+ * Pick a Gloo IMAGE model at run time — the `/ai/v2/responses` surface, not chat.
+ *
+ * Prefers an image-ONLY entry over a text+image one. Both can produce a picture, but a
+ * text+image model may answer a bare prompt with prose instead, which would surface as a
+ * confusing 502 ("no completed image output") rather than as a clear failure. Cheapest
+ * first, by real published price.
+ */
+export function selectGlooImageModel(models: GlooModelInfo[]): string {
+  const candidates = models
+    .filter((m) => m.id.length > 0 && m.outputModalities.includes("image"))
+    .sort((a, b) => {
+      const imageOnly = (m: GlooModelInfo) =>
+        m.outputModalities.includes("text") ? 1 : 0;
+      const byShape = imageOnly(a) - imageOnly(b);
+      return byShape !== 0 ? byShape : priceOf(a) - priceOf(b);
+    });
+  const pick = candidates[0]?.id;
+  if (!pick) {
+    throw new Error(
+      "no image-capable Gloo model found via the /platform/v2/models catalogue — cannot " +
+        "resolve one at run time without hardcoding it (design-delta §10.9).",
     );
   }
   return pick;
@@ -426,4 +507,24 @@ export async function resolveGlooModel(
   const body = (await res.json()) as { data?: RawGlooModel[]; models?: RawGlooModel[] };
   const raw = body.data ?? body.models ?? [];
   return selectGlooChatModel(raw.map(toGlooModelInfo));
+}
+
+/** The image twin of {@link resolveGlooModel} — same catalogue, different filter. */
+export async function resolveGlooImageModel(
+  env: GlooModelEnv,
+  bearerToken: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const res = await fetchImpl(`${trimSlash(env.GLOO_BASE_URL)}/platform/v2/models`, {
+    method: "GET",
+    headers: { accept: "application/json", authorization: `Bearer ${bearerToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Gloo model discovery failed: GET /platform/v2/models -> ${res.status}`,
+    );
+  }
+  const body = (await res.json()) as { data?: RawGlooModel[]; models?: RawGlooModel[] };
+  const raw = body.data ?? body.models ?? [];
+  return selectGlooImageModel(raw.map(toGlooModelInfo));
 }

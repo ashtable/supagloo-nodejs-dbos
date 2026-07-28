@@ -3,7 +3,12 @@ import { buildAssetKey, type GenerateImagePayload } from "@supagloo/database-lib
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getProviderConfig } from "../providers/config";
-import { loadOpenRouterCredential } from "../providers/credentials";
+import {
+  loadGlooCredential,
+  loadOpenRouterCredential,
+} from "../providers/credentials";
+import { mintGlooToken } from "../providers/gloo";
+import { requestGlooImage } from "../providers/gloo-image";
 import { requestImage } from "../providers/media-client";
 import { MEDIA_RETRY, DISCOVERY_RETRY } from "../providers/errors";
 import { getS3Config } from "../files/s3-config";
@@ -22,18 +27,29 @@ import {
 
 /**
  * `generateImageWorkflow` (queue `ai-generation`) — the FIRST media-generation workflow and
- * the FIRST real S3 WRITE in the codebase. Design-delta §7 workflow 6. `image` is
- * openrouter-only (§9-Q2). NO repair loop (image output is opaque bytes, not schema-validated
- * JSON — there is nothing to re-prompt on).
+ * the FIRST real S3 WRITE in the codebase. Design-delta §7 workflow 6. NO repair loop
+ * (image output is opaque bytes, not schema-validated JSON — nothing to re-prompt on).
+ *
+ * -- TWO providers as of 2026-07-28 (genesis-1 Inspector, D1) ------------------------
+ * This workflow used to be openrouter-only on the authority of §9-Q2's "Gloo has no media
+ * modalities". That is false for images: Gloo carries 11 image-capable models and a real
+ * PNG was generated from one. They are simply not reachable through chat/completions --
+ * that surface answers 400 with "Use the POST /v2/responses endpoint instead", which is
+ * why the capability went unnoticed. The two paths differ in credential (a long-lived
+ * OpenRouter key vs a per-attempt minted Gloo bearer), endpoint, request shape and
+ * response shape, so they are two branches rather than one parameterised call.
+ * `narration`/`music`/`video` remain openrouter-only, and correctly so -- those Gloo
+ * routes answer 404 (absent), not 405.
  *
  * Steps: loadRequestAndCredentials → callImageModel (MEDIA_RETRY: maxAttempts 4 + backoff,
  * 4xx fail-fast; folds the design's `callImageModel` + `fetchAssetBytes` + `uploadAssetToS3`
  * into ONE step) → persistResult. It ONLY writes the `AiGeneration` row (status +
  * resultAssetKey) — never `ProjectVersion` or the manifest.
  *
- * SECRET HANDLING: `loadRequestAndCredentials` verifies the OpenRouter connection exists but
- * returns NO plaintext; the key is (re)loaded INSIDE `callImageModel` so it never lands in a
- * DBOS checkpoint (same discipline as generateScript).
+ * SECRET HANDLING: `loadRequestAndCredentials` verifies the relevant connection exists but
+ * returns NO plaintext; the credential is (re)loaded INSIDE `callImageModel` so it never
+ * lands in a DBOS checkpoint (same discipline as generateScript). The Gloo bearer is minted
+ * fresh inside each step attempt and never cached -- also generateScript's shape.
  *
  * WHY callImageModel + upload are ONE DBOS step: on real OpenRouter the image is returned
  * INLINE as a base64 data URI in the chat-completions response (`modalities:["image"]`) — there
@@ -93,13 +109,23 @@ async function generateImageFn(
           throw new GenerationRequestInvalidError(`no AiGeneration row for id ${genId}`);
         }
         const req = parseImageRequest(row);
-        // Verify the OpenRouter connection exists WITHOUT returning the plaintext secret.
+        // Verify the relevant connection exists WITHOUT returning the plaintext secret.
+        // WHICH one depends on the row's provider -- checking the wrong one would let a
+        // Gloo generation reach the provider call before failing, wasting the step.
         const cfg = getProviderConfig();
-        await loadOpenRouterCredential({
-          prisma,
-          userId: req.userId,
-          encryptionKey: cfg.secretsEncryptionKey,
-        });
+        if (req.provider === "gloo") {
+          await loadGlooCredential({
+            prisma,
+            userId: req.userId,
+            encryptionKey: cfg.secretsEncryptionKey,
+          });
+        } else {
+          await loadOpenRouterCredential({
+            prisma,
+            userId: req.userId,
+            encryptionKey: cfg.secretsEncryptionKey,
+          });
+        }
         await markImageGenerationRunning(prisma, genId);
         return req;
       },
@@ -121,15 +147,43 @@ async function generateImageFn(
     await DBOS.runStep(
       async () => {
         const cfg = getProviderConfig();
-        const cred = await loadOpenRouterCredential({
-          prisma,
-          userId: request.userId,
-          encryptionKey: cfg.secretsEncryptionKey,
-        });
-        const { bytes, contentType } = await requestImage(
-          { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey },
-          { modelId: request.model, prompt: request.prompt },
-        );
+        const { bytes, contentType } =
+          request.provider === "gloo"
+            ? await (async () => {
+                const cred = await loadGlooCredential({
+                  prisma,
+                  userId: request.userId,
+                  encryptionKey: cfg.secretsEncryptionKey,
+                });
+                // Minted per attempt, inside the step -- never cached, never checkpointed.
+                const token = await mintGlooToken({
+                  glooBaseUrl: cfg.glooBaseUrl,
+                  clientId: cred.clientId,
+                  clientSecret: cred.clientSecret,
+                });
+                return requestGlooImage(
+                  { glooBaseUrl: cfg.glooBaseUrl, accessToken: token.accessToken },
+                  {
+                    modelId: request.model,
+                    prompt: request.prompt,
+                    // Faith alignment applies on the image surface too: the same request
+                    // with `tradition` set still returned a valid PNG, input tokens
+                    // rising 1042 -> 14917. Absent unless the user chose one.
+                    ...(request.tradition ? { tradition: request.tradition } : {}),
+                  },
+                );
+              })()
+            : await (async () => {
+                const cred = await loadOpenRouterCredential({
+                  prisma,
+                  userId: request.userId,
+                  encryptionKey: cfg.secretsEncryptionKey,
+                });
+                return requestImage(
+                  { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey },
+                  { modelId: request.model, prompt: request.prompt },
+                );
+              })();
         const { client, bucket } = getS3Config();
         await uploadAsset(client, {
           bucket,
