@@ -307,11 +307,14 @@ async function scaffoldProjectFn(
       { name: "pushOpenMergeBasePr", ...NETWORK_RETRY, shouldRetry: retryUnlessPermanent },
     );
 
-    // 7) cutWorkingBranch — cut v0.0.1 from the base and push it.
+    // 7) cutWorkingBranch — cut v0.0.1 from the MERGED base tip (`pr.mergeSha`) and push it.
+    //    NOT from the local v0.0.0 branch: the base PR is squash-merged, so v0.0.0's commit
+    //    is not an ancestor of main and a v0.0.1 cut from it diverges — which makes the
+    //    publish PR permanently unmergeable. See `cutWorkingBranchLocal`'s doc comment.
     await at("cutWorkingBranch");
     const workingSha = await DBOS.runStep(
       async () => {
-        const { workingSha } = await cutWorkingBranchLocal(ctx);
+        const { workingSha } = await cutWorkingBranchLocal(ctx, pr.mergeSha);
         await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
         await markStageDone(prisma, jobId, "cutWorkingBranch");
         return workingSha;

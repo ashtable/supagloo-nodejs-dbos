@@ -235,12 +235,37 @@ export async function materializeBaseVersion(
   return { path, baseSha, filesWritten };
 }
 
-/** Cut the `v0.0.1` working branch from the base commit (a plain branch, no commit). */
+/**
+ * Cut the `v0.0.1` working branch from the MERGED base tip (a plain branch, no commit).
+ *
+ * `mergedBaseSha` is the sha `pushOpenMergeBasePr` got back from merging the base PR — the
+ * commit that `main` actually points at, NOT the local `v0.0.0` tip.
+ *
+ * **Cutting from the local `v0.0.0` branch is the bug this parameter exists to prevent.**
+ * The base PR is SQUASH-merged, so `main` receives a BRAND-NEW commit parented on the base
+ * tip; `v0.0.0`'s own commit is never an ancestor of `main`. A `v0.0.1` cut from `v0.0.0`
+ * therefore DIVERGES from `main` at the pre-scaffold commit, and both sides independently
+ * "add" all 14 scaffold files. Everything the user then edits on `v0.0.1` turns those into
+ * add/add conflicts with different content, so `publishVersionWorkflow`'s PR is born
+ * `mergeable_state: "dirty"` and GitHub answers its merge `405 "not mergeable"` — surfacing
+ * as publish-version's `is NOT merged … refusing its test-merge sha` (the correct refusal
+ * from a resolveMergeCommitSha that was handed an unmergeable PR). Reproduced on
+ * `ashtable/genesis-1#2`: `main`/`v0.0.1` `status: "diverged"`, merge base = the auto_init
+ * commit. Cutting from the merge sha makes `v0.0.1` a descendant of `main`, which is also
+ * exactly what `publish-version/workspace.ts#cutNextBranch` already does for every LATER
+ * version — this makes scaffold agree with publish instead of contradicting it.
+ *
+ * The merge commit is created on the ORIGIN by the REST merge, so a workspace cloned before
+ * that call has never seen it: fetch the base branch first (which carries the merge sha, and
+ * still carries it as an ancestor if the branch has since moved on).
+ */
 export async function cutWorkingBranchLocal(
   ctx: ScaffoldContext,
+  mergedBaseSha: string,
 ): Promise<{ path: string; workingSha: string }> {
-  const { path } = await materializeBaseVersion(ctx);
-  await checkoutBranch(path, WORKING_BRANCH, BASE_BRANCH);
+  const path = await ensureClone(ctx); // self-heal: a crash-lost workspace re-clones
+  await git(["fetch", "origin", baseRefOf(ctx)], { cwd: path });
+  await checkoutBranch(path, WORKING_BRANCH, mergedBaseSha);
   const workingSha = await revParse(path, "HEAD");
   return { path, workingSha };
 }

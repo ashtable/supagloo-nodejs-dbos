@@ -149,6 +149,36 @@ function remoteHeads(fixture: FixtureRepo, token: string): string[] {
     .map((line) => line.split(/\s+/)[1]);
 }
 
+/**
+ * How many commits `base` carries that `head` does not, on the real origin.
+ *
+ * `0` means `base` is fully reachable from `head` — GitHub's `compare` calls that `ahead`
+ * (or `identical`) rather than `diverged`, and it is the precondition for `head → base`
+ * being mergeable at all. Read with `git rev-list --count base..head`-style output rather
+ * than `merge-base --is-ancestor`, whose answer is an EXIT CODE that `gitFixtureExec`
+ * (correctly) turns into a throw, making "not an ancestor" indistinguishable from a real
+ * git failure. A `--bare` clone is enough: it brings every `refs/heads/*` and no worktree.
+ */
+function commitsMissingFrom(fixture: FixtureRepo, token: string, head: string, base: string): number {
+  const dir = join(tmpdir(), `scaffold-ancestry-${randomUUID().slice(0, 8)}.git`);
+  try {
+    gitFixtureExec([
+      "clone",
+      "--bare",
+      authenticatedRemoteUrl({ token, owner: fixture.owner, repo: fixture.repo }),
+      dir,
+    ]);
+    return Number(
+      gitFixtureExec(
+        ["rev-list", "--count", `refs/heads/${head}..refs/heads/${base}`],
+        { cwd: dir },
+      ).trim(),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function seedProjectJob(fixture: FixtureRepo): Promise<{
   projectId: string;
   jobId: string;
@@ -296,6 +326,22 @@ describe("scaffoldProjectWorkflow — happy path", () => {
     const heads = remoteHeads(fixture, github.token);
     expect(heads).toContain("refs/heads/v0.0.0");
     expect(heads).toContain("refs/heads/v0.0.1");
+
+    // ...and v0.0.1 must be a DESCENDANT of main, not merely present. This is the property
+    // `publishVersionWorkflow` silently depends on and the one nothing asserted until a real
+    // project (`ashtable/genesis-1#2`) hit it: because the base PR is SQUASH-merged, main
+    // gets a brand-new commit and v0.0.0's commit is never an ancestor of it, so a v0.0.1
+    // cut from v0.0.0 diverges — both sides independently "add" all 14 scaffold files. The
+    // repo looks perfect (both branches exist, PR merged, tags right) and every assertion in
+    // this spec still passed; the damage only surfaces once the user COMMITS to v0.0.1 and
+    // publishes, where GitHub answers the release merge `405 "not mergeable"`.
+    //
+    // Deliberately asserted HERE rather than in publish-version.e2e.ts: that spec hand-builds
+    // its fixture by cutting v0.0.1 straight from main, which is the ALREADY-FIXED shape, so
+    // it cannot observe what scaffold actually emits. This is the only lane that runs the
+    // real scaffoldProjectWorkflow against real GitHub, so it is the only place the two
+    // workflows' contract can be held.
+    expect(commitsMissingFrom(fixture, github.token, "v0.0.1", "main")).toBe(0);
 
     // Exactly-once, proven along TWO independent axes (D9) instead of the stub's single
     // conflated counter.
