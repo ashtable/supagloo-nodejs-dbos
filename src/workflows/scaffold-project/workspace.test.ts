@@ -345,18 +345,101 @@ describe("ensureBaseRef", () => {
 });
 
 describe("cutWorkingBranchLocal", () => {
-  it("cuts v0.0.1 from the base and pushes it to the origin", async () => {
+  /**
+   * Reproduce what GitHub's `PUT /merge` does to the ORIGIN when the base PR is squash-merged:
+   * `main` gains a BRAND-NEW commit carrying v0.0.0's tree, parented on the pre-scaffold tip.
+   * v0.0.0's own commit is deliberately NOT an ancestor of the result — that is the whole
+   * shape of the defect, so the fixture must not fake it with a fast-forward.
+   */
+  function squashMergeIntoBase(bare: string, head: string, base = DEFAULT_BASE_BRANCH): string {
+    const work = mkdtempSync(join(root, "merge-"));
+    git(["clone", bare, work]);
+    git(["-C", work, "checkout", base]);
+    git(["-C", work, "merge", "--squash", `origin/${head}`]);
+    git(["-C", work, "commit", "-m", `Squash merge ${head}`]);
+    git(["-C", work, "push", "origin", base]);
+    return execFileSync("git", ["-C", work, "rev-parse", "HEAD"], {
+      env: { ...process.env, ...HERMETIC },
+    })
+      .toString()
+      .trim();
+  }
+
+  /** True when `ancestor` is reachable from `descendant` on the origin. */
+  function isAncestor(bare: string, ancestor: string, descendant: string): boolean {
+    try {
+      execFileSync(
+        "git",
+        [
+          "-C",
+          bare,
+          "merge-base",
+          "--is-ancestor",
+          `refs/heads/${ancestor}`,
+          `refs/heads/${descendant}`,
+        ],
+        { env: { ...process.env, ...HERMETIC }, stdio: "ignore" },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("cuts v0.0.1 from the MERGED base tip and pushes it to the origin", async () => {
     const ctx = ctxFor("job-d");
     const { baseSha } = await materializeBaseVersion(ctx);
     await pushBranchFromWorkspace(ctx, BASE_BRANCH);
+    const mergeSha = squashMergeIntoBase(originDir, BASE_BRANCH);
 
-    const { workingSha } = await cutWorkingBranchLocal(ctx);
-    // Working branch starts at the base commit (a plain cut — no new commit).
-    expect(workingSha).toBe(baseSha);
+    const { workingSha } = await cutWorkingBranchLocal(ctx, mergeSha);
+    // A plain cut — no new commit — but at the MERGE commit, not the local v0.0.0 tip. The
+    // squash gave those two different shas, which is exactly why the distinction matters.
+    expect(workingSha).toBe(mergeSha);
+    expect(workingSha).not.toBe(baseSha);
     await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
 
     const branches = remoteBranches(originDir);
     expect(branches).toContain(BASE_BRANCH);
     expect(branches).toContain(WORKING_BRANCH);
+    // The scaffold is still there — cutting from main must not lose the tree it merged.
+    expect(existsSync(join(workspacePath(ctx), "supagloo.project.json"))).toBe(true);
+  });
+
+  /**
+   * THE REGRESSION. `publishVersionWorkflow` opens `v0.0.1 → main` and merges it; GitHub can
+   * only do that if the two have not diverged. Cutting v0.0.1 from the local v0.0.0 branch
+   * (as this did until now) left `main` UNREACHABLE from v0.0.1 after the squash, so every
+   * publish PR was born `mergeable_state: "dirty"` and its merge answered `405 "not
+   * mergeable"`. Asserting reachability on the ORIGIN is what pins the fix: it fails on the
+   * old `checkoutBranch(path, WORKING_BRANCH, BASE_BRANCH)` and passes on the merge sha.
+   */
+  it("leaves v0.0.1 a descendant of main, so a later publish PR is mergeable", async () => {
+    const ctx = ctxFor("job-d2");
+    await materializeBaseVersion(ctx);
+    await pushBranchFromWorkspace(ctx, BASE_BRANCH);
+    const mergeSha = squashMergeIntoBase(originDir, BASE_BRANCH);
+
+    await cutWorkingBranchLocal(ctx, mergeSha);
+    await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
+
+    expect(isAncestor(originDir, DEFAULT_BASE_BRANCH, WORKING_BRANCH)).toBe(true);
+    // ...and the pre-squash v0.0.0 commit is NOT on that line, confirming the fixture really
+    // reproduced a squash (an accidental fast-forward would make the assertion above free).
+    expect(isAncestor(originDir, BASE_BRANCH, WORKING_BRANCH)).toBe(false);
+  });
+
+  it("self-heals a lost workspace and still cuts from the merged base tip", async () => {
+    const ctx = ctxFor("job-d3");
+    await materializeBaseVersion(ctx);
+    await pushBranchFromWorkspace(ctx, BASE_BRANCH);
+    const mergeSha = squashMergeIntoBase(originDir, BASE_BRANCH);
+
+    rmSync(workspacePath(ctx), { recursive: true, force: true }); // crash: workspace gone
+
+    const { workingSha } = await cutWorkingBranchLocal(ctx, mergeSha);
+    expect(workingSha).toBe(mergeSha);
+    await pushBranchFromWorkspace(ctx, WORKING_BRANCH);
+    expect(remoteSha(originDir, WORKING_BRANCH)).toBe(mergeSha);
   });
 });
