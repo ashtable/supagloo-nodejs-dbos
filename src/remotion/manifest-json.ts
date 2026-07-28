@@ -33,6 +33,20 @@ export function canonicalizeManifest(
     if (scene.visualAssetKey !== undefined) {
       out.visualAssetKey = scene.visualAssetKey;
     }
+    // The SAME symmetry invariant recorded below for `narratorVoice.assetKey`: a field the
+    // generator READS but this function does not WRITE is silently erased on every commit.
+    // These three drive the per-scene narration <Audio>, the scene/narration duration
+    // reconciliation, and the still-vs-clip branch respectively — dropping any of them
+    // would quietly restore the exact bug it was added to fix, one commit later.
+    if (scene.visualAssetKind !== undefined) {
+      out.visualAssetKind = scene.visualAssetKind;
+    }
+    if (scene.narrationAssetKey !== undefined) {
+      out.narrationAssetKey = scene.narrationAssetKey;
+    }
+    if (scene.narrationDurationSeconds !== undefined) {
+      out.narrationDurationSeconds = scene.narrationDurationSeconds;
+    }
     return out;
   });
 
@@ -65,6 +79,11 @@ export function canonicalizeManifest(
     const music: Record<string, unknown> = { style: manifest.music.style };
     if (manifest.music.assetKey !== undefined) {
       music.assetKey = manifest.music.assetKey;
+    }
+    // The MEASURED bed length. Without it surviving a commit the composition cannot loop
+    // the bed, and the music silently reverts to "plays once, then silence".
+    if (manifest.music.durationSeconds !== undefined) {
+      music.durationSeconds = manifest.music.durationSeconds;
     }
     out.music = music;
   }

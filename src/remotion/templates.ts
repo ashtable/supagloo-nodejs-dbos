@@ -1,4 +1,8 @@
-import type { ProjectManifest } from "@supagloo/database-lib";
+import {
+  effectiveSceneDurationSeconds,
+  type ManifestScene,
+  type ProjectManifest,
+} from "@supagloo/database-lib";
 import type { AssignedScene } from "./naming";
 import { REACT_VERSION, REMOTION_VERSION } from "./versions";
 
@@ -20,13 +24,70 @@ export function frameCount(durationSeconds: number, fps: number): number {
   return Math.max(1, Math.round(durationSeconds * fps));
 }
 
+/**
+ * How many frames a scene occupies — the ONE place the render turns a scene into a length.
+ *
+ * Goes through `effectiveSceneDurationSeconds`, so a scene whose measured narration is
+ * longer than its authored `durationSeconds` STRETCHES rather than cutting the verse off
+ * mid-sentence. Scene lengths originate in the LLM's `suggestedDurationSeconds`, which has
+ * no relationship at all to how long the text takes to read aloud.
+ */
+export function sceneFrames(scene: ManifestScene, fps: number): number {
+  return frameCount(effectiveSceneDurationSeconds(scene), fps);
+}
+
 /** Total composition length = Σ per-scene frames, clamped ≥ 1 (zero-scene → 1). */
 export function totalFrames(manifest: ProjectManifest): number {
   const sum = manifest.scenes.reduce(
-    (acc, scene) => acc + frameCount(scene.durationSeconds, manifest.composition.fps),
+    (acc, scene) => acc + sceneFrames(scene, manifest.composition.fps),
     0,
   );
   return Math.max(1, sum);
+}
+
+/** How long the music bed fades out for at the end of the video. */
+const MUSIC_FADE_SECONDS = 1.5;
+/** The music bed's level under the narration. Matches the studio preview. */
+const MUSIC_VOLUME = 0.4;
+
+/**
+ * Ken Burns motion, indexed by the scene's position (plan D8).
+ *
+ * Determinism is a hard requirement, not a preference: the generator is pure and is pinned
+ * byte-for-byte by goldens, and `materializeRenderSources` re-runs it at render time — so a
+ * `Math.random()` or a wall-clock read would make the goldens unmaintainable AND make two
+ * renders of the same commit differ. Deriving the variant from the index gives per-scene
+ * variety (a cut never looks like a continuation of the previous move) with none of that.
+ *
+ * Over-scan is deliberately modest: at most 1.10 scale with a ≤1.5% drift, so the image
+ * always covers the frame and never letterboxes. This costs no extra decode memory —
+ * `<Img>` decodes at the source's natural size regardless, and `scale`/`translate` are
+ * compositing operations — so `render-sizing.md`'s (320×180-derived) budget is unaffected.
+ *
+ * `scale` MUST be emitted as a STRING. React's `isUnitlessNumber` table does not contain
+ * `scale`, so a numeric value renders as `scale:1.1px` — invalid CSS, and the pan silently
+ * does nothing. Verified with react-dom 18.3.1 directly.
+ */
+const KEN_BURNS: ReadonlyArray<{
+  scale: [string, string];
+  translate: [string, string];
+}> = [
+  { scale: ["1", "1.1"], translate: ["0% 0%", "1.5% 1%"] },
+  { scale: ["1.1", "1"], translate: ["-1.5% -1%", "0% 0%"] },
+  { scale: ["1", "1.1"], translate: ["0% 0%", "-1.5% 1%"] },
+  { scale: ["1.1", "1"], translate: ["1.5% -1%", "0% 0%"] },
+];
+
+/** `["a","b"]` → `["a", "b"]` — matches the spacing of every other emitted literal. */
+function jsxArray(values: readonly string[]): string {
+  return `[${values.map((v) => JSON.stringify(v)).join(", ")}]`;
+}
+
+/** `Alpha` → `alpha`. Component names are already unique valid identifiers, and they are
+ *  sanitized to start with an upper-case letter, so lower-casing the first char preserves
+ *  uniqueness. Used to derive per-scene narration const names. */
+function lowerFirst(name: string): string {
+  return name.charAt(0).toLowerCase() + name.slice(1);
 }
 
 // ── static files (manifest-independent) ─────────────────────────────────────
@@ -213,23 +274,47 @@ export function buildVideoSource(
   // the bundle is never played. The render workflow patches a freshly-synthesized track's
   // (workspace-local) key into the manifest and re-materializes these sources, so both the
   // cached-ref and the synthesized-fallback paths land here identically.
-  const narrationKey = manifest.narratorVoice.assetKey ?? null;
+  const { fps } = manifest.composition;
+  const total = totalFrames(manifest);
+
+  // PER-SCENE NARRATION (bug 1, second half). The shipped composition mounted ONE
+  // whole-project narration <Audio> at frame 0, OUTSIDE every <Sequence>, while scene
+  // lengths came from the LLM's suggested durations — so there was no sync mechanism of any
+  // kind and scene 3's verse could play over scene 1's picture. Mounting each scene's clip
+  // inside that scene's own <Sequence> IS the sync: Remotion starts a nested media element
+  // when its Sequence starts.
+  const narrationScenes = assigned
+    .map((a) => ({
+      assigned: a,
+      key: a.scene.narrationAssetKey ?? null,
+      constName: `${lowerFirst(a.component)}Narration`,
+    }))
+    .filter((n): n is typeof n & { key: string } => Boolean(n.key));
+
+  // The whole-video narration track is the BACKWARD-COMPATIBLE fallback: manifests
+  // committed before per-scene narration existed carry only `narratorVoice.assetKey`, and
+  // must keep rendering exactly as they do today. Once any scene has its own clip the
+  // whole-video track would double up, so it yields.
+  const legacyNarrationKey =
+    narrationScenes.length === 0 ? (manifest.narratorVoice.assetKey ?? null) : null;
   const musicKey = manifest.music?.assetKey ?? null;
-  const audioKeys: Array<{ name: string; key: string }> = [];
-  if (narrationKey) audioKeys.push({ name: "narrationAssetKey", key: narrationKey });
-  if (musicKey) audioKeys.push({ name: "musicAssetKey", key: musicKey });
+  // Only a MEASURED length can drive a loop. Absent (every v1 manifest) ⇒ the plain <Audio>
+  // this file already emitted — old behaviour is the honest fallback, whereas inventing an
+  // iteration length would mis-time the bed on every render.
+  const musicLoopFrames = manifest.music?.durationSeconds
+    ? frameCount(manifest.music.durationSeconds, fps)
+    : null;
+  const musicLoops = musicLoopFrames !== null && musicLoopFrames < total;
 
-  const audioConsts = audioKeys.map(
-    (a) => `const ${a.name} = ${JSON.stringify(a.key)};`,
-  );
-  const audioSrcs = audioKeys.map(
-    (a) => `  const ${a.name}Src = getAssetUrl(${a.name});`,
-  );
-  const audioElements = audioKeys.flatMap((a) => [
-    `      {${a.name}Src ? <Audio src={${a.name}Src} /> : null}`,
-  ]);
+  const topLevelKeys: Array<{ name: string; key: string }> = [];
+  if (legacyNarrationKey) {
+    topLevelKeys.push({ name: "narrationAssetKey", key: legacyNarrationKey });
+  }
+  if (musicKey) topLevelKeys.push({ name: "musicAssetKey", key: musicKey });
 
-  if (assigned.length === 0 && audioKeys.length === 0) {
+  const hasAudio = topLevelKeys.length > 0 || narrationScenes.length > 0;
+
+  if (assigned.length === 0 && !hasAudio) {
     return [
       ...header,
       'import { AbsoluteFill } from "remotion";',
@@ -241,15 +326,28 @@ export function buildVideoSource(
     ].join("\n");
   }
 
+  const audioConsts = [
+    ...topLevelKeys.map((a) => `const ${a.name} = ${JSON.stringify(a.key)};`),
+    ...narrationScenes.map(
+      (n) => `const ${n.constName}Key = ${JSON.stringify(n.key)};`,
+    ),
+  ];
+  const audioSrcs = [
+    ...topLevelKeys.map((a) => `  const ${a.name}Src = getAssetUrl(${a.name});`),
+    ...narrationScenes.map(
+      (n) => `  const ${n.constName}Src = getAssetUrl(${n.constName}Key);`,
+    ),
+  ];
+
   const remotionImports = ["AbsoluteFill"];
-  if (audioKeys.length > 0) remotionImports.push("Audio");
+  if (hasAudio) remotionImports.push("Audio");
+  if (musicLoops) remotionImports.push("Loop");
   if (assigned.length > 0) remotionImports.push("Sequence");
+  if (musicLoops) remotionImports.push("interpolate");
 
   const imports = [
     `import { ${remotionImports.join(", ")} } from "remotion";`,
-    ...(audioKeys.length > 0
-      ? ['import { getAssetUrl } from "./lib/assets";']
-      : []),
+    ...(hasAudio ? ['import { getAssetUrl } from "./lib/assets";'] : []),
     ...assigned.map(
       (a) => `import { ${a.component} } from "./scenes/${a.component}";`,
     ),
@@ -260,15 +358,64 @@ export function buildVideoSource(
   body.push("export const VideoComposition = () => {");
   if (audioSrcs.length > 0) body.push(...audioSrcs, "");
   body.push("  return (", '    <AbsoluteFill style={{ backgroundColor: "#000000" }}>');
-  body.push(...audioElements);
+
+  if (legacyNarrationKey) {
+    body.push("      {narrationAssetKeySrc ? <Audio src={narrationAssetKeySrc} /> : null}");
+  }
+
+  if (musicKey) {
+    if (musicLoops) {
+      // MUSIC COVERAGE (bug 2, arm B). <Loop> renders
+      // `ceil(compositionDuration / durationInFrames)` iterations and the composition's own
+      // end trims the final partial one — coverage and trim in a single construct, with no
+      // dependence on the provider returning a conveniently-sized clip (verified live: no
+      // music model accepts a requested length at all).
+      //
+      // `loopVolumeCurveBehavior="extend"` is what makes the fade a WHOLE-VIDEO tail rather
+      // than a duck at the end of every iteration: remotion's `useFrameForVolumeProp` adds
+      // `loop.durationInFrames * loop.iteration` under "extend", so `f` is a composition
+      // frame. Under the default "repeat" the bed would dip repeatedly through the video.
+      const fadeStart = Math.max(0, total - frameCount(MUSIC_FADE_SECONDS, fps));
+      body.push(
+        "      {musicAssetKeySrc ? (",
+        `        <Loop durationInFrames={${musicLoopFrames}}>`,
+        "          <Audio",
+        "            src={musicAssetKeySrc}",
+        '            loopVolumeCurveBehavior="extend"',
+        "            volume={(f) =>",
+        `              interpolate(f, [${fadeStart}, ${total}], [${MUSIC_VOLUME}, 0], {`,
+        '                extrapolateLeft: "clamp",',
+        '                extrapolateRight: "clamp",',
+        "              })",
+        "            }",
+        "          />",
+        "        </Loop>",
+        "      ) : null}",
+      );
+    } else {
+      body.push(
+        `      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} volume={${MUSIC_VOLUME}} /> : null}`,
+      );
+    }
+  }
+
+  const narrationByComponent = new Map(
+    narrationScenes.map((n) => [n.assigned.component, n.constName]),
+  );
   let from = 0;
   for (const a of assigned) {
-    const frames = frameCount(a.scene.durationSeconds, manifest.composition.fps);
+    const frames = sceneFrames(a.scene, fps);
     body.push(
       `      <Sequence name="${a.component}" from={${from}} durationInFrames={${frames}}>`,
       `        <${a.component} />`,
-      "      </Sequence>",
     );
+    const narration = narrationByComponent.get(a.component);
+    if (narration) {
+      body.push(
+        `        {${narration}Src ? <Audio src={${narration}Src} /> : null}`,
+      );
+    }
+    body.push("      </Sequence>");
     from += frames;
   }
   body.push("    </AbsoluteFill>", "  );", "};", "");
@@ -284,12 +431,23 @@ export function buildVideoSource(
  * in the style prop (no CSS transitions — forbidden by the guide). `scriptText` is
  * shown only when `scene.captions` is true; the `reference` label always renders.
  */
-export function buildSceneSource(assigned: AssignedScene): string {
+export function buildSceneSource(
+  assigned: AssignedScene,
+  fps: number,
+  index: number,
+): string {
   const scene = assigned.scene;
+  // A clip already moves; only a STILL gets the pan/zoom. `visualAssetKind` absent means
+  // image, which is exactly what every pre-existing v1 manifest was rendered as.
+  const isVideo = scene.visualAssetKind === "video";
+  const frames = sceneFrames(scene, fps);
+  const motion = KEN_BURNS[index % KEN_BURNS.length];
+  const visualComponent = isVideo ? "OffthreadVideo" : "Img";
+
   const lines: string[] = [
     "// Supagloo-generated scene source — DO NOT EDIT.",
     `// Regenerated from supagloo.project.json (scene id ${JSON.stringify(scene.id)}).`,
-    'import { AbsoluteFill, Img, interpolate, useCurrentFrame } from "remotion";',
+    `import { AbsoluteFill, ${visualComponent}, interpolate, useCurrentFrame } from "remotion";`,
     'import { getAssetUrl } from "../lib/assets";',
     "",
     `const visualAssetKey = ${JSON.stringify(scene.visualAssetKey ?? null)};`,
@@ -307,11 +465,51 @@ export function buildSceneSource(assigned: AssignedScene): string {
     "  return (",
     '    <AbsoluteFill style={{ backgroundColor: "#000000" }}>',
     "      {src ? (",
-    "        <Img",
-    "          src={src}",
-    '          style={{ width: "100%", height: "100%", objectFit: "cover" }}',
-    "        />",
-    "      ) : null}",
+  );
+  if (isVideo) {
+    // Renders a video-kind asset as a video rather than through <Img>, which shows a single
+    // frame of it at best. The manifest had no way to express the distinction at all before
+    // `visualAssetKind` — the image and video workflows write the same extensionless S3 key
+    // and the content-type is discarded on download.
+    //
+    // SCOPE: this MAKES CLOSING that latent bug possible; it does not close it. No producer
+    // writes `visualAssetKind` yet — the field is read here and in the nextjs preview, and
+    // plumbed through all four schema mirrors, but `setSceneVisual` / `IMAGE_GENERATED` write
+    // only `visualAssetKey`. So in production a generated video asset still reaches this
+    // function with the kind absent and is still rendered through <Img>. This branch is
+    // reachable only from a hand-written manifest and from tests until a producer sets it.
+    lines.push(
+      "        <OffthreadVideo",
+      "          src={src}",
+      '          style={{ width: "100%", height: "100%", objectFit: "cover" }}',
+      "        />",
+    );
+  } else {
+    // KEN BURNS. Normalized over this scene's OWN frame count so the move completes exactly
+    // once whatever the scene's length, and clamped at both ends so a scene held past its
+    // Sequence never over-travels. `scale` is a STRING because React's unitless-property
+    // table omits `scale` and would otherwise emit `scale:1.1px`, silently doing nothing.
+    lines.push(
+      "        <Img",
+      "          src={src}",
+      "          style={{",
+      '            width: "100%",',
+      '            height: "100%",',
+      '            objectFit: "cover",',
+      `            scale: interpolate(frame, [0, ${frames}], ${jsxArray(motion.scale)}, {`,
+      '              extrapolateLeft: "clamp",',
+      '              extrapolateRight: "clamp",',
+      "            }),",
+      `            translate: interpolate(frame, [0, ${frames}], ${jsxArray(motion.translate)}, {`,
+      '              extrapolateLeft: "clamp",',
+      '              extrapolateRight: "clamp",',
+      "            }),",
+      "          }}",
+      "        />",
+    );
+  }
+  lines.push("      ) : null}");
+  lines.push(
     "      <AbsoluteFill",
     "        style={{",
     '          justifyContent: "flex-end",',
@@ -325,9 +523,28 @@ export function buildSceneSource(assigned: AssignedScene): string {
     "        }}",
     "      >",
   );
+  // `dir="auto"` on both text runs is how a non-English verse renders correctly.
+  //
+  // It is the HTML standard's bidi first-strong-character determination (UAX#9 P2/P3) —
+  // a SPECIFIED algorithm, implemented identically by every browser engine. That is what
+  // makes the two places the text appears agree, and it is NOT a shared engine: the
+  // studio preview runs @remotion/player in the user's browser (which may be Safari or
+  // Firefox), this render runs @remotion/renderer in headless Chromium. They are not the
+  // same engine and do not need to be — the standard, not the engine, is why the preview
+  // and the MP4 cannot disagree about direction. That is the failure mode that matters,
+  // and one that a per-scene `direction` field on the manifest would not have prevented
+  // any better (it would only have added four schema mirrors and a db-lib release).
+  //
+  // It matters most on the reference line: YouVersion's own reference strings for RTL
+  // translations arrive pre-marked with U+200E around the numerals ("التكوين ‎1:1"), and
+  // rendering them in an LTR context reorders the numerals.
+  //
+  // `textAlign: "center"` stays: centring is direction-neutral, so `dir` is only fixing
+  // punctuation placement and mixed-content ordering, never the layout.
   if (scene.captions) {
     lines.push(
       "        <p",
+      '          dir="auto"',
       "          style={{",
       "            margin: 0,",
       '            color: "#ffffff",',
@@ -343,6 +560,7 @@ export function buildSceneSource(assigned: AssignedScene): string {
   }
   lines.push(
     "        <p",
+    '          dir="auto"',
     "          style={{",
     "            margin: 0,",
     '            color: "#ffffff",',

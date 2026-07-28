@@ -1,4 +1,8 @@
-import { Prisma, type PrismaClient } from "@supagloo/database-lib";
+import {
+  Prisma,
+  type NarrationResult,
+  type PrismaClient,
+} from "@supagloo/database-lib";
 
 // Cast helper for Prisma Json columns (mirrors generate-script/finalize.ts): a plain object
 // with a possibly-null property is a valid JSON value, but Prisma's InputJsonValue type is
@@ -27,12 +31,32 @@ export async function markAudioGenerationRunning(
   });
 }
 
-/** Idempotent success upsert: status succeeded + resultAssetKey + resultJson metadata
- *  (the provider generation id + the audio kind) + completedAt. */
+/**
+ * Idempotent success upsert: status succeeded + resultAssetKey + resultJson metadata
+ * (the provider generation id, the audio kind, and — for narration — the per-scene map)
+ * + completedAt.
+ *
+ * `resultAssetKey` remains exactly ONE key, preserving the row invariant. Narration now
+ * produces one clip per scene, and those extra keys ride in `resultJson.narration` (see
+ * db-lib `NarrationResultSchema`); `resultAssetKey` names the first scene's clip so every
+ * existing consumer of the column keeps working unchanged. `resultJson` was already the
+ * agreed home for audio metadata (decision D6), so this is that seam widening, not a new one.
+ *
+ * For music, `durationSeconds` is the MEASURED length of the returned bed — the number the
+ * composition needs in order to loop it far enough to cover the video.
+ */
 export async function persistAudioResult(
   prisma: PrismaClient,
   generationId: string,
-  args: { assetKey: string; kind: "narration" | "music"; providerGenerationId: string | null },
+  args: {
+    assetKey: string;
+    kind: "narration" | "music";
+    providerGenerationId: string | null;
+    /** Per-scene narration clips (narration only). */
+    narration?: NarrationResult;
+    /** Measured length of the synthesized track (music only). */
+    durationSeconds?: number | null;
+  },
 ): Promise<void> {
   await prisma.aiGeneration.update({
     where: { id: generationId },
@@ -42,6 +66,10 @@ export async function persistAudioResult(
       resultJson: toJson({
         kind: args.kind,
         providerGenerationId: args.providerGenerationId,
+        ...(args.narration ? { narration: args.narration } : {}),
+        ...(typeof args.durationSeconds === "number"
+          ? { durationSeconds: args.durationSeconds }
+          : {}),
       }),
       completedAt: new Date(),
       error: null,

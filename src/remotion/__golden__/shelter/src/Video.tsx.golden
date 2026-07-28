@@ -15,7 +15,7 @@ export const VideoComposition = () => {
   return (
     <AbsoluteFill style={{ backgroundColor: "#000000" }}>
       {narrationAssetKeySrc ? <Audio src={narrationAssetKeySrc} /> : null}
-      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} /> : null}
+      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} volume={0.4} /> : null}
       <Sequence name="Shelter" from={0} durationInFrames={150}>
         <Shelter />
       </Sequence>

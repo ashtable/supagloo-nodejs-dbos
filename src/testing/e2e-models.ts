@@ -90,7 +90,7 @@ export interface AudioModelInfo {
 interface RawAudioModel {
   id?: unknown;
   description?: unknown;
-  pricing?: { audio?: unknown; completion?: unknown };
+  pricing?: { audio?: unknown; completion?: unknown; prompt?: unknown };
 }
 
 /** Normalize one raw audio-model entry, classifying music vs TTS from its description/id. */
@@ -104,7 +104,15 @@ export function toAudioModelInfo(raw: RawAudioModel): AudioModelInfo {
     desc.includes("instrumental");
   return {
     id,
-    audioPrice: Number(raw.pricing?.audio ?? raw.pricing?.completion ?? NaN),
+    // Speech-catalogue models price on `prompt` (per input token) with `completion: "0"`,
+    // while the chat-audio models price on `audio`/`completion` — so all three are consulted.
+    audioPrice: Number(
+      raw.pricing?.audio ??
+        (Number(raw.pricing?.completion ?? 0) > 0
+          ? raw.pricing?.completion
+          : (raw.pricing?.prompt ?? raw.pricing?.completion)) ??
+        NaN,
+    ),
     isMusic,
   };
 }
@@ -132,6 +140,30 @@ export function selectAudioModel(
     throw new Error(
       `no ${kind} audio model found via discovery (music=${wantMusic}) — cannot resolve one ` +
         `without hardcoding (design-delta §10.9).`,
+    );
+  }
+  return pick.id;
+}
+
+/**
+ * Select a dedicated TTS model from the `output_modalities=speech` catalogue: cheapest by
+ * per-token price, ties broken by id. Every entry there is a batch synthesis model, so no
+ * music/TTS classification is needed — the catalogue itself is the filter. Throws
+ * (actionable) if it is empty, rather than silently falling back to a chat model.
+ */
+export function selectNarrationModel(models: AudioModelInfo[]): string {
+  const candidates = models
+    .filter((m) => m.id.length > 0)
+    .sort((a, b) => {
+      const pa = Number.isFinite(a.audioPrice) ? a.audioPrice : Number.POSITIVE_INFINITY;
+      const pb = Number.isFinite(b.audioPrice) ? b.audioPrice : Number.POSITIVE_INFINITY;
+      return pa - pb || a.id.localeCompare(b.id);
+    });
+  const pick = candidates[0];
+  if (!pick) {
+    throw new Error(
+      "no speech model found via discovery (GET /api/v1/models?output_modalities=speech) — " +
+        "cannot resolve a narration model without hardcoding one (design-delta §10.9).",
     );
   }
   return pick.id;
@@ -255,25 +287,45 @@ export async function resolveImageModel(env: E2eModelEnv): Promise<string> {
 
 async function fetchAudioModels(
   env: E2eModelEnv,
+  modality: "audio" | "speech",
   fetchImpl: typeof fetch = fetch,
 ): Promise<AudioModelInfo[]> {
   const res = await fetchImpl(
-    `${trimSlash(env.OPENROUTER_BASE_URL)}/api/v1/models?output_modalities=audio`,
+    `${trimSlash(env.OPENROUTER_BASE_URL)}/api/v1/models?output_modalities=${modality}`,
     { method: "GET", headers: { accept: "application/json" } },
   );
   if (!res.ok) {
-    throw new Error(`audio model discovery failed: -> ${res.status}`);
+    throw new Error(`${modality} model discovery failed: -> ${res.status}`);
   }
   const body = (await res.json()) as { data?: RawAudioModel[] };
   return (body.data ?? []).map(toAudioModelInfo);
 }
 
-/** Resolve a live audio model id for the kind (narration → TTS, music → Lyria). */
+/**
+ * Resolve a live audio model id for the kind.
+ *
+ * The two kinds read DIFFERENT catalogues, and this is not a stylistic choice — verified
+ * live, `output_modalities=speech` and `output_modalities=audio` return disjoint sets:
+ *
+ *   - narration → `speech` (15 dedicated batch-TTS models, `architecture.output_modalities`
+ *     is exactly `["speech"]`). These are the models `POST /api/v1/audio/speech` accepts.
+ *   - music     → `audio` (4 models: the two Lyria music models plus the two conversational
+ *     gpt-audio models), reached through streaming chat-completions.
+ *
+ * Asking the `audio` catalogue for narration is what shipped, and it is why narration ran on
+ * `openai/gpt-audio-mini` — a CONVERSATIONAL model that replied to the verse instead of
+ * reading it. That id is also rejected outright by the speech endpoint
+ * (`400 Model openai/gpt-audio-mini does not exist`), so the split is load-bearing in both
+ * directions.
+ */
 export async function resolveAudioModel(
   env: E2eModelEnv,
   kind: "narration" | "music",
 ): Promise<string> {
-  return selectAudioModel(await fetchAudioModels(env), kind);
+  if (kind === "narration") {
+    return selectNarrationModel(await fetchAudioModels(env, "speech"));
+  }
+  return selectAudioModel(await fetchAudioModels(env, "audio"), "music");
 }
 
 async function fetchVideoModels(

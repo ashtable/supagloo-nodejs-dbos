@@ -5,6 +5,7 @@ import {
   applyAudioPlans,
   planAudioTrack,
   renderAudioAssetKey,
+  renderSceneNarrationAssetKey,
 } from "./audio";
 import {
   emptyManifest,
@@ -43,6 +44,24 @@ const withoutNarrationRef = (m: ProjectManifest): ProjectManifest => ({
 
 const CONNECTED = { hasOpenRouterConnection: true } as const;
 
+/** Minimal shared fixtures for the render-bug cases at the bottom of this file. */
+const SCENE = {
+  id: "s1",
+  name: "Scene",
+  scriptText: "text",
+  reference: "Genesis 1:1",
+  translation: "KJV",
+  visualPrompt: "prompt",
+  durationSeconds: 2,
+  captions: true,
+} as const;
+const BASE: ProjectManifest = {
+  manifestVersion: 1,
+  composition: { width: 320, height: 180, fps: 10, aspectRatio: "16:9" },
+  scenes: [SCENE],
+  narratorVoice: { description: "Warm narrator" },
+};
+
 describe("planAudioTrack — narration", () => {
   it("is `cached` when the manifest already carries narratorVoice.assetKey", () => {
     const plan = planAudioTrack({
@@ -65,14 +84,14 @@ describe("planAudioTrack — narration", () => {
       ...CONNECTED,
     });
     expect(plan.action).toBe("synthesize");
-    if (plan.action !== "synthesize") return;
-    expect(plan.assetKey).toBe(renderAudioAssetKey("narration"));
-    expect(plan.speechArgs.modelId).toBe("some-model");
-    // Design D5 (mirrors generateAudio's decision D5): one combined track, per-scene
-    // scripts concatenated in array order.
-    expect(plan.speechArgs.input).toContain(shelterManifest.scenes[0].scriptText);
-    expect(plan.speechArgs.input).toContain(shelterManifest.scenes[1].scriptText);
-    expect(plan.speechArgs.voice).toBeTruthy();
+    if (plan.action !== "synthesize" || plan.kind !== "narration") return;
+    // One clip PER SCENE (was: one combined track). The combined form is what made
+    // scene-synced narration unexpressible — a single file with no scene boundaries.
+    expect(plan.scenes).toHaveLength(shelterManifest.scenes.length);
+    expect(plan.scenes[0].speechArgs.modelId).toBe("some-model");
+    expect(plan.scenes[0].speechArgs.input).toBe(shelterManifest.scenes[0].scriptText);
+    expect(plan.scenes[1].speechArgs.input).toBe(shelterManifest.scenes[1].scriptText);
+    expect(plan.scenes[0].speechArgs.voice).toBeTruthy();
   });
 
   it("is `skipped` when no render narration model is configured", () => {
@@ -132,11 +151,12 @@ describe("planAudioTrack — music", () => {
       ...CONNECTED,
     });
     expect(plan.action).toBe("synthesize");
-    if (plan.action !== "synthesize") return;
+    if (plan.action !== "synthesize" || plan.kind !== "music") return;
     expect(plan.assetKey).toBe(renderAudioAssetKey("music"));
-    expect(plan.speechArgs.input).toBe("ambient cinematic pads");
-    // Music (Lyria) takes NO voice — the same rule generateAudio's buildSpeechArgs uses.
-    expect(plan.speechArgs.voice).toBeUndefined();
+    expect(plan.musicArgs.input).toBe("ambient cinematic pads");
+    // The music args carry a model + a style prompt and NOTHING else — in particular no
+    // duration, because no discovered music model accepts one.
+    expect(Object.keys(plan.musicArgs).sort()).toEqual(["input", "modelId"]);
   });
 
   it("is `skipped` when the manifest has no music bed at all", () => {
@@ -171,7 +191,13 @@ describe("applyAudioPlans — the patch that makes synthesized audio reachable",
     expect(music.action).toBe("cached");
     const patched = applyAudioPlans(subject, { narration, music });
 
-    expect(patched.narratorVoice.assetKey).toBe(renderAudioAssetKey("narration"));
+    // Narration now lands PER SCENE. The whole-project `narratorVoice.assetKey` is
+    // deliberately NOT written: the composition prefers per-scene clips and ignores the
+    // whole-video track once any exist, so writing both would play the narration twice.
+    expect(patched.narratorVoice.assetKey).toBeUndefined();
+    for (const scene of patched.scenes) {
+      expect(scene.narrationAssetKey).toBe(renderSceneNarrationAssetKey(scene.id));
+    }
     // music was `cached` — its existing key is left exactly as-is.
     expect(patched.music?.assetKey).toBe("projects/demo/music/bed.mp3");
   });
@@ -213,8 +239,15 @@ describe("applyAudioPlans — the patch that makes synthesized audio reachable",
     applyAudioPlans(shelterManifest, {
       narration: {
         action: "synthesize",
-        assetKey: renderAudioAssetKey("narration"),
-        speechArgs: { modelId: "m", input: "hi", voice: "alloy" },
+        kind: "narration",
+        scenes: [
+          {
+            sceneId: shelterManifest.scenes[0].id,
+            assetKey: renderSceneNarrationAssetKey(shelterManifest.scenes[0].id),
+            speechArgs: { modelId: "m", input: "hi", voice: "alloy" },
+            durationSeconds: 3.5,
+          },
+        ],
       },
       music: { action: "skipped", reason: "none" },
     });
@@ -229,5 +262,126 @@ describe("renderAudioAssetKey — workspace-local, obviously not an S3 key", () 
     // db-lib's S3 layout is `projects/…` / `renders/…`; ours is neither.
     expect(renderAudioAssetKey("narration").startsWith("projects/")).toBe(false);
     expect(renderAudioAssetKey("narration").startsWith("renders/")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Render-bug work. The render-time synthesis fallback must produce the SAME shape the
+// studio path produces, or a project rendered through the fallback silently reverts to the
+// old bugs (one drifting narration track; a bed that plays once and stops).
+// ---------------------------------------------------------------------------
+
+describe("planAudioTrack — narration is planned PER SCENE", () => {
+  const manifest: ProjectManifest = {
+    ...BASE,
+    scenes: [
+      { ...SCENE, id: "s1", scriptText: "In the beginning God created the heaven." },
+      { ...SCENE, id: "s2", scriptText: "And God said, Let there be light." },
+    ],
+    narratorVoice: { description: "Warm narrator" },
+  };
+
+  it("U-RA1: emits one synthesis per scene, each with only that scene's verse", () => {
+    const plan = planAudioTrack({
+      kind: "narration",
+      manifest,
+      modelId: "resolved/speech-model",
+      hasOpenRouterConnection: true,
+    });
+    expect(plan.action).toBe("synthesize");
+    if (plan.action !== "synthesize" || plan.kind !== "narration") return;
+    expect(plan.scenes).toHaveLength(2);
+    expect(plan.scenes[0].sceneId).toBe("s1");
+    expect(plan.scenes[0].speechArgs.input).toBe(
+      "In the beginning God created the heaven.",
+    );
+    expect(plan.scenes[1].speechArgs.input).toBe("And God said, Let there be light.");
+    // Never the concatenated blob that made per-scene sync impossible.
+    for (const s of plan.scenes) expect(s.speechArgs.input).not.toContain("\n\n");
+  });
+
+  it("U-RA2: each scene gets its own distinct workspace-local key", () => {
+    const plan = planAudioTrack({
+      kind: "narration",
+      manifest,
+      modelId: "m",
+      hasOpenRouterConnection: true,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "narration") {
+      throw new Error("expected a per-scene narration synthesize plan");
+    }
+    const keys = plan.scenes.map((s) => s.assetKey);
+    expect(new Set(keys).size).toBe(keys.length);
+    for (const k of keys) expect(k.startsWith(`${RENDER_AUDIO_DIR}/`)).toBe(true);
+  });
+
+  it("U-RA3: applyAudioPlans writes per-scene keys AND measured lengths onto the manifest", () => {
+    // The measured length is what makes the scene stretch instead of clipping the verse,
+    // and the key is what puts the clip inside the scene's own <Sequence>. Both have to
+    // reach the manifest that `materializeRenderSources` regenerates from.
+    const plan = planAudioTrack({
+      kind: "narration",
+      manifest,
+      modelId: "m",
+      hasOpenRouterConnection: true,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "narration") {
+      throw new Error("expected a per-scene narration synthesize plan");
+    }
+    const measured = {
+      ...plan,
+      scenes: plan.scenes.map((s, i) => ({ ...s, durationSeconds: 6.5 + i })),
+    };
+    const out = applyAudioPlans(manifest, {
+      narration: measured,
+      music: { action: "skipped", reason: "none" },
+    });
+    expect(out.scenes[0].narrationAssetKey).toBe(plan.scenes[0].assetKey);
+    expect(out.scenes[0].narrationDurationSeconds).toBe(6.5);
+    expect(out.scenes[1].narrationDurationSeconds).toBe(7.5);
+    // The whole-project key is NOT set — the two would double up in the composition.
+    expect(out.narratorVoice.assetKey).toBeUndefined();
+  });
+});
+
+describe("planAudioTrack — music carries its MEASURED length to the manifest", () => {
+  it("U-RA4: applyAudioPlans writes music.durationSeconds so the bed can be looped", () => {
+    const manifest: ProjectManifest = {
+      ...BASE,
+      music: { style: "ambient pads" },
+    };
+    const plan = planAudioTrack({
+      kind: "music",
+      manifest,
+      modelId: "m",
+      hasOpenRouterConnection: true,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "music") {
+      throw new Error("expected a music synthesize plan");
+    }
+    const out = applyAudioPlans(manifest, {
+      narration: { action: "skipped", reason: "none" },
+      music: { ...plan, durationSeconds: 29.07 },
+    });
+    expect(out.music?.assetKey).toBe(plan.assetKey);
+    expect(out.music?.durationSeconds).toBe(29.07);
+  });
+
+  it("U-RA5: an UNMEASURED bed leaves durationSeconds absent rather than guessed", () => {
+    const manifest: ProjectManifest = { ...BASE, music: { style: "ambient pads" } };
+    const plan = planAudioTrack({
+      kind: "music",
+      manifest,
+      modelId: "m",
+      hasOpenRouterConnection: true,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "music") {
+      throw new Error("expected a music synthesize plan");
+    }
+    const out = applyAudioPlans(manifest, {
+      narration: { action: "skipped", reason: "none" },
+      music: plan,
+    });
+    expect(out.music?.durationSeconds).toBeUndefined();
   });
 });

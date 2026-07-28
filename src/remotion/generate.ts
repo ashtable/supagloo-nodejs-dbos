@@ -33,12 +33,15 @@ export function generateManifestFiles(manifest: ProjectManifest): GeneratedFile[
     { path: "src/Root.tsx", contents: buildRootSource(manifest) },
     { path: "src/Video.tsx", contents: buildVideoSource(manifest, assigned) },
   ];
-  for (const a of assigned) {
+  // fps and the ordinal are threaded in because a scene now animates over its OWN frame
+  // count (the Ken Burns pan is normalized to the scene length) and picks its motion
+  // variant from its position. Neither is derivable from `AssignedScene` alone.
+  assigned.forEach((a, index) => {
     files.push({
       path: `src/scenes/${a.fileName}`,
-      contents: buildSceneSource(a),
+      contents: buildSceneSource(a, manifest.composition.fps, index),
     });
-  }
+  });
   return files;
 }
 
