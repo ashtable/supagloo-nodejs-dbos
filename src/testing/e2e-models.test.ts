@@ -4,6 +4,7 @@ import {
   selectCheapestImageModel,
   selectCheapestStructuredTextModel,
   selectGlooChatModel,
+  selectGlooImageModel,
   selectTextToVideoModel,
   toAudioModelInfo,
   toGlooModelInfo,
@@ -232,42 +233,174 @@ describe("selectTextToVideoModel (video — must be text-to-video capable, min d
 // metadata, so "cheapest ADEQUATE" degrades to a cheap-tier id heuristic (mini/nano/…), with a
 // safe fallback to the first catalogue entry — a runtime pick, not a hardcode.
 describe("toGlooModelInfo", () => {
-  it("reads the id off a raw Gloo catalogue entry", () => {
-    expect(toGlooModelInfo({ id: "gloo-openai-gpt-5-mini" })).toEqual({
-      id: "gloo-openai-gpt-5-mini",
+  it("reads the id, modalities and REAL per-1k pricing off a raw catalogue entry", () => {
+    // Every one of Gloo's 106 catalogue entries carries `output_modalities` and a
+    // `pricing` block with decimal-STRING rates (measured live 2026-07-28). The rates are
+    // per 1k tokens; the normalizer converts to per-token so it is comparable with
+    // OpenRouter's, which is already per-token.
+    const info = toGlooModelInfo({
+      id: "gloo-vendor-chat-mini",
+      output_modalities: ["text"],
+      pricing: {
+        input: { rate_per_1k_tokens: "0.000100" },
+        output: { rate_per_1k_tokens: "0.000400" },
+      },
     });
+    expect(info.id).toBe("gloo-vendor-chat-mini");
+    expect(info.outputModalities).toEqual(["text"]);
+    // Compared with a tolerance: the per-1k -> per-token division is binary floating
+    // point, so an exact-equality assertion here would be pinning IEEE-754 rounding, not
+    // the conversion rule.
+    expect(info.inputTokenPrice).toBeCloseTo(0.0000001, 12);
+    expect(info.outputTokenPrice).toBeCloseTo(0.0000004, 12);
   });
 
-  it("is tolerant of a missing/non-string id", () => {
-    expect(toGlooModelInfo({})).toEqual({ id: "" });
-    expect(toGlooModelInfo({ id: 42 })).toEqual({ id: "" });
+  it("is tolerant of a missing/non-string id and of absent metadata", () => {
+    expect(toGlooModelInfo({})).toEqual({ id: "", outputModalities: [] });
+    expect(toGlooModelInfo({ id: 42 })).toEqual({ id: "", outputModalities: [] });
+  });
+
+  it("keeps an image-only entry distinguishable from a text one", () => {
+    const info = toGlooModelInfo({
+      id: "gloo-vendor-flux",
+      output_modalities: ["image"],
+      pricing: { output: { rate_per_1k_tokens: "0.004560" } },
+    });
+    expect(info.outputModalities).toEqual(["image"]);
+    expect(info.outputTokenPrice).toBeCloseTo(0.00000456, 12);
   });
 });
 
-describe("selectGlooChatModel (runtime pick — cheap-tier heuristic, else first)", () => {
-  const g = (id: string): GlooModelInfo => ({ id });
+describe("selectGlooChatModel (U-EM1 — text-capable, cheapest by REAL price)", () => {
+  /**
+   * REWRITTEN 2026-07-28. The previous implementation picked the first id matching
+   * `mini|nano|small|lite|flash|haiku` and, failing that, the first catalogue entry. Two
+   * facts measured against the live host on 2026-07-28 made that unsafe:
+   *
+   *  1. **Four IMAGE models now match that substring filter.** Gloo's catalogue carries
+   *     11 image-capable models, several of them "flash"/"mini"-tiered. An image model
+   *     handed to `.chat()` answers 400 — "does not support text output and cannot be
+   *     used with the Chat Completions API" — so the e2e would fail for a reason that
+   *     looks like a broken provider. It has been safe only by ACCIDENT: those entries
+   *     sit at catalogue indices 93-103 while index 0 happens to be a cheap text model.
+   *     A catalogue reorder breaks it, and Gloo controls that order.
+   *  2. **Pricing is present on 106/106 models**, refuting this module's own comment
+   *     ("Gloo's catalogue carries no reliable per-model pricing"). So "cheapest
+   *     adequate" no longer has to degrade to a name heuristic — it can be computed.
+   *
+   * The selector therefore filters on `output_modalities` including "text" and sorts by
+   * real price, which is both correct and independent of catalogue ordering.
+   */
+  const text = (id: string, price: number): GlooModelInfo => ({
+    id,
+    outputModalities: ["text"],
+    inputTokenPrice: price,
+    outputTokenPrice: price * 4,
+  });
+  const image = (id: string): GlooModelInfo => ({
+    id,
+    outputModalities: ["image"],
+    inputTokenPrice: 0,
+    outputTokenPrice: 0.00456,
+  });
 
-  it("prefers a cheap-tier id (mini/nano/small/lite/flash/haiku) over a heavier one", () => {
+  it("U-EM1a: refuses an image-only model even when it is FIRST and cheap-tier-named", () => {
+    // The exact failure the old heuristic was one catalogue reorder away from.
     const models = [
-      g("gloo-anthropic-claude-sonnet-4.5"),
-      g("gloo-openai-gpt-5-mini"),
-      g("gloo-openai-gpt-5"),
+      image("gloo-vendor-flux-flash"),
+      text("gloo-vendor-chat-large", 0.00002),
     ];
-    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5-mini");
+    expect(selectGlooChatModel(models)).toBe("gloo-vendor-chat-large");
   });
 
-  it("falls back to the first catalogue entry when no cheap-tier id is present", () => {
-    const models = [g("gloo-openai-gpt-5"), g("gloo-anthropic-claude-sonnet-4.5")];
-    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5");
+  it("U-EM1b: picks the CHEAPEST text model, not the first or the best-named", () => {
+    const models = [
+      text("gloo-vendor-chat-large", 0.00002),
+      text("gloo-vendor-chat-mini", 0.0000001),
+      text("gloo-vendor-chat-medium", 0.000005),
+    ];
+    expect(selectGlooChatModel(models)).toBe("gloo-vendor-chat-mini");
   });
 
-  it("ignores empty ids when falling back", () => {
-    const models = [g(""), g("gloo-openai-gpt-5")];
-    expect(selectGlooChatModel(models)).toBe("gloo-openai-gpt-5");
+  it("U-EM1c: keeps a text+image model — it CAN serve chat", () => {
+    const both: GlooModelInfo = {
+      id: "gloo-vendor-omni",
+      outputModalities: ["image", "text"],
+      inputTokenPrice: 0.0000001,
+      outputTokenPrice: 0.0000004,
+    };
+    expect(selectGlooChatModel([image("gloo-vendor-flux"), both])).toBe(
+      "gloo-vendor-omni",
+    );
   });
 
-  it("throws an actionable error when the catalogue is empty", () => {
+  it("U-EM1d: an entry with no modality metadata is treated as text (tolerant fallback)", () => {
+    // A catalogue that stops publishing `output_modalities` must degrade to the old
+    // behaviour rather than resolving nothing and failing the whole e2e lane.
+    const bare: GlooModelInfo = { id: "gloo-vendor-chat", outputModalities: [] };
+    expect(selectGlooChatModel([bare])).toBe("gloo-vendor-chat");
+  });
+
+  it("U-EM1e: an unpriced text model still wins over no candidate at all", () => {
+    const unpriced: GlooModelInfo = {
+      id: "gloo-vendor-chat",
+      outputModalities: ["text"],
+    };
+    expect(selectGlooChatModel([image("gloo-vendor-flux"), unpriced])).toBe(
+      "gloo-vendor-chat",
+    );
+  });
+
+  it("ignores empty ids", () => {
+    expect(selectGlooChatModel([text("", 0.1), text("gloo-vendor-chat", 0.2)])).toBe(
+      "gloo-vendor-chat",
+    );
+  });
+
+  it("throws an actionable error when there is no usable text model", () => {
     expect(() => selectGlooChatModel([])).toThrow(/gloo/i);
-    expect(() => selectGlooChatModel([g("")])).toThrow(/gloo/i);
+    expect(() => selectGlooChatModel([image("gloo-vendor-flux")])).toThrow(/gloo/i);
+  });
+});
+
+describe("selectGlooImageModel (the /ai/v2/responses surface)", () => {
+  const model = (
+    id: string,
+    outputModalities: string[],
+    price = 0.001,
+  ): GlooModelInfo => ({ id, outputModalities, outputTokenPrice: price });
+
+  it("prefers an image-ONLY model over a text+image one", () => {
+    // Both can produce a picture, but a text+image model may answer a bare prompt with
+    // prose — which surfaces as a confusing "no completed image output" 502 rather than
+    // as a clear failure.
+    expect(
+      selectGlooImageModel([
+        model("gloo-vendor-omni", ["image", "text"], 0.0001),
+        model("gloo-vendor-flux", ["image"], 0.01),
+      ]),
+    ).toBe("gloo-vendor-flux");
+  });
+
+  it("among image-only models, picks the cheapest", () => {
+    expect(
+      selectGlooImageModel([
+        model("gloo-vendor-flux-max", ["image"], 0.02),
+        model("gloo-vendor-flux-klein", ["image"], 0.004),
+      ]),
+    ).toBe("gloo-vendor-flux-klein");
+  });
+
+  it("falls back to a text+image model when that is all there is", () => {
+    expect(selectGlooImageModel([model("gloo-vendor-omni", ["image", "text"])])).toBe(
+      "gloo-vendor-omni",
+    );
+  });
+
+  it("throws actionably when the catalogue has no image-capable model", () => {
+    expect(() => selectGlooImageModel([])).toThrow(/gloo/i);
+    expect(() => selectGlooImageModel([model("gloo-vendor-chat", ["text"])])).toThrow(
+      /gloo/i,
+    );
   });
 });

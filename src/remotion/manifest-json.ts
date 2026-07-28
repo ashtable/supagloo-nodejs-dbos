@@ -1,4 +1,17 @@
-import type { ProjectManifest } from "@supagloo/database-lib";
+import type { AiModelChoice, ProjectManifest } from "@supagloo/database-lib";
+
+/** The kinds the Inspector offers a model selector for, in their canonical on-disk
+ *  order. Iterating a FIXED list (rather than the input object's keys) is what makes the
+ *  emitted field order independent of however the studio happened to build the object. */
+const AI_SETTING_KINDS = ["image", "narration", "music", "video"] as const;
+
+/** Rebuild one `{provider, model?}` choice with `model` omitted when unset — an
+ *  `undefined` key would break the byte-stable on-disk form. */
+function canonicalizeChoice(choice: AiModelChoice): Record<string, unknown> {
+  const out: Record<string, unknown> = { provider: choice.provider };
+  if (choice.model !== undefined) out.model = choice.model;
+  return out;
+}
 
 /**
  * Canonical, deterministic serialization of the `supagloo.project.json` manifest —
@@ -86,6 +99,26 @@ export function canonicalizeManifest(
       music.durationSeconds = manifest.music.durationSeconds;
     }
     out.music = music;
+  }
+
+  // Genesis-1: the project's provider/model choices + faith alignment. Written under the
+  // SAME symmetry invariant recorded above for `narratorVoice.assetKey` and the per-scene
+  // fields: a value the studio writes but this function does not is silently ERASED on
+  // every commit. Here that would mean the user's model choice appearing to save, lasting
+  // until the next commit, and then reverting to the system default with nothing to
+  // indicate it -- which is worse than not persisting at all, because there is no reason
+  // to go and look.
+  const aiSettings = manifest.aiSettings;
+  if (aiSettings !== undefined) {
+    const out2: Record<string, unknown> = {};
+    if (aiSettings.faithAlignment !== undefined) {
+      out2.faithAlignment = aiSettings.faithAlignment;
+    }
+    for (const kind of AI_SETTING_KINDS) {
+      const choice = aiSettings[kind];
+      if (choice !== undefined) out2[kind] = canonicalizeChoice(choice);
+    }
+    out.aiSettings = out2;
   }
 
   if (manifest.endCard !== undefined) {
