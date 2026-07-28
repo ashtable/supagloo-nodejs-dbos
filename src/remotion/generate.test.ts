@@ -545,11 +545,14 @@ describe("RTL — text direction is resolved from the text itself, in BOTH paths
   it("U-T-DIR1: the caption and the reference carry dir=\"auto\"", () => {
     // Task item 1 asks for the picked verse to render "respecting RTL/LTR".
     //
-    // `dir="auto"` is the HTML first-strong-character algorithm. It is chosen over a new
-    // `language`/`direction` field on `ManifestScene` for one decisive reason: the studio
-    // preview (@remotion/player) and this render (@remotion/renderer) are BOTH Chromium,
-    // so they resolve direction with the same engine and cannot disagree. A manifest
-    // field would have had to be mirrored in db-lib's ManifestSceneSchema, nextjs's
+    // `dir="auto"` is the HTML standard's bidi first-strong-character determination
+    // (UAX#9 P2/P3) — a SPECIFIED algorithm, implemented identically by every browser
+    // engine. It is chosen over a new `language`/`direction` field on `ManifestScene` for
+    // one decisive reason: the studio preview runs @remotion/player in the USER'S browser
+    // (which may be Safari or Firefox) and this render runs @remotion/renderer in
+    // headless Chromium — NOT the same engine, and they do not need to be. What makes the
+    // preview and the MP4 agree about direction is the standard, not a shared engine. A
+    // manifest field would have had to be mirrored in db-lib's ManifestSceneSchema, nextjs's
     // hand-copied contracts, manifest-json.ts's canonicalizer and this generator — four
     // mirrors and a db-lib release — to reach the same place.
     //

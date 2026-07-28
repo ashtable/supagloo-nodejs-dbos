@@ -525,12 +525,15 @@ export function buildSceneSource(
   );
   // `dir="auto"` on both text runs is how a non-English verse renders correctly.
   //
-  // It is the HTML first-strong-character bidi algorithm, resolved by the SAME engine in
-  // both places the text appears: the studio preview runs @remotion/player in the user's
-  // browser, this render runs @remotion/renderer in headless Chromium. So the preview and
-  // the MP4 cannot disagree about direction — which is the failure mode that matters, and
-  // one that a per-scene `direction` field on the manifest would not have prevented any
-  // better (it would only have added four schema mirrors and a db-lib release).
+  // It is the HTML standard's bidi first-strong-character determination (UAX#9 P2/P3) —
+  // a SPECIFIED algorithm, implemented identically by every browser engine. That is what
+  // makes the two places the text appears agree, and it is NOT a shared engine: the
+  // studio preview runs @remotion/player in the user's browser (which may be Safari or
+  // Firefox), this render runs @remotion/renderer in headless Chromium. They are not the
+  // same engine and do not need to be — the standard, not the engine, is why the preview
+  // and the MP4 cannot disagree about direction. That is the failure mode that matters,
+  // and one that a per-scene `direction` field on the manifest would not have prevented
+  // any better (it would only have added four schema mirrors and a db-lib release).
   //
   // It matters most on the reference line: YouVersion's own reference strings for RTL
   // translations arrive pre-marked with U+200E around the numerals ("التكوين ‎1:1"), and
