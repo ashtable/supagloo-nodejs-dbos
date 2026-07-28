@@ -1,13 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { ProviderHttpError, retryUnlessPermanent } from "./errors";
 import {
+  audioDurationSeconds,
   decodeDataUri,
   downloadBytes,
   fetchAssetBytes,
   getVideoJob,
   parseAudioStream,
   requestImage,
+  requestMusic,
   requestSpeech,
+  sniffAudioBytes,
   submitVideoJob,
   wavFromPcm16,
 } from "./media-client";
@@ -117,85 +120,291 @@ describe("parseAudioStream", () => {
   });
 });
 
-describe("requestSpeech (streaming chat-audio → WAV)", () => {
-  it("POSTs chat/completions with modalities audio + stream + pcm16 and returns WAV bytes", async () => {
+/**
+ * Fixture MP3 frames, hand-built from the MPEG audio frame-header spec. These are the
+ * exact two shapes the real providers return (verified live):
+ *   - MPEG2 Layer III, 24 kHz mono, 64 kbps — `hexgrad/kokoro-82m` via /audio/speech
+ *     (real magic `ff f3 84 c4`, 147 frames, 3.528 s)
+ *   - MPEG1 Layer III, 44.1 kHz stereo, 128 kbps — `google/lyria-3-clip-preview`
+ *     (real magic `49 44 33` ID3 tag then MPEG1 frames, ~1100 frames, ~29 s)
+ */
+function mp3Frames(
+  kind: "mpeg2-24k-mono" | "mpeg1-44k-stereo",
+  count: number,
+): Buffer {
+  const spec =
+    kind === "mpeg2-24k-mono"
+      ? { b1: 0xf3, b2: 0x84, b3: 0xc0, len: 192, secs: 576 / 24000 }
+      : { b1: 0xfb, b2: 0x90, b3: 0x00, len: 417, secs: 1152 / 44100 };
+  const frames: Buffer[] = [];
+  for (let i = 0; i < count; i++) {
+    const f = Buffer.alloc(spec.len);
+    f[0] = 0xff;
+    f[1] = spec.b1;
+    f[2] = spec.b2;
+    f[3] = spec.b3;
+    frames.push(f);
+  }
+  return Buffer.concat(frames);
+}
+
+/** Wrap bytes in a minimal ID3v2.3 tag, exactly as Lyria's real output arrives. */
+function withId3(payload: Buffer, tagSize = 32): Buffer {
+  const tag = Buffer.alloc(10 + tagSize);
+  tag.write("ID3", 0, "ascii");
+  tag[3] = 3; // v2.3
+  // 28-bit synchsafe size of the tag body (excludes the 10-byte header).
+  tag[6] = (tagSize >> 21) & 0x7f;
+  tag[7] = (tagSize >> 14) & 0x7f;
+  tag[8] = (tagSize >> 7) & 0x7f;
+  tag[9] = tagSize & 0x7f;
+  return Buffer.concat([tag, payload]);
+}
+
+describe("sniffAudioBytes — the container the provider ACTUALLY sent", () => {
+  /**
+   * The music bug's dominant cause. `google/lyria-3-clip-preview` was asked for
+   * `format:"pcm16"` and returned ID3-tagged MP3 anyway — verified live, identically for
+   * `pcm16`, `wav` AND `mp3`. The shipped code then called `wavFromPcm16` on those MP3
+   * bytes, prepending a RIFF header declaring 24 kHz mono PCM16. A decoder honours the
+   * header, so a 29.07 s track was announced as 703859/(24000*2) = 14.66 s — the music
+   * "ending early" was manufactured entirely inside our own code.
+   */
+  it("U-M1: passes ID3-tagged MP3 through UNTOUCHED as audio/mpeg (the Lyria regression)", () => {
+    const mp3 = withId3(mp3Frames("mpeg1-44k-stereo", 4));
+    const out = sniffAudioBytes(mp3);
+    expect(out.contentType).toBe("audio/mpeg");
+    expect(out.bytes.equals(mp3)).toBe(true);
+    // The specific corruption that shipped: a RIFF header must NEVER be bolted on.
+    expect(out.bytes.subarray(0, 4).toString("ascii")).not.toBe("RIFF");
+  });
+
+  it("U-M2: passes a bare MPEG frame stream (no ID3) through as audio/mpeg", () => {
+    const mp3 = mp3Frames("mpeg2-24k-mono", 3);
+    const out = sniffAudioBytes(mp3);
+    expect(out.contentType).toBe("audio/mpeg");
+    expect(out.bytes.equals(mp3)).toBe(true);
+  });
+
+  it("U-M3: passes an existing RIFF/WAVE container through untouched", () => {
+    const wav = wavFromPcm16(Buffer.from([1, 2, 3, 4]));
+    const out = sniffAudioBytes(wav);
+    expect(out.contentType).toBe("audio/wav");
+    expect(out.bytes.equals(wav)).toBe(true);
+  });
+
+  it("U-M4: WAV-wraps anything else, which is the real raw-PCM16 case", () => {
     const pcm = Buffer.from([0x10, 0x11, 0x12, 0x13]);
+    const out = sniffAudioBytes(pcm);
+    expect(out.contentType).toBe("audio/wav");
+    expect(out.bytes.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    expect(out.bytes.subarray(44).equals(pcm)).toBe(true);
+  });
+});
+
+describe("audioDurationSeconds — MEASURED length, the input to every sync decision", () => {
+  it("U-M5: measures an MPEG2 24 kHz mono stream frame-by-frame", () => {
+    // 147 frames is exactly what the real kokoro synthesis of Genesis 1:1 returned;
+    // 147 * 576/24000 = 3.528 s, which is what this parser must reproduce.
+    const bytes = mp3Frames("mpeg2-24k-mono", 147);
+    expect(audioDurationSeconds(bytes)).toBeCloseTo(3.528, 6);
+  });
+
+  it("U-M6: measures an MPEG1 44.1 kHz stereo stream and SKIPS the ID3 tag", () => {
+    const frames = 1178; // the real lyria clip length measured live
+    const tagged = withId3(mp3Frames("mpeg1-44k-stereo", frames));
+    expect(audioDurationSeconds(tagged)).toBeCloseTo(frames * (1152 / 44100), 6);
+    // Identical answer with and without the tag — the tag must not be counted as audio.
+    expect(audioDurationSeconds(mp3Frames("mpeg1-44k-stereo", frames))).toBeCloseTo(
+      audioDurationSeconds(tagged) as number,
+      6,
+    );
+  });
+
+  it("U-M7: measures a WAV from its own header rather than guessing", () => {
+    const pcm = Buffer.alloc(24_000 * 2 * 2); // 2 s at 24 kHz mono PCM16
+    expect(audioDurationSeconds(wavFromPcm16(pcm))).toBeCloseTo(2, 6);
+  });
+
+  it("U-M8: returns null for bytes it cannot honestly measure", () => {
+    // Better an absent duration than a fabricated one: an absent measurement makes the
+    // composition fall back to the un-looped <Audio> it emits today, whereas a wrong
+    // number would silently mis-time every scene.
+    expect(audioDurationSeconds(Buffer.from("not audio at all"))).toBeNull();
+  });
+});
+
+describe("requestSpeech — the DEDICATED /api/v1/audio/speech endpoint", () => {
+  /**
+   * Bug 1. The shipped implementation posted the verse as a `user` turn to a
+   * CONVERSATIONAL audio model with no system message, and the model answered it.
+   * Verified live against real OpenRouter with the shipped body:
+   *
+   *   input:  "In the beginning God created the heaven and the earth."
+   *   spoken: "It sounds like you're quoting from the Book of Genesis in the Bible. …"
+   *
+   * 16.4 s of commentary for a 3.5 s verse — exactly the reported symptom.
+   *
+   * The fix is structural rather than persuasive. `/api/v1/audio/speech` (verified live:
+   * 200 `audio/mpeg` for `hexgrad/kokoro-82m`) is a batch synthesis endpoint that takes an
+   * `input` STRING. It has no `messages` array, so there is no conversational turn for a
+   * model to reply to — a chat reply is not a thing this request can produce. That is why
+   * the assertions below are written as ABSENCES: they are the whole point.
+   */
+  it("U-M9: posts input/voice/response_format and carries NO chat turn at all", async () => {
+    const mp3 = mp3Frames("mpeg2-24k-mono", 147);
     const rec = recorder(
       () =>
-        new Response(audioSse([pcm.toString("base64")], { id: "gen_9" }), {
+        new Response(mp3, {
           status: 200,
-          headers: { "content-type": "text/event-stream" },
+          headers: { "content-type": "audio/mpeg" },
         }),
     );
     const result = await requestSpeech(
       { ...CFG, fetchImpl: rec.fetch },
-      { modelId: "openai/gpt-audio-mini", input: "In the beginning", voice: "alloy" },
+      { modelId: "hexgrad/kokoro-82m", input: "In the beginning", voice: "alloy" },
     );
-    expect(result.contentType).toBe("audio/wav");
-    expect(result.generationId).toBe("gen_9");
-    expect(result.bytes.subarray(0, 4).toString("ascii")).toBe("RIFF");
-    expect(result.bytes.subarray(44).equals(pcm)).toBe(true);
 
     const req = rec.reqs[0];
-    expect(req.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(req.url).toBe("https://openrouter.ai/api/v1/audio/speech");
     expect(req.method).toBe("POST");
     expect(req.headers.get("authorization")).toBe("Bearer sk-or-test");
+
     const body = JSON.parse(req.body);
-    expect(body.model).toBe("openai/gpt-audio-mini");
-    expect(body.stream).toBe(true);
-    expect(body.modalities).toEqual(["text", "audio"]);
-    expect(body.audio).toEqual({ voice: "alloy", format: "pcm16" });
-    expect(body.messages[0].content).toBe("In the beginning");
+    // The bug-1 regression assertions — a conversational reply is UNREACHABLE from here.
+    expect(body).not.toHaveProperty("messages");
+    expect(body).not.toHaveProperty("modalities");
+    expect(body).not.toHaveProperty("stream");
+    expect(body).toEqual({
+      model: "hexgrad/kokoro-82m",
+      input: "In the beginning",
+      voice: "alloy",
+      response_format: "mp3",
+    });
+
+    expect(result.contentType).toBe("audio/mpeg");
+    expect(result.bytes.equals(mp3)).toBe(true);
+    expect(result.durationSeconds).toBeCloseTo(3.528, 6);
   });
 
-  it("omits voice for music (no voice arg)", async () => {
-    const pcm = Buffer.from([0x20, 0x21]);
+  it("U-M10: always sends a voice — the live endpoint rejects the request without one", async () => {
+    // Verified live: omitting `voice` returns
+    // `{"code":"invalid_type","path":["voice"],"message":"expected string, received undefined"}`.
     const rec = recorder(
-      () => new Response(audioSse([pcm.toString("base64")]), { status: 200 }),
+      () => new Response(mp3Frames("mpeg2-24k-mono", 2), { status: 200 }),
     );
     await requestSpeech(
       { ...CFG, fetchImpl: rec.fetch },
-      { modelId: "google/lyria-3-clip-preview", input: "cinematic strings" },
+      { modelId: "hexgrad/kokoro-82m", input: "x" },
     );
-    expect(JSON.parse(rec.reqs[0].body).audio).toEqual({ format: "pcm16" });
+    expect(typeof JSON.parse(rec.reqs[0].body).voice).toBe("string");
+    expect(JSON.parse(rec.reqs[0].body).voice.length).toBeGreaterThan(0);
   });
 
-  it("surfaces a non-2xx as a ProviderHttpError", async () => {
+  it("U-M11: surfaces a non-2xx as a ProviderHttpError", async () => {
     const rec = recorder(() => new Response("nope", { status: 500 }));
     await expect(
-      requestSpeech({ ...CFG, fetchImpl: rec.fetch }, { modelId: "m", input: "x" }),
+      requestSpeech(
+        { ...CFG, fetchImpl: rec.fetch },
+        { modelId: "m", input: "x", voice: "alloy" },
+      ),
     ).rejects.toBeInstanceOf(ProviderHttpError);
   });
 
-  it("throws a 502 when a 200 stream carries no audio deltas", async () => {
-    const rec = recorder(() => new Response("data: [DONE]\n", { status: 200 }));
+  it("U-M12: treats an empty 200 body as a transient 502 so MEDIA_RETRY re-tries", async () => {
+    const rec = recorder(() => new Response(Buffer.alloc(0), { status: 200 }));
     const err = await requestSpeech(
       { ...CFG, fetchImpl: rec.fetch },
-      { modelId: "m", input: "x" },
+      { modelId: "m", input: "x", voice: "alloy" },
     ).catch((e) => e);
     expect(err).toBeInstanceOf(ProviderHttpError);
     expect((err as ProviderHttpError).status).toBe(502);
   });
 
-  it("503-then-200: retryable ProviderHttpError on the 503, then WAV bytes on the re-invoked 200", async () => {
-    const pcm = Buffer.from([0x30, 0x31, 0x32]);
+  it("U-M13: 503-then-200 is retryable and then succeeds", async () => {
+    const mp3 = mp3Frames("mpeg2-24k-mono", 5);
     const queue: Array<() => Response> = [
       () => new Response("busy", { status: 503 }),
-      () => new Response(audioSse([pcm.toString("base64")], { id: "g" }), { status: 200 }),
+      () => new Response(mp3, { status: 200 }),
     ];
     const rec = recorder(() => queue.shift()!());
-    const args = { modelId: "openai/gpt-audio-mini", input: "hi", voice: "alloy" };
+    const args = { modelId: "hexgrad/kokoro-82m", input: "hi", voice: "alloy" };
 
     const transient = await requestSpeech({ ...CFG, fetchImpl: rec.fetch }, args).catch(
       (e) => e,
     );
     expect(transient).toBeInstanceOf(ProviderHttpError);
-    expect((transient as ProviderHttpError).status).toBe(503);
     expect(retryUnlessPermanent(transient)).toBe(true);
 
     const result = await requestSpeech({ ...CFG, fetchImpl: rec.fetch }, args);
-    expect(result.bytes.subarray(44).equals(pcm)).toBe(true);
+    expect(result.bytes.equals(mp3)).toBe(true);
     expect(rec.reqs).toHaveLength(2);
+  });
+});
+
+describe("requestMusic — streaming chat-audio, bytes preserved as sent", () => {
+  it("U-M14: keeps the streaming chat contract (Lyria has no /audio/speech entry)", async () => {
+    // Verified live: `/api/v1/audio/speech` answers `400 Model … does not exist` for the
+    // audio-modality models, and the `output_modalities=speech` catalogue does not contain
+    // Lyria. Music therefore stays on the chat-completions audio path.
+    const mp3 = withId3(mp3Frames("mpeg1-44k-stereo", 1113));
+    const rec = recorder(
+      () =>
+        new Response(audioSse([mp3.toString("base64")], { id: "gen-lyria" }), {
+          status: 200,
+        }),
+    );
+    const result = await requestMusic(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "google/lyria-3-clip-preview", input: "ambient worship pads" },
+    );
+
+    const body = JSON.parse(rec.reqs[0].body);
+    expect(rec.reqs[0].url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(body.stream).toBe(true);
+    expect(body.modalities).toEqual(["text", "audio"]);
+    expect(body.audio).not.toHaveProperty("voice");
+
+    // The heart of the music fix: the provider's MP3 survives intact and is measured
+    // honestly, instead of being mislabelled as 24 kHz mono PCM.
+    expect(result.contentType).toBe("audio/mpeg");
+    expect(result.bytes.equals(mp3)).toBe(true);
+    expect(result.durationSeconds).toBeCloseTo(1113 * (1152 / 44100), 6);
+    expect(result.generationId).toBe("gen-lyria");
+  });
+
+  it("U-M15: does NOT send a duration parameter, because no music model supports one", async () => {
+    // Verified live: `supported_parameters` for BOTH lyria models is
+    // ["max_tokens","response_format","seed","temperature","top_p"]. Sending a length is
+    // an invented contract, which is the exact failure mode this repo has been burned by.
+    const rec = recorder(
+      () =>
+        new Response(
+          audioSse([mp3Frames("mpeg1-44k-stereo", 2).toString("base64")]),
+          { status: 200 },
+        ),
+    );
+    await requestMusic(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "google/lyria-3-clip-preview", input: "pads" },
+    );
+    const body = JSON.parse(rec.reqs[0].body);
+    for (const k of ["duration", "duration_seconds", "durationSeconds", "length"]) {
+      expect(body).not.toHaveProperty(k);
+    }
+  });
+
+  it("U-M16: still WAV-wraps a model that really does return raw PCM16", async () => {
+    const pcm = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+    const rec = recorder(
+      () => new Response(audioSse([pcm.toString("base64")]), { status: 200 }),
+    );
+    const result = await requestMusic(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "some/pcm-music", input: "pads" },
+    );
+    expect(result.contentType).toBe("audio/wav");
+    expect(result.bytes.subarray(44).equals(pcm)).toBe(true);
   });
 });
 

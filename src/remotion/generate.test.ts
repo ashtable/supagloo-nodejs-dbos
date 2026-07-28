@@ -293,3 +293,214 @@ describe("supagloo.project.json round-trips ProjectManifestSchema", () => {
     expect("assetKey" in absent.narratorVoice).toBe(false);
   });
 });
+
+// ===========================================================================
+// Render-bug work: per-scene narration sync, music coverage, Ken Burns.
+// The fixture below is a small manifest carrying every new manifest field, so the
+// three claims are asserted against generated SOURCE rather than against prose.
+// ===========================================================================
+
+const richManifest = {
+  manifestVersion: 1 as const,
+  composition: { width: 320, height: 180, fps: 10, aspectRatio: "16:9" },
+  scenes: [
+    {
+      id: "sc-1",
+      name: "Alpha",
+      scriptText: "In the beginning God created the heaven and the earth.",
+      reference: "Genesis 1:1",
+      translation: "KJV",
+      visualPrompt: "a formless void",
+      durationSeconds: 2,
+      captions: true,
+      visualAssetKey: "projects/p/assets/img-1",
+      narrationAssetKey: "projects/p/assets/gen-1-scene-sc-1",
+      narrationDurationSeconds: 1.5,
+    },
+    {
+      id: "sc-2",
+      name: "Beta",
+      scriptText: "And the earth was without form, and void.",
+      reference: "Genesis 1:2",
+      translation: "KJV",
+      visualPrompt: "dark waters",
+      // Authored 2s but the narration measured 3.4s — the scene must STRETCH.
+      durationSeconds: 2,
+      captions: true,
+      visualAssetKey: "projects/p/assets/img-2",
+      narrationAssetKey: "projects/p/assets/gen-1-scene-sc-2",
+      narrationDurationSeconds: 3.4,
+    },
+    {
+      id: "sc-3",
+      name: "Gamma",
+      scriptText: "And God said, Let there be light.",
+      reference: "Genesis 1:3",
+      translation: "KJV",
+      visualPrompt: "first light",
+      durationSeconds: 2,
+      captions: false,
+      visualAssetKey: "projects/p/assets/clip-3",
+      visualAssetKind: "video" as const,
+    },
+  ],
+  narratorVoice: { description: "Warm narrator" },
+  music: {
+    style: "ambient pads",
+    assetKey: "projects/p/assets/music-1",
+    durationSeconds: 3, // deliberately SHORTER than the 8.4s composition
+  },
+};
+
+describe("bug 1 — narration is mounted per scene, inside that scene's own Sequence", () => {
+  const files = fileMap(generateManifestFiles(richManifest));
+  const video = files.get("src/Video.tsx") as string;
+
+  it("U-T1: each scene's narration <Audio> sits INSIDE its own <Sequence>", () => {
+    // The shipped composition mounted ONE whole-project <Audio> at frame 0, outside every
+    // <Sequence>. There was no sync mechanism of any kind: scene 3's verse could be playing
+    // over scene 1's picture. Nesting the audio inside the Sequence IS the sync.
+    for (const [seq, constName, key] of [
+      ["Alpha", "alphaNarration", "projects/p/assets/gen-1-scene-sc-1"],
+      ["Beta", "betaNarration", "projects/p/assets/gen-1-scene-sc-2"],
+    ]) {
+      const start = video.indexOf(`<Sequence name="${seq}"`);
+      const block = video.slice(start, video.indexOf("</Sequence>", start));
+      expect(block, `${seq} sequence body`).toContain("<Audio");
+      expect(block, `${seq} sequence body`).toContain(`src={${constName}Src}`);
+      // ...and that binding really resolves to THAT scene's asset, not another's.
+      expect(video).toContain(`const ${constName}Key = ${JSON.stringify(key)};`);
+      expect(video).toContain(
+        `  const ${constName}Src = getAssetUrl(${constName}Key);`,
+      );
+    }
+    // Nothing is mounted at frame 0 outside a Sequence — that was the whole bug.
+    const preamble = video.slice(
+      video.indexOf('<AbsoluteFill style={{ backgroundColor: "#000000" }}>'),
+      video.indexOf("<Sequence"),
+    );
+    expect(preamble).not.toContain("Narration");
+  });
+
+  it("U-T2: a scene with no narration key gets no narration <Audio>", () => {
+    const block = video.slice(
+      video.indexOf('<Sequence name="Gamma"'),
+      video.indexOf("</Sequence>", video.indexOf('<Sequence name="Gamma"')),
+    );
+    expect(block).not.toContain("Narration");
+  });
+
+  it("U-T3: the scene STRETCHES to fit a narration longer than its authored duration", () => {
+    // sc-2 is authored at 2s (=20 frames) but its narration measured 3.4s (=34 frames).
+    // Cutting the verse off mid-sentence is the bug; the scene grows instead.
+    expect(video).toContain('<Sequence name="Beta" from={20} durationInFrames={34}>');
+    // ...and everything after it shifts, so the timeline stays contiguous.
+    expect(video).toContain('<Sequence name="Gamma" from={54} durationInFrames={20}>');
+    // Total = 20 + 34 + 20 = 74 frames, not the naive 60.
+    expect(files.get("src/Root.tsx")).toContain("durationInFrames={74}");
+  });
+
+  it("U-T4: a v1 manifest with only the whole-project narratorVoice.assetKey is unchanged", () => {
+    // Backward compatibility: manifests committed before per-scene narration existed must
+    // keep emitting exactly the whole-video <Audio> they emit today.
+    const legacy = fileMap(generateManifestFiles(shelterManifest)).get(
+      "src/Video.tsx",
+    ) as string;
+    expect(legacy).toContain("narrationAssetKey");
+  });
+});
+
+describe("bug 2 — the music bed covers the whole composition", () => {
+  const files = fileMap(generateManifestFiles(richManifest));
+  const video = files.get("src/Video.tsx") as string;
+
+  it("U-T5: a measured music length shorter than the video is LOOPED to cover it", () => {
+    // Remotion's <Loop> fills `ceil(compositionDuration / durationInFrames)` iterations and
+    // the composition end trims the last one, so this is coverage AND trim in one.
+    // 3s at 10fps = 30 frames per iteration, over a 74-frame composition.
+    expect(video).toContain("<Loop durationInFrames={30}>");
+    expect(video).toContain("musicAssetKeySrc");
+  });
+
+  it("U-T6: the bed fades out at the END OF THE VIDEO, not at the end of each loop", () => {
+    // `loopVolumeCurveBehavior="extend"` makes the volume callback's frame a COMPOSITION
+    // frame (verified in remotion 4.0.490 `useFrameForVolumeProp`, which adds
+    // `loop.durationInFrames * loop.iteration`). Without it the fade would re-run every
+    // single loop iteration, ducking the bed repeatedly through the video.
+    expect(video).toContain('loopVolumeCurveBehavior="extend"');
+    expect(video).toContain("volume={(f) =>");
+    expect(video).toContain("[59, 74]"); // last 1.5s of the 74-frame composition
+  });
+
+  it("U-T7: with NO measured duration the bed stays a plain <Audio> (no guessing)", () => {
+    // A v1 manifest has no measured length. Emitting a <Loop> would require inventing an
+    // iteration length, which would mis-time the bed. Old behaviour is the honest fallback.
+    const noDuration = {
+      ...richManifest,
+      music: { style: "ambient pads", assetKey: "projects/p/assets/music-1" },
+    };
+    const v = fileMap(generateManifestFiles(noDuration)).get("src/Video.tsx") as string;
+    expect(v).toContain("musicAssetKeySrc");
+    expect(v).not.toContain("<Loop");
+  });
+});
+
+describe("bug 3 — Ken Burns on stills, OffthreadVideo on clips", () => {
+  const files = fileMap(generateManifestFiles(richManifest));
+
+  it("U-T8: a still scene pans and zooms over its own frame count", () => {
+    const alpha = files.get("src/scenes/Alpha.tsx") as string;
+    expect(alpha).toContain("<Img");
+    expect(alpha).toContain("scale: interpolate(");
+    expect(alpha).toContain("translate: interpolate(");
+    // Normalized over the scene's OWN length (15 frames for the stretched sc-1... 2s = 20),
+    // so the motion always completes exactly once per scene regardless of duration.
+    expect(alpha).toContain("[0, 20]");
+  });
+
+  it("U-T9: the pan variant is derived from the scene INDEX, never from randomness", () => {
+    // The generator is required to be deterministic and is pinned byte-for-byte by goldens.
+    // Any wall-clock or Math.random input would make the goldens unmaintainable and the
+    // render non-reproducible.
+    const a = generateManifestFiles(richManifest);
+    const b = generateManifestFiles(richManifest);
+    expect(a).toEqual(b);
+    const alpha = files.get("src/scenes/Alpha.tsx") as string;
+    const beta = files.get("src/scenes/Beta.tsx") as string;
+    // Adjacent scenes get different motion so a cut never looks like a continuation.
+    expect(alpha).not.toBe(beta);
+    for (const src of [alpha, beta]) {
+      expect(src).not.toContain("Math.random");
+      expect(src).not.toContain("Date.now");
+    }
+  });
+
+  it("U-T10: a VIDEO-kind asset renders through <OffthreadVideo> and gets NO pan", () => {
+    // Latent second bug, closed here: before the manifest could distinguish a still from a
+    // clip, EVERY visual — including a generated video — went through <Img>, which renders
+    // a single frame of it at best.
+    const gamma = files.get("src/scenes/Gamma.tsx") as string;
+    expect(gamma).toContain("<OffthreadVideo");
+    expect(gamma).not.toContain("<Img");
+    expect(gamma).not.toContain("scale: interpolate(");
+  });
+
+  it("U-T11: an absent visualAssetKind still means IMAGE (v1 manifests keep working)", () => {
+    const shelter = fileMap(generateManifestFiles(shelterManifest));
+    expect(shelter.get("src/scenes/Shelter.tsx")).toContain("<Img");
+  });
+});
+
+describe("canonicalizeManifest symmetry for the new fields", () => {
+  it("U-T12: every new field survives a serialize→parse round trip", () => {
+    // The invariant `manifest-json.ts` already records in prose: a field the generator
+    // reads but `canonicalizeManifest` does not write is silently ERASED on every commit.
+    // That regression already happened once, to narratorVoice.assetKey.
+    const json = fileMap(generateManifestFiles(richManifest)).get(
+      "supagloo.project.json",
+    ) as string;
+    const parsed = ProjectManifestSchema.safeParse(JSON.parse(json));
+    expect(parsed.success, JSON.stringify(parsed)).toBe(true);
+    if (parsed.success) expect(parsed.data).toEqual(richManifest);
+  });
+});

@@ -1,10 +1,15 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
-import { buildAssetKey, type GenerateAudioPayload } from "@supagloo/database-lib";
+import {
+  buildAssetKey,
+  buildSceneNarrationAssetKey,
+  type GenerateAudioPayload,
+  type NarrationResult,
+} from "@supagloo/database-lib";
 import { WORKFLOW_NAMES } from "../dbos/registry";
 import { getAppDb } from "../db/app-db";
 import { getProviderConfig } from "../providers/config";
 import { loadOpenRouterCredential } from "../providers/credentials";
-import { requestSpeech } from "../providers/media-client";
+import { requestMusic, requestSpeech } from "../providers/media-client";
 import { MEDIA_RETRY, DISCOVERY_RETRY } from "../providers/errors";
 import { getS3Config } from "../files/s3-config";
 import { uploadAsset } from "../files/s3-client";
@@ -14,7 +19,7 @@ import {
   retryUnlessPermanentGeneration,
 } from "./generate-audio/errors";
 import { parseAudioRequest, type AudioRequest } from "./generate-audio/request";
-import { buildSpeechArgs } from "./generate-audio/synthesize";
+import { buildMusicArgs, buildNarrationSceneArgs } from "./generate-audio/synthesize";
 import {
   markAudioGenerationFailed,
   markAudioGenerationRunning,
@@ -96,40 +101,101 @@ async function generateAudioFn(
       },
     );
 
-    // 2) synthesizeAndUploadAudio (folds callSpeechEndpoint + uploadAssetToS3) — reload the
-    //    key INSIDE the step (never checkpointed), stream the SSE speech chat-completions and
-    //    WAV-wrap the PCM16 bytes, PUT the bytes to the deterministic idempotent key. The bytes
-    //    stay in step-local memory; only the small { providerGenerationId } is returned/checkpointed.
-    const assetKey = buildAssetKey(request.projectId, genId);
-    const { providerGenerationId } = await DBOS.runStep<{
-      providerGenerationId: string | null;
-    }>(
-      async () => {
-        const cfg = getProviderConfig();
-        const cred = await loadOpenRouterCredential({
-          prisma,
-          userId: request.userId,
-          encryptionKey: cfg.secretsEncryptionKey,
-        });
-        const speech = await requestSpeech(
-          { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey },
-          buildSpeechArgs(request),
+    // 2) synthesizeAndUpload — reload the key INSIDE each step (never checkpointed), call the
+    //    provider, and PUT the bytes to a deterministic idempotent key. The bytes stay in
+    //    step-local memory; only small metadata is returned/checkpointed (the task-33 fold).
+    //
+    //    NARRATION now runs ONE STEP PER SCENE. Splitting the steps (rather than looping
+    //    inside one) gives per-scene retry granularity — a single scene's transient 502
+    //    re-synthesizes that scene, not all of them — and keeps each step's return value
+    //    tiny. The iteration order comes straight from the CHECKPOINTED request, so DBOS
+    //    replays the same steps in the same order after a crash.
+    const openrouter = async () => {
+      const cfg = getProviderConfig();
+      const cred = await loadOpenRouterCredential({
+        prisma,
+        userId: request.userId,
+        encryptionKey: cfg.secretsEncryptionKey,
+      });
+      return { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey };
+    };
+
+    let assetKey: string;
+    let providerGenerationId: string | null = null;
+    let narration: NarrationResult | undefined;
+    let durationSeconds: number | null = null;
+
+    if (request.kind === "narration") {
+      const sceneArgs = buildNarrationSceneArgs(request);
+      const scenes: NarrationResult["scenes"] = [];
+      for (const sceneArg of sceneArgs) {
+        const sceneKey = buildSceneNarrationAssetKey(
+          request.projectId,
+          genId,
+          sceneArg.sceneId,
         );
-        const { client, bucket } = getS3Config();
-        await uploadAsset(client, {
-          bucket,
-          key: assetKey,
-          bytes: speech.bytes,
-          contentType: speech.contentType,
+        const measured = await DBOS.runStep<{ durationSeconds: number | null }>(
+          async () => {
+            const speech = await requestSpeech(await openrouter(), sceneArg.speech);
+            const { client, bucket } = getS3Config();
+            await uploadAsset(client, {
+              bucket,
+              key: sceneKey,
+              bytes: speech.bytes,
+              contentType: speech.contentType,
+            });
+            return { durationSeconds: speech.durationSeconds };
+          },
+          {
+            name: `synthesizeNarrationScene:${sceneArg.sceneId}`,
+            ...MEDIA_RETRY,
+            shouldRetry: retryUnlessPermanentGeneration,
+          },
+        );
+        scenes.push({
+          sceneId: sceneArg.sceneId,
+          assetKey: sceneKey,
+          ...(measured.durationSeconds !== null
+            ? { durationSeconds: measured.durationSeconds }
+            : {}),
         });
-        return { providerGenerationId: speech.generationId };
-      },
-      {
-        name: "synthesizeAndUploadAudio",
-        ...MEDIA_RETRY,
-        shouldRetry: retryUnlessPermanentGeneration,
-      },
-    );
+      }
+      narration = { scenes };
+      // The row keeps exactly ONE resultAssetKey (the invariant is unchanged); the rest of
+      // the clips travel in resultJson. Scene 1's clip is the representative key.
+      assetKey = scenes[0]?.assetKey ?? buildAssetKey(request.projectId, genId);
+    } else {
+      assetKey = buildAssetKey(request.projectId, genId);
+      const result = await DBOS.runStep<{
+        providerGenerationId: string | null;
+        durationSeconds: number | null;
+      }>(
+        async () => {
+          const music = await requestMusic(await openrouter(), buildMusicArgs(request));
+          const { client, bucket } = getS3Config();
+          await uploadAsset(client, {
+            bucket,
+            key: assetKey,
+            bytes: music.bytes,
+            contentType: music.contentType,
+          });
+          return {
+            providerGenerationId: music.generationId,
+            durationSeconds: music.durationSeconds,
+          };
+        },
+        {
+          name: "synthesizeAndUploadAudio",
+          ...MEDIA_RETRY,
+          shouldRetry: retryUnlessPermanentGeneration,
+        },
+      );
+      providerGenerationId = result.providerGenerationId;
+      // The MEASURED bed length. The composition cannot ask a provider for a track that
+      // spans the video (no music model accepts a length), so it loops the one it got —
+      // which requires knowing how long that is.
+      durationSeconds = result.durationSeconds;
+    }
 
     // 3) persistResult — idempotent success upsert (status succeeded + resultAssetKey +
     //    resultJson metadata + completedAt).
@@ -139,6 +205,8 @@ async function generateAudioFn(
           assetKey,
           kind: request.kind,
           providerGenerationId,
+          narration,
+          durationSeconds,
         });
       },
       { name: "persistResult", retriesAllowed: true, maxAttempts: 3 },

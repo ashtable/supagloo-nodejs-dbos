@@ -1,5 +1,9 @@
 import type { ProjectManifest } from "@supagloo/database-lib";
-import type { RequestSpeechArgs } from "../../providers/media-client";
+import {
+  DEFAULT_NARRATION_VOICE,
+  type RequestMusicArgs,
+  type RequestSpeechArgs,
+} from "../../providers/media-client";
 
 /**
  * `ensureNarrationAudio` / `ensureMusicAudio` — the pure DECISION half (design-delta §7
@@ -30,9 +34,34 @@ import type { RequestSpeechArgs } from "../../providers/media-client";
 
 export type AudioTrackKind = "narration" | "music";
 
+/** One scene's narration synthesis: which scene, where the file goes, what to say, and —
+ *  once synthesized — how long it actually turned out to be. */
+export interface NarrationScenePlan {
+  sceneId: string;
+  assetKey: string;
+  speechArgs: RequestSpeechArgs;
+  /** MEASURED after synthesis and folded back into the CHECKPOINTED plan, so it survives
+   *  replay and reaches `applyAudioPlans`. */
+  durationSeconds?: number;
+}
+
 export type AudioPlan =
+  // Narration synthesizes N clips (one per scene) so each can be mounted inside its own
+  // <Sequence>; music synthesizes one bed for the whole video.
   | { action: "cached"; assetKey: string }
-  | { action: "synthesize"; assetKey: string; speechArgs: RequestSpeechArgs }
+  | {
+      action: "synthesize";
+      kind: "narration";
+      scenes: NarrationScenePlan[];
+    }
+  | {
+      action: "synthesize";
+      kind: "music";
+      assetKey: string;
+      musicArgs: RequestMusicArgs;
+      /** MEASURED bed length — the number the composition needs in order to loop it. */
+      durationSeconds?: number;
+    }
   | { action: "skipped"; reason: string };
 
 /** The workspace-local `public/` subdirectory freshly-synthesized tracks are written to. */
@@ -47,12 +76,21 @@ export function renderAudioAssetKey(kind: AudioTrackKind): string {
   return `${RENDER_AUDIO_DIR}/${kind}.wav`;
 }
 
+/** The workspace-local key for ONE scene's narration clip. Distinct per scene, since
+ *  narration is no longer a single whole-video file. */
+export function renderSceneNarrationAssetKey(sceneId: string): string {
+  // The scene id is sanitized because this becomes a path segment under the workspace
+  // `public/` dir and is handed to `staticFile()`.
+  const safe = sceneId.replace(/[^A-Za-z0-9_-]/g, "-");
+  return `${RENDER_AUDIO_DIR}/narration-${safe}.mp3`;
+}
+
 /**
  * The provider `voice` for narration. A FIXED valid enum value — the manifest's freeform
  * voice DESCRIPTOR (e.g. "JAMES EARL JONES-STYLE") is not a valid provider voice id, so
  * it cannot be passed through. Identical rule to `generate-audio/synthesize.ts`.
  */
-const NARRATION_VOICE = "alloy";
+const NARRATION_VOICE = DEFAULT_NARRATION_VOICE;
 
 export interface PlanAudioArgs {
   kind: AudioTrackKind;
@@ -87,32 +125,39 @@ export function planAudioTrack(args: PlanAudioArgs): AudioPlan {
   }
 
   if (kind === "narration") {
-    // One combined track for the whole video: per-scene scripts concatenated in array
-    // order (the generateAudio decision D5 — an AiGeneration row has one asset, and so
-    // does the manifest's narratorVoice).
-    const input = manifest.scenes
-      .map((scene) => scene.scriptText)
-      .filter((text) => text.trim().length > 0)
-      .join("\n\n");
-    if (input.length === 0) {
+    // ONE CLIP PER SCENE. This used to concatenate every scene's script into a single
+    // synthesis call, producing one whole-video track that the composition could only mount
+    // at frame 0 — there was no sync mechanism at all, so the narration drifted away from
+    // the picture. Splitting per scene is what lets each clip live inside its own
+    // <Sequence>, and what gives each scene a measurable length to stretch to.
+    const scenes = manifest.scenes
+      .filter((scene) => scene.scriptText.trim().length > 0)
+      .map((scene) => ({
+        sceneId: scene.id,
+        assetKey: renderSceneNarrationAssetKey(scene.id),
+        speechArgs: {
+          modelId,
+          input: scene.scriptText,
+          voice: NARRATION_VOICE,
+        },
+      }));
+    if (scenes.length === 0) {
       return { action: "skipped", reason: "no narration script text in the manifest" };
     }
-    return {
-      action: "synthesize",
-      assetKey: renderAudioAssetKey("narration"),
-      speechArgs: { modelId, input, voice: NARRATION_VOICE },
-    };
+    return { action: "synthesize", kind: "narration", scenes };
   }
 
   const style = manifest.music?.style;
   if (!style) {
     return { action: "skipped", reason: "the manifest has no music bed" };
   }
-  // Music (Lyria) uses the same streaming chat-audio contract with NO voice.
+  // Music uses the streaming chat-audio contract with NO voice, and sends no duration —
+  // no discovered music model accepts one.
   return {
     action: "synthesize",
+    kind: "music",
     assetKey: renderAudioAssetKey("music"),
-    speechArgs: { modelId, input: style },
+    musicArgs: { modelId, input: style },
   };
 }
 
@@ -132,16 +177,37 @@ export function applyAudioPlans(
   plans: AudioPlans,
 ): ProjectManifest {
   let next = manifest;
-  if (plans.narration.action === "synthesize") {
+  if (plans.narration.action === "synthesize" && plans.narration.kind === "narration") {
+    // Per-scene keys + measured lengths. The whole-project `narratorVoice.assetKey` is
+    // deliberately left alone: the composition prefers per-scene clips and ignores the
+    // whole-video track once any exist, so setting both would double the narration up.
+    const bySceneId = new Map(plans.narration.scenes.map((s) => [s.sceneId, s]));
     next = {
       ...next,
-      narratorVoice: { ...next.narratorVoice, assetKey: plans.narration.assetKey },
+      scenes: next.scenes.map((scene) => {
+        const hit = bySceneId.get(scene.id);
+        if (!hit) return scene;
+        return {
+          ...scene,
+          narrationAssetKey: hit.assetKey,
+          ...(hit.durationSeconds !== undefined
+            ? { narrationDurationSeconds: hit.durationSeconds }
+            : {}),
+        };
+      }),
     };
   }
-  if (plans.music.action === "synthesize" && next.music) {
+  if (plans.music.action === "synthesize" && plans.music.kind === "music" && next.music) {
     next = {
       ...next,
-      music: { ...next.music, assetKey: plans.music.assetKey },
+      music: {
+        ...next.music,
+        assetKey: plans.music.assetKey,
+        // Only when it was really measured — a guessed length would mis-time the loop.
+        ...(plans.music.durationSeconds !== undefined
+          ? { durationSeconds: plans.music.durationSeconds }
+          : {}),
+      },
     };
   }
   return next;

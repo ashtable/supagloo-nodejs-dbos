@@ -15,7 +15,7 @@ import {
 } from "./shared/installation-token";
 import { getProviderConfig } from "../providers/config";
 import { loadOpenRouterCredential } from "../providers/credentials";
-import { requestSpeech } from "../providers/media-client";
+import { requestMusic, requestSpeech } from "../providers/media-client";
 import { getS3Config } from "../files/s3-config";
 import { downloadAsset, uploadAsset } from "../files/s3-client";
 import { getRenderConfig } from "./render/config";
@@ -34,6 +34,7 @@ import {
   planAudioTrack,
   type AudioPlan,
   type AudioPlans,
+  type NarrationScenePlan,
 } from "./render/audio";
 import {
   markRenderCanceled,
@@ -220,28 +221,65 @@ async function ensureSceneAssets(
   return materialized;
 }
 
-/** Materialize one audio plan onto disk (synthesizing only if the file is missing). */
+/**
+ * Materialize one audio plan onto disk, returning the plan ENRICHED with what was measured.
+ *
+ * The return value matters: the caller checkpoints it as the step's result, so the measured
+ * lengths survive a crash and reach `applyAudioPlans`. Without them a render-time-synthesized
+ * bed could not be looped and a render-time-synthesized narration could not stretch its
+ * scene — i.e. this fallback path would quietly reproduce both original bugs.
+ *
+ * Narration synthesizes one clip PER SCENE; music synthesizes one bed.
+ */
 async function ensureAudioOnDisk(
   ws: RenderWorkspace,
   request: RenderRequest,
   plan: AudioPlan,
-): Promise<void> {
-  if (plan.action !== "synthesize") return;
-  if (hasWorkspaceAsset(ws, plan.assetKey)) return;
+): Promise<AudioPlan> {
+  if (plan.action !== "synthesize") return plan;
   const cfg = getProviderConfig();
   const prisma = getAppDb();
   // The key is (re)loaded INSIDE the call so it never lands in a DBOS checkpoint — the
   // discipline every generation workflow follows.
-  const cred = await loadOpenRouterCredential({
-    prisma,
-    userId: request.userId,
-    encryptionKey: cfg.secretsEncryptionKey,
-  });
-  const speech = await requestSpeech(
-    { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey },
-    plan.speechArgs,
-  );
-  await writeWorkspaceAsset(ws, plan.assetKey, speech.bytes);
+  const client = async () => {
+    const cred = await loadOpenRouterCredential({
+      prisma,
+      userId: request.userId,
+      encryptionKey: cfg.secretsEncryptionKey,
+    });
+    return { openrouterBaseUrl: cfg.openrouterBaseUrl, apiKey: cred.apiKey };
+  };
+
+  if (plan.kind === "narration") {
+    const scenes: NarrationScenePlan[] = [];
+    for (const scene of plan.scenes) {
+      if (hasWorkspaceAsset(ws, scene.assetKey) && scene.durationSeconds !== undefined) {
+        scenes.push(scene);
+        continue;
+      }
+      const speech = await requestSpeech(await client(), scene.speechArgs);
+      await writeWorkspaceAsset(ws, scene.assetKey, speech.bytes);
+      scenes.push({
+        ...scene,
+        ...(speech.durationSeconds !== null
+          ? { durationSeconds: speech.durationSeconds }
+          : {}),
+      });
+    }
+    return { ...plan, scenes };
+  }
+
+  if (hasWorkspaceAsset(ws, plan.assetKey) && plan.durationSeconds !== undefined) {
+    return plan;
+  }
+  const music = await requestMusic(await client(), plan.musicArgs);
+  await writeWorkspaceAsset(ws, plan.assetKey, music.bytes);
+  return {
+    ...plan,
+    ...(music.durationSeconds !== null
+      ? { durationSeconds: music.durationSeconds }
+      : {}),
+  };
 }
 
 /**
@@ -600,8 +638,9 @@ async function renderFn(payload: RenderWorkflowPayload): Promise<RenderResult> {
           hasOpenRouterConnection,
         });
         const ws = await ensureClonedWorkspace(ctx);
-        await ensureAudioOnDisk(ws, request, plan);
-        return plan;
+        // The ENRICHED plan is what gets checkpointed — the measured clip lengths ride
+        // back out with it and are what `applyAudioPlans` writes onto the manifest.
+        return await ensureAudioOnDisk(ws, request, plan);
       },
       {
         name: "ensureNarrationAudio",
@@ -620,8 +659,7 @@ async function renderFn(payload: RenderWorkflowPayload): Promise<RenderResult> {
           hasOpenRouterConnection,
         });
         const ws = await ensureClonedWorkspace(ctx);
-        await ensureAudioOnDisk(ws, request, plan);
-        return plan;
+        return await ensureAudioOnDisk(ws, request, plan);
       },
       {
         name: "ensureMusicAudio",

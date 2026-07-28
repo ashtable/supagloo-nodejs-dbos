@@ -100,10 +100,19 @@ vi.mock("../providers/credentials", () => ({
   loadOpenRouterCredential: vi.fn(async () => ({ apiKey: "sk-or-x" })),
 }));
 vi.mock("../providers/media-client", () => ({
+  // The provider voice constant the render-time narration planner reads.
+  DEFAULT_NARRATION_VOICE: "alloy",
   requestSpeech: vi.fn(async () => ({
     bytes: Buffer.from("RIFF"),
     contentType: "audio/wav",
+    generationId: null,
+    durationSeconds: 2.5,
+  })),
+  requestMusic: vi.fn(async () => ({
+    bytes: Buffer.from("RIFF"),
+    contentType: "audio/wav",
     generationId: "g1",
+    durationSeconds: 29.07,
   })),
 }));
 vi.mock("../files/s3-config", () => ({
