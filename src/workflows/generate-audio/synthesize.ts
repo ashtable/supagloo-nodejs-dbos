@@ -24,7 +24,17 @@ import type { AudioRequest } from "./request";
  *
  * The provider `voice` is a valid provider voice id, NOT the request's freeform DESCRIPTOR
  * ("JEJ-STYLE") — the live endpoint rejects an unknown voice and enumerates the valid ones.
- * Richer descriptor→voice mapping remains future work.
+ *
+ * FEATURE 1: it is now the id the STUDIO chose (`input.voiceId`), falling back to
+ * {@link DEFAULT_NARRATION_VOICE} only when the project has never picked one. Until this,
+ * the descriptor was written, validated, persisted, committed and snapshotted, and read by
+ * zero provider-facing code — every project narrated in the same default voice however the
+ * studio was configured. No provider publishes a voice-enumeration API (verified live
+ * 2026-07-29), so the studio ships a curated per-model list and sends the resolved id; this
+ * file is deliberately a PASS-THROUGH and holds no voice catalogue of its own.
+ *
+ * `render/audio.ts` resolves the same value from `manifest.narratorVoice.voiceId`. Both
+ * paths must agree or the studio preview and the final render narrate in different voices.
  *
  * ## MUSIC — one call, and deliberately NO duration
  *
@@ -44,12 +54,34 @@ export interface NarrationSceneArgs {
   speech: RequestSpeechArgs;
 }
 
+/**
+ * The chosen provider voice id, read STRUCTURALLY off the parsed narration input.
+ *
+ * `GenerateNarrationInputSchema` is `NarrationSpecSchema.passthrough()`, so a top-level
+ * key survives validation here even though this repo's pinned `@supagloo/database-lib`
+ * copy does not yet DECLARE it — the same mechanism `faithAlignment` already rides for
+ * image generations. The cast is the forward declaration.
+ *
+ * DELETE THE CAST AT THE db-lib BUMP (`NarrationSpecSchema.voiceId` types it).
+ *
+ * Anything that is not a non-empty string is treated as absent rather than forwarded: an
+ * unknown voice is a hard provider 400, and degrading to the default narrator is a far
+ * better outcome than failing the whole generation on a malformed id.
+ */
+function chosenVoiceId(input: unknown): string | undefined {
+  const raw = (input as { voiceId?: unknown } | null | undefined)?.voiceId;
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
 export function buildNarrationSceneArgs(
   request: Extract<AudioRequest, { kind: "narration" }> | AudioRequest,
 ): NarrationSceneArgs[] {
   if (request.kind !== "narration") {
     throw new Error(`buildNarrationSceneArgs called with kind "${request.kind}"`);
   }
+  // ONE voice for the whole video, resolved once: a narrator that changed between scenes
+  // would be a different person reading each verse.
+  const voice = chosenVoiceId(request.input) ?? DEFAULT_NARRATION_VOICE;
   // Array order is preserved verbatim: the workflow runs one DBOS step per entry, and DBOS
   // requires the same steps in the same order on replay. Deriving this list purely from the
   // already-checkpointed request is what makes that hold after a crash.
@@ -58,7 +90,7 @@ export function buildNarrationSceneArgs(
     speech: {
       modelId: request.model,
       input: scene.scriptText,
-      voice: DEFAULT_NARRATION_VOICE,
+      voice,
     },
   }));
 }

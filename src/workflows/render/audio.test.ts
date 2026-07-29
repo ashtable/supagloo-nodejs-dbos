@@ -385,3 +385,70 @@ describe("planAudioTrack — music carries its MEASURED length to the manifest",
     expect(out.music?.durationSeconds).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 1 — the narrator voice, on the RENDER path
+// ---------------------------------------------------------------------------
+//
+// There are TWO places that turn a manifest into a speech request: the studio's
+// `generate-audio/synthesize.ts` and this one. They are separate code paths reached by
+// separate user actions (↻ Regenerate narration vs a render with no cached narration
+// ref), and until now both hardcoded `DEFAULT_NARRATION_VOICE`. Fixing only one would
+// mean the studio preview and the final render narrate in DIFFERENT voices — a
+// divergence nothing in the product would report, because each path is individually
+// self-consistent.
+
+describe("planAudioTrack — narration honours the manifest's chosen voice", () => {
+  const withChosenVoice = (voiceId?: string): ProjectManifest => ({
+    ...BASE,
+    narratorVoice: {
+      description: "warm, weathered baritone",
+      label: "JEJ-STYLE",
+      ...(voiceId !== undefined ? { voiceId } : {}),
+    },
+  });
+
+  it("U-RA6: sends narratorVoice.voiceId as the provider voice", () => {
+    const plan = planAudioTrack({
+      kind: "narration",
+      manifest: withChosenVoice("zac"),
+      modelId: "m",
+      ...CONNECTED,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "narration") {
+      throw new Error("expected a per-scene narration synthesize plan");
+    }
+    expect(plan.scenes.map((s) => s.speechArgs.voice)).toEqual(["zac"]);
+  });
+
+  it("U-RA7: falls back to the default provider voice when the manifest chose none", () => {
+    const plan = planAudioTrack({
+      kind: "narration",
+      manifest: withChosenVoice(),
+      modelId: "m",
+      ...CONNECTED,
+    });
+    if (plan.action !== "synthesize" || plan.kind !== "narration") {
+      throw new Error("expected a per-scene narration synthesize plan");
+    }
+    expect(plan.scenes.map((s) => s.speechArgs.voice)).toEqual(["alloy"]);
+  });
+
+  it("U-RA8: never sends the freeform descriptor or label as a voice id", () => {
+    for (const manifest of [withChosenVoice("zac"), withChosenVoice()]) {
+      const plan = planAudioTrack({
+        kind: "narration",
+        manifest,
+        modelId: "m",
+        ...CONNECTED,
+      });
+      if (plan.action !== "synthesize" || plan.kind !== "narration") {
+        throw new Error("expected a per-scene narration synthesize plan");
+      }
+      for (const scene of plan.scenes) {
+        expect(scene.speechArgs.voice).not.toContain("JEJ");
+        expect(scene.speechArgs.voice).not.toContain("baritone");
+      }
+    }
+  });
+});

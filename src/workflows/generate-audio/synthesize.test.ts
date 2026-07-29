@@ -28,6 +28,15 @@ const narration: AudioRequest = {
   },
 };
 
+/** The same request with the studio's CHOSEN voice attached (feature 1). */
+const narrationWithVoice: AudioRequest = {
+  ...narration,
+  input: {
+    ...(narration.input as Extract<AudioRequest, { kind: "narration" }>["input"]),
+    voiceId: "zac",
+  } as Extract<AudioRequest, { kind: "narration" }>["input"],
+};
+
 describe("buildNarrationSceneArgs", () => {
   it("U-S1: emits one synthesis call per scene, each carrying ONLY that scene's verse", () => {
     const args = buildNarrationSceneArgs(narration);
@@ -59,13 +68,45 @@ describe("buildNarrationSceneArgs", () => {
     expect(buildNarrationSceneArgs(narration)).toEqual(buildNarrationSceneArgs(narration));
   });
 
-  it("U-S4: uses a valid provider voice id, not the freeform manifest descriptor", () => {
-    // "JEJ-STYLE" is a human-readable label, not a provider voice enum; the live endpoint
-    // rejects an unknown voice by name.
+  // ── Feature 1 ──────────────────────────────────────────────────────────────
+  //
+  // U-S4 USED TO ASSERT `expect(a.speech.voice).toBe("alloy")` unconditionally. That
+  // assertion pinned the BUG: the user's chosen narrator voice reached this builder and
+  // was thrown away, so every project narrated in the same default voice however the
+  // studio was configured. The rule the test meant to protect — "never send the freeform
+  // PROSE descriptor as a provider voice id" — is real and is kept below; what changes is
+  // that a real provider voice ID, when the studio chose one, is now honoured.
+
+  it("U-S4: sends the CHOSEN provider voice id when the studio picked one", () => {
+    for (const a of buildNarrationSceneArgs(narrationWithVoice)) {
+      expect(a.speech.voice).toBe("zac");
+    }
+  });
+
+  it("U-S4b: falls back to the default provider voice when no id was chosen", () => {
+    // Absent is a real state: every manifest committed before this feature existed, and
+    // any project whose user never opened the voice list.
     for (const a of buildNarrationSceneArgs(narration)) {
       expect(a.speech.voice).toBe("alloy");
-      expect(a.speech.voice).not.toContain("JEJ");
     }
+  });
+
+  it("U-S4c: NEVER sends the freeform descriptor or label as a voice id", () => {
+    // "JEJ-STYLE" / "warm, weathered baritone" are human-readable prose, not a provider
+    // voice enum; the live endpoint rejects an unknown voice by name. This holds whether
+    // or not a real id was chosen — the prose has no channel in the request body at all
+    // (`requestSpeech` sends exactly {model, input, voice, response_format}).
+    for (const req of [narration, narrationWithVoice]) {
+      for (const a of buildNarrationSceneArgs(req)) {
+        expect(a.speech.voice).not.toContain("JEJ");
+        expect(a.speech.voice).not.toContain("baritone");
+      }
+    }
+  });
+
+  it("U-S4d: an id chosen for one scene is used for EVERY scene — one narrator per video", () => {
+    const voices = buildNarrationSceneArgs(narrationWithVoice).map((a) => a.speech.voice);
+    expect(voices).toEqual(["zac", "zac"]);
   });
 });
 
