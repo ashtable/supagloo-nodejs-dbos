@@ -131,3 +131,124 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
     expect(out.aiSettings).toEqual({ narration: { provider: "openrouter" } });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 1 + Feature 2 — the two new manifest fields cross this SAME mirror
+// ---------------------------------------------------------------------------
+//
+// Identical argument to U-AS4 above, applied to `narratorVoice.voiceId` (the user's
+// chosen narrator, feature 1) and `scripture` (the project's origin passage picked in
+// the new-project wizard, feature 2). A field this function does not WRITE is erased on
+// every commit — and for `voiceId` that would restore the exact bug being fixed one
+// commit later, with the studio still displaying the choice it had already lost.
+//
+// Both are read through a locally-declared FORWARD type because this repo's
+// `@supagloo/database-lib` is the nested submodule, pinned until the release step. The
+// reads are structural over a plain JSON object, so the runtime behaviour is correct
+// today. DELETE THE FORWARD TYPE AT THE db-lib BUMP.
+interface ForwardManifest {
+  narratorVoice: { voiceId?: string };
+  scripture?: {
+    reference: string;
+    translation: string;
+    language?: string;
+    passageId?: string;
+  };
+}
+const forwardAs = (m: ProjectManifest, extra: ForwardManifest): ProjectManifest =>
+  ({
+    ...m,
+    ...extra,
+    narratorVoice: { ...m.narratorVoice, ...extra.narratorVoice },
+  }) as ProjectManifest;
+
+describe("canonicalizeManifest — narratorVoice.voiceId (feature 1)", () => {
+  it("U-V7: the chosen voice id survives canonicalization", () => {
+    const manifest = forwardAs(baseManifest, { narratorVoice: { voiceId: "zac" } });
+    const out = canonicalizeManifest(manifest);
+    expect((out.narratorVoice as Record<string, unknown>).voiceId).toBe("zac");
+  });
+
+  it("U-V8: a manifest without one does not gain the key", () => {
+    const out = canonicalizeManifest(baseManifest);
+    expect("voiceId" in (out.narratorVoice as object)).toBe(false);
+  });
+
+  it("U-V9: voiceId is emitted AFTER description/label/assetKey — fixed key order", () => {
+    const manifest = forwardAs(baseManifest, {
+      narratorVoice: { voiceId: "zac" },
+    });
+    const withAll = {
+      ...manifest,
+      narratorVoice: {
+        ...manifest.narratorVoice,
+        label: "JEJ-STYLE",
+        assetKey: "projects/p/narration.mp3",
+      },
+    };
+    expect(Object.keys(canonicalizeManifest(withAll).narratorVoice as object)).toEqual([
+      "description",
+      "label",
+      "assetKey",
+      "voiceId",
+    ]);
+  });
+});
+
+describe("canonicalizeManifest — scripture (feature 2)", () => {
+  const scripture = {
+    reference: "Psalm 121",
+    translation: "ASV",
+    language: "en",
+    passageId: "PSA.121",
+  };
+
+  it("U-W10: the origin passage survives canonicalization intact", () => {
+    const out = canonicalizeManifest(
+      forwardAs(baseManifest, { narratorVoice: {}, scripture }),
+    );
+    expect(out.scripture).toEqual(scripture);
+  });
+
+  it("U-W11: a manifest without one does not gain the key", () => {
+    expect("scripture" in canonicalizeManifest(baseManifest)).toBe(false);
+  });
+
+  it("U-W12: the optional halves stay absent rather than materializing as undefined", () => {
+    const out = canonicalizeManifest(
+      forwardAs(baseManifest, {
+        narratorVoice: {},
+        scripture: { reference: "Psalm 121", translation: "ASV" },
+      }),
+    );
+    expect(out.scripture).toEqual({ reference: "Psalm 121", translation: "ASV" });
+    expect(Object.keys(out.scripture as object)).toEqual(["reference", "translation"]);
+  });
+
+  it("U-W13: scripture is emitted in a FIXED key order regardless of input order", () => {
+    const reversed = {
+      passageId: "PSA.121",
+      language: "en",
+      translation: "ASV",
+      reference: "Psalm 121",
+    };
+    const out = canonicalizeManifest(
+      forwardAs(baseManifest, { narratorVoice: {}, scripture: reversed }),
+    );
+    expect(Object.keys(out.scripture as object)).toEqual([
+      "reference",
+      "translation",
+      "language",
+      "passageId",
+    ]);
+  });
+
+  it("U-W14: serializeManifest emits both new fields as stable JSON text", () => {
+    const text = serializeManifest(
+      forwardAs(baseManifest, { narratorVoice: { voiceId: "zac" }, scripture }),
+    );
+    expect(text).toContain('"voiceId": "zac"');
+    expect(text).toContain('"passageId": "PSA.121"');
+    expect(text.endsWith("\n")).toBe(true);
+  });
+});

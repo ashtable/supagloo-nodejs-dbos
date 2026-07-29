@@ -60,3 +60,58 @@ describe("appendValidationErrors", () => {
     expect(repaired.length).toBeGreaterThan(base.length);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Feature 1 (secondary bug) — a re-plan must not overwrite the narrator voice
+// ---------------------------------------------------------------------------
+//
+// The storyboard system directive asks the model to PRODUCE a `narratorVoice`
+// (`GeneratedStoryboardSchema` requires one), and this builder never told it about the
+// voice the project already has. So every "re-plan all scenes" silently replaced a
+// descriptor the user had written with whatever the model invented — a destructive edit
+// to a field the user owns, triggered by a button about SCENES.
+//
+// The prompt carries the existing voice when there is one; the machine-readable
+// `voiceId` is preserved by the studio on the way back in (an LLM has no business
+// inventing a provider voice id).
+
+describe("buildGenerationPrompt — existing narrator voice", () => {
+  const withVoice: GenerateScriptInput = {
+    ...INPUT,
+    narratorVoice: {
+      description: "warm, weathered baritone — unhurried, reverent",
+      label: "JEJ-STYLE",
+    },
+  } as GenerateScriptInput;
+
+  it("U-P1: a re-plan tells the model to KEEP the project's existing narrator voice", () => {
+    const { prompt } = buildGenerationPrompt({
+      kind: "storyboard",
+      input: withVoice,
+      passage: PASSAGE,
+    });
+    expect(prompt).toContain("warm, weathered baritone — unhurried, reverent");
+    expect(prompt).toContain("JEJ-STYLE");
+    expect(prompt.toLowerCase()).toContain("keep");
+  });
+
+  it("U-P2: a first-time generation (no voice yet) is byte-identical to before", () => {
+    const before = buildGenerationPrompt({
+      kind: "storyboard",
+      input: INPUT,
+      passage: PASSAGE,
+    });
+    expect(before.prompt).not.toContain("narrator voice");
+  });
+
+  it("U-P3: the SCRIPT kind never carries it — a script regeneration returns no voice", () => {
+    // `GeneratedScriptSchema` is {scriptText, reference, translation}; there is no
+    // narratorVoice for the model to overwrite, so mentioning one is noise in the prompt.
+    const { prompt } = buildGenerationPrompt({
+      kind: "script",
+      input: withVoice,
+      passage: PASSAGE,
+    });
+    expect(prompt).not.toContain("JEJ-STYLE");
+  });
+});

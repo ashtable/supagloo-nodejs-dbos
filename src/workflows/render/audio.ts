@@ -86,11 +86,28 @@ export function renderSceneNarrationAssetKey(sceneId: string): string {
 }
 
 /**
- * The provider `voice` for narration. A FIXED valid enum value — the manifest's freeform
- * voice DESCRIPTOR (e.g. "JAMES EARL JONES-STYLE") is not a valid provider voice id, so
- * it cannot be passed through. Identical rule to `generate-audio/synthesize.ts`.
+ * The provider `voice` for narration — the id the STUDIO chose, or the default when the
+ * project never picked one.
+ *
+ * The manifest's freeform voice DESCRIPTOR ("JAMES EARL JONES-STYLE") is still never
+ * passed through: it is prose, and an unknown voice is rejected by name. What changed is
+ * that `narratorVoice.voiceId` — a real provider voice id, chosen from the studio's
+ * curated per-model list — is now honoured here as well as in
+ * `generate-audio/synthesize.ts`.
+ *
+ * **Both sites or neither.** This is the render path (reached when a render finds no
+ * cached narration ref) and that is the studio path (reached by ↻ Regenerate narration).
+ * Fixing one alone would make the studio preview and the final video narrate in different
+ * voices, and nothing in the product would report it, because each path is individually
+ * self-consistent.
+ *
+ * Read structurally because this repo's pinned `@supagloo/database-lib` copy does not yet
+ * declare the field. DELETE THE CAST AT THE db-lib BUMP.
  */
-const NARRATION_VOICE = DEFAULT_NARRATION_VOICE;
+function narrationVoiceFor(manifest: ProjectManifest): string {
+  const raw = (manifest.narratorVoice as { voiceId?: unknown }).voiceId;
+  return typeof raw === "string" && raw.length > 0 ? raw : DEFAULT_NARRATION_VOICE;
+}
 
 export interface PlanAudioArgs {
   kind: AudioTrackKind;
@@ -130,6 +147,9 @@ export function planAudioTrack(args: PlanAudioArgs): AudioPlan {
     // at frame 0 — there was no sync mechanism at all, so the narration drifted away from
     // the picture. Splitting per scene is what lets each clip live inside its own
     // <Sequence>, and what gives each scene a measurable length to stretch to.
+    // ONE voice for the whole video, resolved once — a narrator that changed between
+    // scenes would be a different person reading each verse.
+    const voice = narrationVoiceFor(manifest);
     const scenes = manifest.scenes
       .filter((scene) => scene.scriptText.trim().length > 0)
       .map((scene) => ({
@@ -138,7 +158,7 @@ export function planAudioTrack(args: PlanAudioArgs): AudioPlan {
         speechArgs: {
           modelId,
           input: scene.scriptText,
-          voice: NARRATION_VOICE,
+          voice,
         },
       }));
     if (scenes.length === 0) {

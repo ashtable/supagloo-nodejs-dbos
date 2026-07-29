@@ -80,6 +80,15 @@ export function canonicalizeManifest(
   if (manifest.narratorVoice.assetKey !== undefined) {
     narratorVoice.assetKey = manifest.narratorVoice.assetKey;
   }
+  // Feature 1 — the CHOSEN provider voice id, under the same symmetry invariant. Omitting
+  // this branch would erase the user's narrator on the next commit while the studio still
+  // displayed the choice it had already lost, and the next render would silently revert to
+  // the default voice. Forward-typed: this repo's pinned db-lib copy does not declare it
+  // yet. DELETE THE CAST AT THE db-lib BUMP.
+  const voiceId = (manifest.narratorVoice as { voiceId?: unknown }).voiceId;
+  if (voiceId !== undefined) {
+    narratorVoice.voiceId = voiceId;
+  }
 
   const out: Record<string, unknown> = {
     manifestVersion: manifest.manifestVersion,
@@ -87,6 +96,32 @@ export function canonicalizeManifest(
     scenes,
     narratorVoice,
   };
+
+  // Feature 2 — the project's ORIGIN passage, picked in the new-project wizard's step 2
+  // before any scene existed. Same symmetry invariant again: the scaffold seeds it, so
+  // without this branch the very first commit from the studio would erase it and the
+  // first-time storyboard generation would lose the passage the project was created for.
+  // Fixed key order, `undefined` optionals omitted, byte-stable on disk.
+  // Forward-typed. DELETE THE CAST AT THE db-lib BUMP.
+  const scripture = (
+    manifest as {
+      scripture?: {
+        reference: string;
+        translation: string;
+        language?: string;
+        passageId?: string;
+      };
+    }
+  ).scripture;
+  if (scripture !== undefined) {
+    const out2: Record<string, unknown> = {
+      reference: scripture.reference,
+      translation: scripture.translation,
+    };
+    if (scripture.language !== undefined) out2.language = scripture.language;
+    if (scripture.passageId !== undefined) out2.passageId = scripture.passageId;
+    out.scripture = out2;
+  }
 
   if (manifest.music !== undefined) {
     const music: Record<string, unknown> = { style: manifest.music.style };
