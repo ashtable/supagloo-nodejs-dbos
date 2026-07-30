@@ -48,6 +48,9 @@ function validEnv(
     DATABASE_URL: APP_URL,
     DBOS_DATABASE_URL: SYSTEM_URL,
     SECRETS_ENCRYPTION_KEY,
+    // Required at boot since 2026-07-30 — see the REQUIRED matrix below and `env.ts`'s own
+    // comment for why the old "public-domain KJV/BSB fallback" justification was false.
+    YOUVERSION_APP_KEY: "yvp-app-key-value",
     ...GITHUB_APP,
     ...S3_ENV,
     ...overrides,
@@ -611,8 +614,10 @@ describe("plan row 43 — SECRETS_ENCRYPTION_KEY weak-key rejection", () => {
 
 // The row's Unit column asks for "validator matrices per service" — plural, because the
 // three services' required sets are DELIBERATELY different (brief §2.2 constraint 6). This
-// is dbos's matrix. Required-ness tiers are asserted as they are, not normalised: promoting
-// an optional key to required would falsify current-design §5.3 and break every Compose file.
+// is dbos's matrix. Required-ness tiers are asserted as they ARE, not as they ought to be:
+// this file follows the schema, it does not argue with it. YOUVERSION_APP_KEY was promoted
+// from optional to required on 2026-07-30 — deliberately, in the schema, with root's
+// `docker-compose.yml` already passing it to this service — so it joins the list below.
 describe("plan row 43 — dbos required-variable matrix", () => {
   const REQUIRED = [
     "DATABASE_URL",
@@ -624,6 +629,12 @@ describe("plan row 43 — dbos required-variable matrix", () => {
     "S3_BUCKET",
     "S3_ACCESS_KEY",
     "S3_SECRET_KEY",
+    // The generation workflows cannot read scripture without it: a missing key is a 401 on
+    // BOTH YouVersion endpoints, and `generate-script.ts` calls `fetchPassage`
+    // unconditionally after swallowing the collection 401. Optional here for months on a
+    // "public-domain KJV/BSB fallback" that never worked; the cost of that was a 401 three
+    // services away, reported by the user as "Generation failed — try again".
+    "YOUVERSION_APP_KEY",
   ] as const;
 
   it.each(REQUIRED)(
@@ -650,12 +661,16 @@ describe("plan row 43 — dbos required-variable matrix", () => {
   it("U-DBENV-R43-5: every optional key stays optional", () => {
     // current-design §5.3:615-633 spends nineteen lines arguing DBOS_SYSTEM_DATABASE_SCHEMA
     // is optional-and-unset-everywhere; S3_PUBLIC_ENDPOINT exists for name-parity with the
-    // api and is unused here; YOUVERSION_APP_KEY has a public-domain fallback; the two
-    // RENDER_*_MODEL keys mean "no fallback synthesis" when unset.
+    // api and is unused here; the two RENDER_*_MODEL keys mean "no fallback synthesis" when
+    // unset.
+    //
+    // YOUVERSION_APP_KEY used to be on this list, justified as having "a public-domain
+    // fallback". It never had one, and this sentence is a large part of why the belief
+    // survived review long enough to cost a user-visible failure — so the assertion and the
+    // claim are both gone rather than just the assertion. It is in REQUIRED above now.
     const env = loadEnv(validEnv());
     expect(env.DBOS_SYSTEM_DATABASE_SCHEMA).toBeUndefined();
     expect(env.S3_PUBLIC_ENDPOINT).toBeUndefined();
-    expect(env.YOUVERSION_APP_KEY).toBeUndefined();
     expect(env.RENDER_NARRATION_MODEL).toBeUndefined();
     expect(env.RENDER_MUSIC_MODEL).toBeUndefined();
     // Provider base URLs default to the REAL hosts — production needs zero config.

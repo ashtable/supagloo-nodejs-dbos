@@ -168,12 +168,28 @@ export const envSchema = z.object({
   GLOO_BASE_URL: providerBaseUrl("GLOO_BASE_URL", "https://platform.ai.gloo.com"),
   // Task #30 YouVersion Data Exchange (design-delta §7 workflow 5 / §9-Q10). The base URL
   // fetchScripturePassage resolves the Bible collection + passages from (real host default ⇒
-  // prod needs zero config; since task 34-E8 the e2e hits the LIVE host, no stub). The passage
-  // e2e (34-E5) requires YOUVERSION_APP_KEY; it is the real API's `X-YVP-App-Key` — OPTIONAL at
-  // the schema level (public-domain KJV/BSB fallback works without it), sent as a header when
-  // present.
+  // prod needs zero config; since task 34-E8 the e2e hits the LIVE host, no stub).
+  //
+  // YOUVERSION_APP_KEY is the real API's `x-yvp-app-key`, and it is REQUIRED at boot as of
+  // 2026-07-30. It was `.optional()`, justified in this comment by a "public-domain KJV/BSB
+  // fallback works without it" claim that is empirically false:
+  //
+  //   - `providers/youversion.ts`'s own header docs say the key is "REQUIRED on BOTH
+  //     endpoints" — a missing or wrong one is a 401 from a gateway OAuth check that fires
+  //     before backend routing.
+  //   - `workflows/generate-script.ts` swallows the COLLECTION 401 (`catch → collection =
+  //     null`) down to a KJV/BSB literal, and then calls `fetchPassage` UNCONDITIONALLY with
+  //     the same missing key. So the fallback covers the version lookup only, and the literal
+  //     it produces is not a valid bible id — the passage fetch 422s/401s either way and the
+  //     generation fails permanently.
+  //
+  // That failure surfaced three services away as "Generation failed — try again", which is
+  // exactly what a boot refusal converts into a one-line startup error. The operational cost
+  // is nil: no deployment legitimately runs this worker without the key (root's README
+  // already records nextjs refusing to boot without the same variable), and this schema
+  // already fails fast on GITHUB_APP_PRIVATE_KEY and SECRETS_ENCRYPTION_KEY.
   YOUVERSION_BASE_URL: providerBaseUrl("YOUVERSION_BASE_URL", "https://api.youversion.com"),
-  YOUVERSION_APP_KEY: z.string().min(1).optional(),
+  YOUVERSION_APP_KEY: z.string().min(1),
   // The single AES-256-GCM key that decrypts per-user provider secrets (OpenRouter
   // API key, Gloo client secret) via db-lib's decryptSecret inside the generation
   // workflows. A 64-hex-char (32-byte) value, distinct per environment. Required —
