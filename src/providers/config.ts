@@ -14,7 +14,20 @@ export interface ProviderConfig {
   glooBaseUrl: string;
   /** YouVersion Data Exchange base URL (task #30 fetchScripturePassage). */
   youversionBaseUrl: string;
-  /** The real YouVersion API's `X-YVP-App-Key` (optional — the stub ignores it). */
+  /**
+   * The real YouVersion API's `x-yvp-app-key`, REQUIRED on both YouVersion endpoints.
+   *
+   * The "optional — the stub ignores it" note this replaced was doubly stale: the YouVersion
+   * stub was DELETED in task 34-E8, and since 2026-07-30 `config/env.ts` refuses to boot
+   * without `YOUVERSION_APP_KEY` (a missing key is a 401 on both endpoints, and
+   * `generate-script.ts` calls `fetchPassage` unconditionally, so there is no working
+   * key-free path).
+   *
+   * The TYPE stays optional on purpose. The boot gate already makes the runtime value
+   * present, and four sites construct a `ProviderConfig` by hand (`providers/config.test.ts`
+   * plus three workflow test mocks) — tightening it here would churn those for nothing the
+   * gate does not already guarantee.
+   */
   youversionAppKey?: string;
   /** 64-hex AES-256-GCM key, validated at boot; passed to db-lib decryptSecret. */
   secretsEncryptionKey: string;

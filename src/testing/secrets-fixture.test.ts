@@ -64,6 +64,10 @@ describe("TEST_SECRETS_ENCRYPTION_KEY", () => {
       S3_BUCKET: "supagloo-dev",
       S3_ACCESS_KEY: "supagloo",
       S3_SECRET_KEY: "supagloo-dev",
+      // Required at boot since 2026-07-30 (`config/env.ts`). This env has to be a COMPLETE
+      // one or the case fails on a variable it is not about — the claim here is only that
+      // the shared test AES key is one `loadEnv` accepts.
+      YOUVERSION_APP_KEY: "yvp-app-key-value",
     });
     expect(env.SECRETS_ENCRYPTION_KEY).toBe(TEST_SECRETS_ENCRYPTION_KEY);
   });
