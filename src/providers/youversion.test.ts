@@ -154,6 +154,87 @@ describe("getBibleCollection", () => {
     expect((err as ProviderHttpError).status).toBe(503);
     expect(retryUnlessPermanent(err)).toBe(true);
   });
+
+  /**
+   * PAGINATION (2026-07-30).
+   *
+   * This call sent NO `page_size` and never read `next_page_token`, so it saw exactly one
+   * page. Measured live the same day: the default page is **25** rows
+   * (`language_ranges[]=*` returns 25 of a reported `total_size: 1472`, with a
+   * `next_page_token`). Today's largest single-language grant is English at 20, so the
+   * truncation is LATENT rather than live — but the failure mode when it fires is the worst
+   * available one: `resolveTranslation` throws `TranslationNotLicensedError` for a
+   * translation the user was shown and did pick, and the whole generation fails permanently
+   * with a message blaming licensing. One more licensed English Bible is all it takes.
+   *
+   * nextjs's own client already pages (`lib/youversion/client.ts`), and its measured note
+   * records that `page_size` caps at 50 and that repeated `language_ranges[]` do not union —
+   * so pagination is the only way through. This brings the two clients into agreement.
+   */
+  it("U-YV1: follows next_page_token to the end and unions every page", async () => {
+    const captured: Captured[] = [];
+    const pages = [
+      {
+        data: [{ id: 12, abbreviation: "ASV", title: "American Standard Version" }],
+        next_page_token: "tok-2",
+      },
+      {
+        data: [{ id: 111, abbreviation: "NIV11", title: "New International Version" }],
+        next_page_token: "tok-3",
+      },
+      {
+        data: [{ id: 3034, abbreviation: "BSB", title: "Berean Standard Bible" }],
+        next_page_token: null,
+      },
+    ];
+    let n = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      captured.push({ url: String(url), method: init?.method, appKey: headers.get("x-yvp-app-key") });
+      return jsonResponse(pages[n++]);
+    }) as unknown as typeof fetch;
+
+    const collection = await getBibleCollection({
+      youversionBaseUrl: "https://api.youversion.com",
+      appKey: "app-key-123",
+      language: "eng",
+      fetchImpl,
+    });
+
+    expect(captured).toHaveLength(3);
+    expect(collection.map((c) => c.abbreviation)).toEqual(["ASV", "NIV11", "BSB"]);
+    // The token from page 1 has to reach request 2, or the walk is an infinite loop over
+    // the first page rather than a walk.
+    expect(captured[1].url).toContain("page_token=tok-2");
+    expect(captured[2].url).toContain("page_token=tok-3");
+    // ...and the FIRST request must not carry one.
+    expect(captured[0].url).not.toContain("page_token");
+    // The language scope has to be re-sent on every page.
+    for (const req of captured) expect(req.url).toContain("language_ranges");
+  });
+
+  it("U-YV2: sends an explicit page_size so the provider's default page cannot silently cap the walk", async () => {
+    const captured: Captured[] = [];
+    await getBibleCollection({
+      youversionBaseUrl: "https://api.youversion.com",
+      language: "eng",
+      fetchImpl: capturingFetch(captured, jsonResponse(COLLECTION_BODY)),
+    });
+    expect(captured[0].url).toContain("page_size=");
+  });
+
+  it("U-YV3: one page with no token is exactly ONE request — no loop, no extra egress", async () => {
+    const captured: Captured[] = [];
+    const collection = await getBibleCollection({
+      youversionBaseUrl: "https://api.youversion.com",
+      language: "eng",
+      // COLLECTION_BODY has no next_page_token at all (the live shape when the whole
+      // collection fits on one page — `{data, next_page_token: null, total_size}`).
+      fetchImpl: capturingFetch(captured, jsonResponse(COLLECTION_BODY)),
+    });
+    expect(captured).toHaveLength(1);
+    expect(collection).toHaveLength(2);
+  });
 });
 
 describe("fetchPassage", () => {
