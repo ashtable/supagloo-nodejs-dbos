@@ -60,6 +60,13 @@ const env: Env = loadEnv({
   OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
   GLOO_BASE_URL: process.env.GLOO_BASE_URL,
   YOUVERSION_BASE_URL: process.env.YOUVERSION_BASE_URL,
+  // dbos 6c8a89b (2026-07-30) made YOUVERSION_APP_KEY required at boot. Unused by this
+  // spec: the no-stub guard below reads the BASE URL, and nothing here calls YouVersion —
+  // `generate-script.ts` is the provider's only caller. Deliberately a PLACEHOLDER rather
+  // than `process.env.YOUVERSION_APP_KEY`, for the same reason the App credentials above
+  // are dummy: a live credential in a spec that has no use for one buys nothing. Same
+  // literal as `src/config/env.test.ts`.
+  YOUVERSION_APP_KEY: "yvp-app-key-value",
   SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
   // S3 (writer) vars are required at boot (unused by this providers e2e).
   S3_ENDPOINT: "http://minio:9000",

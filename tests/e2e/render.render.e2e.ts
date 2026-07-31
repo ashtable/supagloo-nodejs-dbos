@@ -142,6 +142,13 @@ function makeEnv(overrides: Record<string, string | undefined> = {}): Env {
     GITHUB_APP_ID: githubSecrets.appId,
     GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
     OPENROUTER_BASE_URL: process.env.OPENROUTER_BASE_URL,
+    // dbos 6c8a89b (2026-07-30) made YOUVERSION_APP_KEY required at boot (unused by the
+    // render workflow — `generate-script.ts` is the only caller of the YouVersion provider,
+    // and scripture text reaches a render already baked into the manifest). Deliberately a
+    // PLACEHOLDER rather than `process.env.YOUVERSION_APP_KEY`: a spec that reads no
+    // scripture must not need the operator's real key to boot. Same literal as
+    // `src/config/env.test.ts`.
+    YOUVERSION_APP_KEY: "yvp-app-key-value",
     SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
     // The in-process worker reaches MinIO at the HOST-reachable endpoint.
     S3_ENDPOINT: S3_PUBLIC,

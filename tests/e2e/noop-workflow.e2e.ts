@@ -60,6 +60,13 @@ const env: Env = loadEnv({
   GITHUB_APP_ID: "123456",
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nnoop\n-----END RSA PRIVATE KEY-----",
+  // dbos 6c8a89b (2026-07-30) made YOUVERSION_APP_KEY required at boot; the noop workflow
+  // reads no scripture (`generate-script.ts` is the only caller of the YouVersion provider),
+  // but launchDbos() validates env, so provide a dummy key. Deliberately a PLACEHOLDER
+  // rather than `process.env.YOUVERSION_APP_KEY` — the operator's real key is not a
+  // prerequisite for a workflow that sends it nowhere. Same literal as
+  // `src/config/env.test.ts`.
+  YOUVERSION_APP_KEY: "yvp-app-key-value",
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot; the noop workflow never
   // decrypts anything but launchDbos() validates env, so provide a dummy 64-hex key.
   SECRETS_ENCRYPTION_KEY: TEST_SECRETS_ENCRYPTION_KEY,
