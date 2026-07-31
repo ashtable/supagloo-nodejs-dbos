@@ -1,6 +1,5 @@
 import type { ProjectManifest } from "@supagloo/database-lib";
 import {
-  DEFAULT_NARRATION_VOICE,
   type RequestMusicArgs,
   type RequestSpeechArgs,
 } from "../../providers/media-client";
@@ -86,7 +85,7 @@ export function renderSceneNarrationAssetKey(sceneId: string): string {
 }
 
 /**
- * The provider `voice` for narration — the id the STUDIO chose, or the default when the
+ * The provider `voice` for narration — the id the STUDIO chose, or `undefined` when the
  * project never picked one.
  *
  * The manifest's freeform voice DESCRIPTOR ("JAMES EARL JONES-STYLE") is still never
@@ -101,12 +100,18 @@ export function renderSceneNarrationAssetKey(sceneId: string): string {
  * voices, and nothing in the product would report it, because each path is individually
  * self-consistent.
  *
+ * CORRECTED 2026-07-30: an absent id used to become `DEFAULT_NARRATION_VOICE = "alloy"`,
+ * which is not in the narration model's published vocabulary and survived only via an
+ * undocumented alias layer. Resolving it belongs at `requestSpeech`, which reads the
+ * model's own `supported_voices` — so **both sites or neither** now holds by delegation
+ * rather than by two constants agreeing.
+ *
  * Read structurally because this repo's pinned `@supagloo/database-lib` copy does not yet
  * declare the field. DELETE THE CAST AT THE db-lib BUMP.
  */
-function narrationVoiceFor(manifest: ProjectManifest): string {
+function narrationVoiceFor(manifest: ProjectManifest): string | undefined {
   const raw = (manifest.narratorVoice as { voiceId?: unknown }).voiceId;
-  return typeof raw === "string" && raw.length > 0 ? raw : DEFAULT_NARRATION_VOICE;
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
 }
 
 export interface PlanAudioArgs {

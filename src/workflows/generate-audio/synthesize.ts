@@ -1,5 +1,4 @@
 import {
-  DEFAULT_NARRATION_VOICE,
   type RequestMusicArgs,
   type RequestSpeechArgs,
 } from "../../providers/media-client";
@@ -25,13 +24,19 @@ import type { AudioRequest } from "./request";
  * The provider `voice` is a valid provider voice id, NOT the request's freeform DESCRIPTOR
  * ("JEJ-STYLE") — the live endpoint rejects an unknown voice and enumerates the valid ones.
  *
- * FEATURE 1: it is now the id the STUDIO chose (`input.voiceId`), falling back to
- * {@link DEFAULT_NARRATION_VOICE} only when the project has never picked one. Until this,
- * the descriptor was written, validated, persisted, committed and snapshotted, and read by
- * zero provider-facing code — every project narrated in the same default voice however the
- * studio was configured. No provider publishes a voice-enumeration API (verified live
- * 2026-07-29), so the studio ships a curated per-model list and sends the resolved id; this
- * file is deliberately a PASS-THROUGH and holds no voice catalogue of its own.
+ * It is the id the STUDIO chose (`input.voiceId`), and when the project has never picked
+ * one this builder leaves `voice` UNSET rather than substituting a default. Until this, the
+ * descriptor was written, validated, persisted, committed and snapshotted, and read by zero
+ * provider-facing code — every project narrated in the same voice however the studio was
+ * configured.
+ *
+ * CORRECTED 2026-07-30. This used to fall back to `DEFAULT_NARRATION_VOICE = "alloy"`, and
+ * the claim above it — that "no provider publishes a voice-enumeration API" — was false:
+ * `supported_voices` is a top-level key on every speech-catalogue entry. `alloy` is not in
+ * the narration model's vocabulary and only ever worked through an undocumented alias
+ * layer. Resolving an absent voice now belongs to `requestSpeech`, the one place that reads
+ * the model's OWN published list. This file stays a PASS-THROUGH and holds no voice
+ * catalogue of its own — which is now true of the studio too.
  *
  * `render/audio.ts` resolves the same value from `manifest.narratorVoice.voiceId`. Both
  * paths must agree or the studio preview and the final render narrate in different voices.
@@ -81,7 +86,7 @@ export function buildNarrationSceneArgs(
   }
   // ONE voice for the whole video, resolved once: a narrator that changed between scenes
   // would be a different person reading each verse.
-  const voice = chosenVoiceId(request.input) ?? DEFAULT_NARRATION_VOICE;
+  const voice = chosenVoiceId(request.input);
   // Array order is preserved verbatim: the workflow runs one DBOS step per entry, and DBOS
   // requires the same steps in the same order on replay. Deriving this list purely from the
   // already-checkpointed request is what makes that hold after a crash.

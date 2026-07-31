@@ -91,7 +91,9 @@ describe("planAudioTrack — narration", () => {
     expect(plan.scenes[0].speechArgs.modelId).toBe("some-model");
     expect(plan.scenes[0].speechArgs.input).toBe(shelterManifest.scenes[0].scriptText);
     expect(plan.scenes[1].speechArgs.input).toBe(shelterManifest.scenes[1].scriptText);
-    expect(plan.scenes[0].speechArgs.voice).toBeTruthy();
+    // The shelter manifest chose no voice, so none is carried — `requestSpeech` resolves
+    // the model's own first published voice rather than this planner guessing one.
+    expect(plan.scenes[0].speechArgs.voice).toBeUndefined();
   });
 
   it("is `skipped` when no render narration model is configured", () => {
@@ -421,7 +423,12 @@ describe("planAudioTrack — narration honours the manifest's chosen voice", () 
     expect(plan.scenes.map((s) => s.speechArgs.voice)).toEqual(["zac"]);
   });
 
-  it("U-RA7: falls back to the default provider voice when the manifest chose none", () => {
+  it("U-RA7: leaves the voice UNSET when the manifest chose none", () => {
+    // MOVED, for the same reason as `synthesize.test.ts`'s U-S4b: this asserted `"alloy"`,
+    // an id `hexgrad/kokoro-82m` does not have. Resolving an absent voice belongs at
+    // `requestSpeech`, which is the only place that reads the model's own published
+    // vocabulary. **Both sites or neither** still holds — the studio path and the render
+    // path must narrate identically — and they now agree by delegating to the same one.
     const plan = planAudioTrack({
       kind: "narration",
       manifest: withChosenVoice(),
@@ -431,10 +438,11 @@ describe("planAudioTrack — narration honours the manifest's chosen voice", () 
     if (plan.action !== "synthesize" || plan.kind !== "narration") {
       throw new Error("expected a per-scene narration synthesize plan");
     }
-    expect(plan.scenes.map((s) => s.speechArgs.voice)).toEqual(["alloy"]);
+    expect(plan.scenes.map((s) => s.speechArgs.voice)).toEqual([undefined]);
   });
 
   it("U-RA8: never sends the freeform descriptor or label as a voice id", () => {
+    const seen: (string | undefined)[] = [];
     for (const manifest of [withChosenVoice("zac"), withChosenVoice()]) {
       const plan = planAudioTrack({
         kind: "narration",
@@ -446,9 +454,23 @@ describe("planAudioTrack — narration honours the manifest's chosen voice", () 
         throw new Error("expected a per-scene narration synthesize plan");
       }
       for (const scene of plan.scenes) {
-        expect(scene.speechArgs.voice).not.toContain("JEJ");
-        expect(scene.speechArgs.voice).not.toContain("baritone");
+        seen.push(scene.speechArgs.voice);
+        // The guard is what does the work: `undefined` satisfying a `not.toContain` would
+        // pass for the wrong reason on the manifest that chose nothing, so the prose check
+        // only runs on the arm that has a value. (An `is string || is undefined`
+        // disjunction used to sit here as well; `RequestSpeechArgs.voice` is typed
+        // `string | undefined`, so it could not fail for any value the type admits.)
+        if (typeof scene.speechArgs.voice === "string") {
+          expect(scene.speechArgs.voice).not.toContain("JEJ");
+          expect(scene.speechArgs.voice).not.toContain("baritone");
+        }
       }
     }
+    // ANTI-VACUITY, and it has to come AFTER the loop: the loop does not know which
+    // manifest it is on, so neither arm can assert a value locally. Without this, a
+    // `narrationVoiceFor` that always returned `undefined` would make every iteration skip
+    // the guard and the case would pass having checked nothing. `toContain` is safe on
+    // strings — it compares by value, not by reference.
+    expect(seen).toContain("zac");
   });
 });

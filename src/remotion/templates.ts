@@ -47,8 +47,24 @@ export function totalFrames(manifest: ProjectManifest): number {
 
 /** How long the music bed fades out for at the end of the video. */
 const MUSIC_FADE_SECONDS = 1.5;
-/** The music bed's level under the narration. Matches the studio preview. */
+/** The music bed's resting level, when nobody is speaking. Matches the studio preview. */
 const MUSIC_VOLUME = 0.4;
+/**
+ * The music bed's level WHILE the narration plays.
+ *
+ * The shipped composition ducked nothing: music sat at a flat {@link MUSIC_VOLUME} and the
+ * narration `<Audio>` carried no `volume` prop at all (so 1.0). That is a fixed ratio
+ * between two assets whose loudness is not normalized — the balance was luck, and the user
+ * heard the bed competing with the verse.
+ *
+ * ~10 dB below the resting level: enough to put the bed clearly behind the voice, and
+ * deliberately NOT silence. A bed that vanishes under every verse and reappears in the gaps
+ * draws more attention to itself than one that never moved.
+ */
+const MUSIC_DUCK_VOLUME = 0.12;
+/** How long the bed takes to slide down and back up at each edge of a narration window.
+ *  A step would be audible as a click; this is a ramp. */
+const MUSIC_DUCK_RAMP_SECONDS = 0.35;
 
 /**
  * Ken Burns motion, indexed by the scene's position (plan D8).
@@ -326,6 +342,42 @@ export function buildVideoSource(
     ].join("\n");
   }
 
+  /**
+   * MUSIC DUCKING — the composition frames during which someone is speaking.
+   *
+   * Every input is already in scope: a scene's start frame is the running `from` the emit
+   * loop below uses, and its narration length is the MEASURED `narrationDurationSeconds`
+   * the synth step wrote back. Clamped to the scene's own frames, because a narration clip
+   * can never outlast the scene it is mounted in (`sceneFrames` goes through
+   * `effectiveSceneDurationSeconds`, which stretches the scene to fit it).
+   *
+   * A scene with no narration clip contributes no window, which is what makes "no
+   * per-scene narration ⇒ no duck" fall out rather than needing a special case.
+   *
+   * **The LEGACY whole-project narration track is deliberately absent from this list.** It
+   * is mounted outside every `<Sequence>` and carries no scene boundaries and no measured
+   * length, so any window for it would be a guess about when someone is speaking — and a
+   * bed that dips at the wrong moments is worse than one that never dips.
+   */
+  const narrationKeys = new Set(narrationScenes.map((n) => n.assigned.scene.id));
+  const duckWindows: Array<[number, number]> = [];
+  {
+    let at = 0;
+    for (const a of assigned) {
+      const frames = sceneFrames(a.scene, fps);
+      if (narrationKeys.has(a.scene.id)) {
+        const spoken = Math.min(
+          frameCount(a.scene.narrationDurationSeconds ?? a.scene.durationSeconds, fps),
+          frames,
+        );
+        duckWindows.push([at, at + spoken]);
+      }
+      at += frames;
+    }
+  }
+  const ducks = duckWindows.length > 0;
+  const duckRamp = Math.max(1, Math.round(MUSIC_DUCK_RAMP_SECONDS * fps));
+
   const audioConsts = [
     ...topLevelKeys.map((a) => `const ${a.name} = ${JSON.stringify(a.key)};`),
     ...narrationScenes.map(
@@ -339,11 +391,15 @@ export function buildVideoSource(
     ),
   ];
 
+  // The bed gets a functional `volume` when it either fades (loops) or ducks; both are
+  // built from `interpolate`, so the import follows the HELPER rather than the loop.
+  const musicCurve = Boolean(musicKey) && (musicLoops || ducks);
+
   const remotionImports = ["AbsoluteFill"];
   if (hasAudio) remotionImports.push("Audio");
   if (musicLoops) remotionImports.push("Loop");
   if (assigned.length > 0) remotionImports.push("Sequence");
-  if (musicLoops) remotionImports.push("interpolate");
+  if (musicCurve) remotionImports.push("interpolate");
 
   const imports = [
     `import { ${remotionImports.join(", ")} } from "remotion";`,
@@ -353,8 +409,72 @@ export function buildVideoSource(
     ),
   ];
 
+  /**
+   * The bed's level as a function of the COMPOSITION frame.
+   *
+   * Two independent rules, composed multiplicatively rather than one replacing the other:
+   *
+   *  - the DUCK gate — 1 outside every narration window, 0 inside, ramping across
+   *    `duckRamp` frames at each edge. Overlapping or adjacent windows take the MINIMUM,
+   *    so two consecutive narrated scenes cannot un-duck each other in the frames where
+   *    both ramps are live;
+   *  - the whole-video tail FADE, unchanged, now expressed as a 1→0 factor.
+   *
+   * Emitted as a named const rather than inline because it is no longer a single
+   * expression. The two level constants are emitted as consts too, so the generated source
+   * never carries `0.4 - 0.12` — which is `0.28000000000000003` in IEEE-754 and would make
+   * the output depend on float formatting.
+   */
+  const musicHelper: string[] = [];
+  if (musicCurve) {
+    if (ducks) {
+      musicHelper.push(
+        `const MUSIC_LEVEL = ${MUSIC_VOLUME};`,
+        `const MUSIC_DUCKED_LEVEL = ${MUSIC_DUCK_VOLUME};`,
+        `const musicDuckWindows = [${duckWindows
+          .map(([a, b]) => `[${a}, ${b}]`)
+          .join(", ")}];`,
+      );
+    }
+    const fadeStart = Math.max(0, total - frameCount(MUSIC_FADE_SECONDS, fps));
+    musicHelper.push("const musicVolume = (f) => {");
+    if (ducks) {
+      musicHelper.push(
+        "  const gate = musicDuckWindows.reduce(",
+        "    (lowest, [a, b]) =>",
+        "      Math.min(",
+        "        lowest,",
+        `        interpolate(f, [a - ${duckRamp}, a, b, b + ${duckRamp}], [1, 0, 0, 1], {`,
+        '          extrapolateLeft: "clamp",',
+        '          extrapolateRight: "clamp",',
+        "        }),",
+        "      ),",
+        "    1,",
+        "  );",
+        "  const level = MUSIC_DUCKED_LEVEL + (MUSIC_LEVEL - MUSIC_DUCKED_LEVEL) * gate;",
+      );
+    } else {
+      musicHelper.push(`  const level = ${MUSIC_VOLUME};`);
+    }
+    if (musicLoops) {
+      musicHelper.push(
+        "  return (",
+        "    level *",
+        `    interpolate(f, [${fadeStart}, ${total}], [1, 0], {`,
+        '      extrapolateLeft: "clamp",',
+        '      extrapolateRight: "clamp",',
+        "    })",
+        "  );",
+      );
+    } else {
+      musicHelper.push("  return level;");
+    }
+    musicHelper.push("};");
+  }
+
   const body: string[] = [];
   if (audioConsts.length > 0) body.push(...audioConsts, "");
+  if (musicHelper.length > 0) body.push(...musicHelper, "");
   body.push("export const VideoComposition = () => {");
   if (audioSrcs.length > 0) body.push(...audioSrcs, "");
   body.push("  return (", '    <AbsoluteFill style={{ backgroundColor: "#000000" }}>');
@@ -375,26 +495,24 @@ export function buildVideoSource(
       // than a duck at the end of every iteration: remotion's `useFrameForVolumeProp` adds
       // `loop.durationInFrames * loop.iteration` under "extend", so `f` is a composition
       // frame. Under the default "repeat" the bed would dip repeatedly through the video.
-      const fadeStart = Math.max(0, total - frameCount(MUSIC_FADE_SECONDS, fps));
       body.push(
         "      {musicAssetKeySrc ? (",
         `        <Loop durationInFrames={${musicLoopFrames}}>`,
         "          <Audio",
         "            src={musicAssetKeySrc}",
         '            loopVolumeCurveBehavior="extend"',
-        "            volume={(f) =>",
-        `              interpolate(f, [${fadeStart}, ${total}], [${MUSIC_VOLUME}, 0], {`,
-        '                extrapolateLeft: "clamp",',
-        '                extrapolateRight: "clamp",',
-        "              })",
-        "            }",
+        "            volume={musicVolume}",
         "          />",
         "        </Loop>",
         "      ) : null}",
       );
     } else {
+      // No measured bed length ⇒ no loop and no tail fade, exactly as before. The helper
+      // still appears when this manifest DUCKS; a manifest that does neither keeps the
+      // literal `volume={0.4}` it has always emitted, which is why no golden moves.
+      const level = ducks ? "{musicVolume}" : `{${MUSIC_VOLUME}}`;
       body.push(
-        `      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} volume={${MUSIC_VOLUME}} /> : null}`,
+        `      {musicAssetKeySrc ? <Audio src={musicAssetKeySrc} volume=${level} /> : null}`,
       );
     }
   }
@@ -472,15 +590,24 @@ export function buildSceneSource(
     // `visualAssetKind` — the image and video workflows write the same extensionless S3 key
     // and the content-type is discarded on download.
     //
-    // SCOPE: this MAKES CLOSING that latent bug possible; it does not close it. No producer
-    // writes `visualAssetKind` yet — the field is read here and in the nextjs preview, and
-    // plumbed through all four schema mirrors, but `setSceneVisual` / `IMAGE_GENERATED` write
-    // only `visualAssetKey`. So in production a generated video asset still reaches this
-    // function with the kind absent and is still rendered through <Img>. This branch is
-    // reachable only from a hand-written manifest and from tests until a producer sets it.
+    // SCOPE, CORRECTED 2026-07-30. This comment used to say the branch was unreachable in
+    // production because nothing wrote `visualAssetKind`. That is STALE: the studio's
+    // `VIDEO_GENERATED` reducer case writes `kind: "video"` alongside the key and
+    // `lib/studio/storyboard.ts` carries it into the manifest, so a generated clip really
+    // does arrive here.
+    //
+    // `muted` follows directly from that. The clip is requested as a VISUAL — whatever
+    // audio the video model happened to produce is never wanted — and it arrived at full
+    // level over a narration track this composition is at the same time ducking the music
+    // under. Two clips in a row meant two unrelated soundtracks colliding.
+    //
+    // Pinned behaviourally by `E-V1` in `tests/e2e/render-bug-proofs.bundle.e2e.ts`: both
+    // scene fixtures in the unit goldens are STILLS, so this line moves no golden and a
+    // source-text assertion alone would pin the string rather than the silence.
     lines.push(
       "        <OffthreadVideo",
       "          src={src}",
+      "          muted",
       '          style={{ width: "100%", height: "100%", objectFit: "cover" }}',
       "        />",
     );
