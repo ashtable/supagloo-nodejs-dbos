@@ -53,12 +53,33 @@ export interface BuiltPrompt {
  * per-model list, and an LLM has no business inventing a provider voice id. The studio
  * preserves it across a re-plan on the way back in.
  *
- * Forward-typed over the `.passthrough()` input. DELETE THE CAST AT THE db-lib BUMP.
+ * ## Why the runtime guards below are LOAD-BEARING, unlike narration's
+ *
+ * CORRECTED 2026-07-30. This used to carry "DELETE THE CAST AT THE db-lib BUMP". The bump
+ * has landed (pinned `fc5cf2c`) and it did NOT declare this field, so that marker was
+ * promising a deletion that will never come from a release alone.
+ *
+ * `GenerateScriptInputSchema` is `z.object({brief, scripture?}).passthrough()`, and
+ * `narratorVoice` is NOT one of its declared keys. `.passthrough()` exempts exactly the
+ * UNDECLARED keys from validation, so — MEASURED against the pinned copy —
+ * `safeParse({brief, narratorVoice: 12345})` succeeds with `narratorVoice: 12345` intact,
+ * and `{description: 99}` survives verbatim too. The parameter type is now
+ * `GenerateScriptInput` rather than `unknown` (the passthrough index signature types the
+ * key as `unknown`, verified NOT `any`), but that buys no shape checking whatsoever.
+ *
+ * Every `typeof` / non-empty check below is therefore the ONLY thing standing between an
+ * arbitrary JSON value and the prompt text, and none of them may be deleted on the grounds
+ * that "the type says so" — the type says `unknown`, which is the truth. Contrast
+ * `generate-audio/synthesize.ts`, where `voiceId` IS a declared key and Zod rejects a
+ * non-string before the builder is reached; that guard was dead and was removed.
+ *
+ * If db-lib ever declares `narratorVoice` on this schema, these guards become dead in the
+ * same way — but that must be re-measured, not assumed.
  */
 function existingNarratorVoice(
-  input: unknown,
+  input: GenerateScriptInput,
 ): { description: string; label?: string } | null {
-  const raw = (input as { narratorVoice?: unknown } | null | undefined)?.narratorVoice;
+  const raw: unknown = input.narratorVoice;
   if (!raw || typeof raw !== "object") return null;
   const { description, label } = raw as { description?: unknown; label?: unknown };
   if (typeof description !== "string" || description.length === 0) return null;

@@ -76,13 +76,19 @@ describe("appendValidationErrors", () => {
 // inventing a provider voice id).
 
 describe("buildGenerationPrompt — existing narrator voice", () => {
+  // The trailing `as GenerateScriptInput` is gone (2026-07-30). Be clear about what that
+  // did and did NOT buy, because it is the opposite of the manifest fixtures': the schema
+  // is `.passthrough()` and `narratorVoice` is UNDECLARED, so the key type-checks only as
+  // `unknown` via the index signature. Nothing here is validated by the type — a misspelt
+  // `narratorVoice` still compiles, and U-P1 is what catches it. That is exactly why
+  // `existingNarratorVoice`'s runtime guards are load-bearing and stay.
   const withVoice: GenerateScriptInput = {
     ...INPUT,
     narratorVoice: {
       description: "warm, weathered baritone — unhurried, reverent",
       label: "JEJ-STYLE",
     },
-  } as GenerateScriptInput;
+  };
 
   it("U-P1: a re-plan tells the model to KEEP the project's existing narrator voice", () => {
     const { prompt } = buildGenerationPrompt({
