@@ -109,21 +109,19 @@ describe("buildNarrationSceneArgs", () => {
     // (`requestSpeech` sends exactly {model, input, voice, response_format}).
     for (const req of [narration, narrationWithVoice]) {
       for (const a of buildNarrationSceneArgs(req)) {
-        // Either no voice at all (the provider resolves one from its own catalogue) or a
-        // real id — never the prose. Asserted as an explicit disjunction rather than by
-        // letting `undefined` satisfy a `not.toContain`, which would make the case pass
-        // for the wrong reason on the fixture that chose nothing.
-        expect(typeof a.speech.voice === "string" || a.speech.voice === undefined).toBe(
-          true,
-        );
+        // The guard is what does the work: `undefined` satisfying a `not.toContain` would
+        // pass for the wrong reason on the fixture that chose nothing, so the prose check
+        // only runs on the arm that has a value. (An `is string || is undefined`
+        // disjunction used to sit here as well; `RequestSpeechArgs.voice` is typed
+        // `string | undefined`, so it could not fail for any value the type admits.)
         if (typeof a.speech.voice === "string") {
           expect(a.speech.voice).not.toContain("JEJ");
           expect(a.speech.voice).not.toContain("baritone");
         }
       }
     }
-    // …and the fixture that DID choose one really does reach the disjunction's live arm,
-    // so the guard above is not vacuous.
+    // …and the fixture that DID choose one really does reach the guard's live arm, so the
+    // check above is not vacuous.
     expect(buildNarrationSceneArgs(narrationWithVoice)[0].speech.voice).toBe("zac");
   });
 

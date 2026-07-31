@@ -442,6 +442,7 @@ describe("planAudioTrack — narration honours the manifest's chosen voice", () 
   });
 
   it("U-RA8: never sends the freeform descriptor or label as a voice id", () => {
+    const seen: (string | undefined)[] = [];
     for (const manifest of [withChosenVoice("zac"), withChosenVoice()]) {
       const plan = planAudioTrack({
         kind: "narration",
@@ -453,19 +454,23 @@ describe("planAudioTrack — narration honours the manifest's chosen voice", () 
         throw new Error("expected a per-scene narration synthesize plan");
       }
       for (const scene of plan.scenes) {
-        // Either no voice (the provider resolves one from its own catalogue) or a real id
-        // — never the prose. Spelled out rather than letting `undefined` satisfy a
-        // `not.toContain`, which would pass for the wrong reason on the manifest that
-        // chose nothing.
-        expect(
-          typeof scene.speechArgs.voice === "string" ||
-            scene.speechArgs.voice === undefined,
-        ).toBe(true);
+        seen.push(scene.speechArgs.voice);
+        // The guard is what does the work: `undefined` satisfying a `not.toContain` would
+        // pass for the wrong reason on the manifest that chose nothing, so the prose check
+        // only runs on the arm that has a value. (An `is string || is undefined`
+        // disjunction used to sit here as well; `RequestSpeechArgs.voice` is typed
+        // `string | undefined`, so it could not fail for any value the type admits.)
         if (typeof scene.speechArgs.voice === "string") {
           expect(scene.speechArgs.voice).not.toContain("JEJ");
           expect(scene.speechArgs.voice).not.toContain("baritone");
         }
       }
     }
+    // ANTI-VACUITY, and it has to come AFTER the loop: the loop does not know which
+    // manifest it is on, so neither arm can assert a value locally. Without this, a
+    // `narrationVoiceFor` that always returned `undefined` would make every iteration skip
+    // the guard and the case would pass having checked nothing. `toContain` is safe on
+    // strings — it compares by value, not by reference.
+    expect(seen).toContain("zac");
   });
 });
