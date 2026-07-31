@@ -81,6 +81,12 @@ const env: Env = loadEnv({
   GITHUB_APP_PRIVATE_KEY:
     "-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----",
   GLOO_BASE_URL: process.env.GLOO_BASE_URL,
+  // dbos 6c8a89b (2026-07-30) made YOUVERSION_APP_KEY required at boot (unused by this
+  // workflow — `generate-script.ts` is the only caller of the YouVersion provider and this
+  // spec never enqueues it). Deliberately a PLACEHOLDER rather than
+  // `process.env.YOUVERSION_APP_KEY`: a spec that reads no scripture must not need the
+  // operator's real key to boot. Same literal as `src/config/env.test.ts`.
+  YOUVERSION_APP_KEY: "yvp-app-key-value",
   SECRETS_ENCRYPTION_KEY: ENCRYPTION_KEY,
   S3_ENDPOINT: S3_PUBLIC,
   S3_PUBLIC_ENDPOINT: S3_PUBLIC,

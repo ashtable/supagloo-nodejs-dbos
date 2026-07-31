@@ -122,6 +122,12 @@ const env: Env = loadEnv({
   // (finding F1: dbos was always real-by-default; only these specs pointed it at a stub).
   GITHUB_APP_ID: githubSecrets.appId,
   GITHUB_APP_PRIVATE_KEY: githubSecrets.privateKey,
+  // dbos 6c8a89b (2026-07-30) made YOUVERSION_APP_KEY required at boot (unused by this
+  // workflow — `generate-script.ts` is the only caller of the YouVersion provider and this
+  // spec never enqueues it). Deliberately a PLACEHOLDER rather than
+  // `process.env.YOUVERSION_APP_KEY`: a spec that reads no scripture must not need the
+  // operator's real key to boot. Same literal as `src/config/env.test.ts`.
+  YOUVERSION_APP_KEY: "yvp-app-key-value",
   // Task #29 made SECRETS_ENCRYPTION_KEY required at boot; since plan row 48 this
   // workflow USES it — the mintInstallationToken step seals its result with it, so this
   // value and the probe's `encryptionKey` below must stay the same key.

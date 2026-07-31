@@ -5,6 +5,7 @@ import {
   selectCheapestStructuredTextModel,
   selectGlooChatModel,
   selectGlooImageModel,
+  selectNarrationModel,
   selectTextToVideoModel,
   toAudioModelInfo,
   toGlooModelInfo,
@@ -150,10 +151,19 @@ describe("toAudioModelInfo / selectAudioModel (narration=TTS, music=Lyria)", () 
     ).toBe(false);
   });
 
-  const a = (id: string, audioPrice: number, isMusic: boolean): AudioModelInfo => ({
+  // The `audio` (music) catalogue has no voice vocabulary, so these cases carry none —
+  // `selectAudioModel` must NOT filter on it. Only the speech catalogue does; see the
+  // `selectNarrationModel` block below.
+  const a = (
+    id: string,
+    audioPrice: number,
+    isMusic: boolean,
+    voiceCount = 0,
+  ): AudioModelInfo => ({
     id,
     audioPrice,
     isMusic,
+    voiceCount,
   });
 
   it("narration → cheapest non-music (TTS) model", () => {
@@ -178,6 +188,58 @@ describe("toAudioModelInfo / selectAudioModel (narration=TTS, music=Lyria)", () 
     expect(() => selectAudioModel([a("openai/gpt-audio", 0, false)], "music")).toThrow(
       /music/i,
     );
+  });
+});
+
+/**
+ * `selectNarrationModel` picks the model that `POST /api/v1/audio/speech` will be called
+ * with, and that endpoint REQUIRES a voice: `media-client.ts`'s `defaultVoiceFor` throws a
+ * 502 ("the speech catalogue publishes no voices for …") rather than guess one, deliberately
+ * — see its docblock. So "cheapest" is not the whole selection rule; "cheapest USABLE" is.
+ *
+ * This went unheld until 2026-07-31, when the live `output_modalities=speech` catalogue was
+ * measured at 19 models of which SIX publish no vocabulary at all — and one of those,
+ * `fish-audio/s2.1-pro-free:free`, is priced 0 and therefore sorted FIRST. The result:
+ * `generate-audio.e2e.ts` and the render lane's narration-synthesis spec both exhausted
+ * their DBOS step retries against a model the product is designed to refuse. Nothing had
+ * changed in either repo — a new free model appearing upstream was enough.
+ */
+describe("selectNarrationModel (speech — cheapest model that actually publishes a VOICE)", () => {
+  const s = (id: string, audioPrice: number, voiceCount: number): AudioModelInfo => ({
+    id,
+    audioPrice,
+    isMusic: false,
+    voiceCount,
+  });
+
+  it("skips a cheaper model that publishes NO voices (the live 2026-07-31 catalogue shape)", () => {
+    const models = [
+      s("fish-audio/s2.1-pro-free:free", 0, 0),
+      s("hexgrad/kokoro-82m", 6.2e-7, 54),
+      s("canopylabs/orpheus-3b-0.1-ft", 0.000007, 7),
+    ];
+    expect(selectNarrationModel(models)).toBe("hexgrad/kokoro-82m");
+  });
+
+  it("still prefers the cheapest when every candidate publishes voices", () => {
+    const models = [
+      s("canopylabs/orpheus-3b-0.1-ft", 0.000007, 7),
+      s("hexgrad/kokoro-82m", 6.2e-7, 54),
+    ];
+    expect(selectNarrationModel(models)).toBe("hexgrad/kokoro-82m");
+  });
+
+  it("throws naming the vocabulary when the catalogue is non-empty but NO model publishes one", () => {
+    expect(() => selectNarrationModel([s("fish-audio/s1", 0.000015, 0)])).toThrow(/voice/i);
+  });
+
+  it("reads the published vocabulary off the raw entry; absent/null is zero, not a crash", () => {
+    expect(
+      toAudioModelInfo({ id: "hexgrad/kokoro-82m", supported_voices: ["af_heart", "af_bella"] })
+        .voiceCount,
+    ).toBe(2);
+    expect(toAudioModelInfo({ id: "fish-audio/s1", supported_voices: null }).voiceCount).toBe(0);
+    expect(toAudioModelInfo({ id: "fish-audio/s2-pro" }).voiceCount).toBe(0);
   });
 });
 

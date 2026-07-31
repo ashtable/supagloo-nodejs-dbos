@@ -85,12 +85,20 @@ export interface AudioModelInfo {
   audioPrice: number;
   /** True when the model is a music generator (Lyria etc.) rather than a TTS voice model. */
   isMusic: boolean;
+  /**
+   * How many voices the SPEECH catalogue publishes for this model (`supported_voices`).
+   * Zero for the `audio` (music) catalogue, which has no voice vocabulary at all — only
+   * {@link selectNarrationModel} reads this.
+   */
+  voiceCount: number;
 }
 
 interface RawAudioModel {
   id?: unknown;
   description?: unknown;
   pricing?: { audio?: unknown; completion?: unknown; prompt?: unknown };
+  /** Live shape: `string[]` for most speech models, and genuinely `null` for several. */
+  supported_voices?: unknown;
 }
 
 /** Normalize one raw audio-model entry, classifying music vs TTS from its description/id. */
@@ -114,6 +122,12 @@ export function toAudioModelInfo(raw: RawAudioModel): AudioModelInfo {
         NaN,
     ),
     isMusic,
+    // Mirrors `media-client.ts`'s `readSpeechVoices` filter, applied to the SAME endpoint's
+    // response — absent or `null` means the provider declines to publish a vocabulary, which
+    // is a real live state and not a parse error.
+    voiceCount: Array.isArray(raw.supported_voices)
+      ? raw.supported_voices.filter((v) => typeof v === "string" && v.length > 0).length
+      : 0,
   };
 }
 
@@ -147,13 +161,32 @@ export function selectAudioModel(
 
 /**
  * Select a dedicated TTS model from the `output_modalities=speech` catalogue: cheapest by
- * per-token price, ties broken by id. Every entry there is a batch synthesis model, so no
- * music/TTS classification is needed — the catalogue itself is the filter. Throws
- * (actionable) if it is empty, rather than silently falling back to a chat model.
+ * per-token price **among the models that actually publish a voice**, ties broken by id.
+ * Every entry there is a batch synthesis model, so no music/TTS classification is needed —
+ * the catalogue itself is that filter.
+ *
+ * The `voiceCount > 0` requirement is NOT a preference: `POST /api/v1/audio/speech` requires
+ * a voice, and `media-client.ts`'s `defaultVoiceFor` deliberately throws
+ * ("the speech catalogue publishes no voices for …") rather than guess one, so a model with
+ * an unpublished vocabulary is one this codebase can never call. Selecting on price alone
+ * made that a live-drift landmine: measured 2026-07-31, SIX of the nineteen speech models
+ * publish nothing, and `fish-audio/s2.1-pro-free:free` is priced 0 and so sorted FIRST —
+ * which reds `generate-audio.e2e.ts` and the render narration-synthesis spec through their
+ * full DBOS step-retry budget, with no change in this repo at all.
+ *
+ * Throws (actionable) rather than silently falling back to a chat model, and distinguishes
+ * "catalogue empty" from "catalogue has no usable voice" so the two are not confused.
  */
 export function selectNarrationModel(models: AudioModelInfo[]): string {
+  if (models.filter((m) => m.id.length > 0).length > 0 && !models.some((m) => m.voiceCount > 0)) {
+    throw new Error(
+      "no speech model in the discovery catalogue (GET /api/v1/models?output_modalities=speech) " +
+        "publishes a voice vocabulary (`supported_voices`), and POST /api/v1/audio/speech " +
+        "requires one — see defaultVoiceFor in src/providers/media-client.ts.",
+    );
+  }
   const candidates = models
-    .filter((m) => m.id.length > 0)
+    .filter((m) => m.id.length > 0 && m.voiceCount > 0)
     .sort((a, b) => {
       const pa = Number.isFinite(a.audioPrice) ? a.audioPrice : Number.POSITIVE_INFINITY;
       const pb = Number.isFinite(b.audioPrice) ? b.audioPrice : Number.POSITIVE_INFINITY;
