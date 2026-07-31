@@ -290,17 +290,114 @@ function wavDurationSeconds(bytes: Buffer): number | null {
 // --- TTS / speech (narration) ---------------------------------------------------
 
 /**
- * The provider voice used when a caller does not name one. The endpoint REQUIRES a voice
- * (verified live: omitting it returns a Zod `invalid_type` on `["voice"]`), and the
- * manifest's freeform voice DESCRIPTOR ("JAMES EARL JONES-STYLE") is not a provider voice id.
+ * The voice used when a caller names none — the MODEL'S OWN first published voice, read
+ * from the provider rather than asserted here.
+ *
+ * ## What this replaces
+ *
+ * `DEFAULT_NARRATION_VOICE = "alloy"`, which was both load-bearing and wrong.
+ *
+ * Load-bearing because the endpoint requires a voice: omitting it is a hard 400
+ * (`"An explicit voice is required for this TTS provider."`), so the constant could not
+ * simply be deleted. Wrong because `alloy` is not in the narration model's published
+ * vocabulary at all — it reached a working generation only through an undocumented
+ * OpenAI→Kokoro ALIAS layer, landing on an American FEMALE voice nobody chose, and on a
+ * model that does not alias it is a 400 that fails the whole generation.
+ *
+ * ## Why discovery rather than a different constant
+ *
+ * Substituting a real id from that model's list would have reintroduced the exact
+ * anti-pattern this run deleted from the studio: asserting a voice for a model without
+ * asking the provider. `supported_voices` is a top-level key on every entry of
+ * `GET /api/v1/models?output_modalities=speech`, the endpoint answers UNAUTHENTICATED
+ * (measured), and it is the same catalogue the api already reads for the picker. So the
+ * honest default is whatever that model itself publishes first — correct for any model,
+ * including one an operator points `SUPAGLOO_AI_MODEL_NARRATION` at tomorrow.
+ *
+ * ## Cost
+ *
+ * Narration is synthesized one clip PER SCENE, so this path can run 5–10 times per
+ * generation; the vocabulary is cached per base URL for {@link SPEECH_VOICE_TTL_MS}. In
+ * practice the studio now always names a voice, so this is the fallback for legacy
+ * manifests and non-studio callers.
  */
-export const DEFAULT_NARRATION_VOICE = "alloy";
+const SPEECH_VOICE_TTL_MS = 5 * 60_000;
+
+const speechVoiceCache = new Map<
+  string,
+  { expiresAt: number; voices: Map<string, string[]> }
+>();
+
+/** Reset the discovered-vocabulary cache (test isolation / forced refresh). */
+export function clearSpeechVoiceCache(): void {
+  speechVoiceCache.clear();
+}
+
+async function readSpeechVoices(
+  cfg: MediaClientConfig,
+  now: number,
+): Promise<Map<string, string[]>> {
+  const root = trimSlash(cfg.openrouterBaseUrl);
+  const cached = speechVoiceCache.get(root);
+  if (cached && now < cached.expiresAt) return cached.voices;
+
+  const fetchImpl = cfg.fetchImpl ?? fetch;
+  const res = await fetchImpl(`${root}/api/v1/models?output_modalities=speech`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) {
+    throw new ProviderHttpError(
+      `speech catalogue read failed (${res.status})`,
+      502,
+    );
+  }
+  const body = (await res.json()) as { data?: Array<Record<string, unknown>> };
+  const voices = new Map<string, string[]>();
+  for (const entry of body?.data ?? []) {
+    if (typeof entry?.id !== "string") continue;
+    // `supported_voices: null` is a real live state for several models — absent is not an
+    // error, it is the provider declining to publish a vocabulary.
+    const published = Array.isArray(entry.supported_voices)
+      ? entry.supported_voices.filter(
+          (v): v is string => typeof v === "string" && v.length > 0,
+        )
+      : [];
+    voices.set(entry.id, published);
+  }
+  speechVoiceCache.set(root, { expiresAt: now + SPEECH_VOICE_TTL_MS, voices });
+  return voices;
+}
+
+/**
+ * The voice to send for `modelId` when the caller named none.
+ *
+ * Throws a RETRYABLE 502 rather than guessing when the provider publishes no vocabulary
+ * for the model. That is the deliberate trade: a transient catalogue blip retries, and a
+ * genuinely voice-less model fails visibly instead of narrating in a voice nobody chose —
+ * which is the failure mode that produced this bug in the first place.
+ */
+async function defaultVoiceFor(
+  cfg: MediaClientConfig,
+  modelId: string,
+): Promise<string> {
+  const voices = await readSpeechVoices(cfg, Date.now());
+  const first = voices.get(modelId)?.[0];
+  if (!first) {
+    throw new ProviderHttpError(
+      `the speech catalogue publishes no voices for "${modelId}", and this endpoint requires one`,
+      502,
+    );
+  }
+  return first;
+}
 
 export interface RequestSpeechArgs {
   modelId: string;
   /** The text to speak, VERBATIM. */
   input: string;
-  /** A provider voice id (model-specific vocabulary); defaults to `"alloy"`. */
+  /** A provider voice id (model-specific vocabulary). Omitted ⇒ the model's own first
+   *  published voice, read from the provider — see {@link defaultVoiceFor}. */
   voice?: string;
 }
 
@@ -350,6 +447,9 @@ export async function requestSpeech(
   args: RequestSpeechArgs,
 ): Promise<SpeechResult> {
   const fetchImpl = cfg.fetchImpl ?? fetch;
+  // Resolved BEFORE the POST, so a model with no published vocabulary fails without
+  // spending a synthesis request on a guessed voice.
+  const voice = args.voice ?? (await defaultVoiceFor(cfg, args.modelId));
   const res = await fetchImpl(
     `${trimSlash(cfg.openrouterBaseUrl)}/api/v1/audio/speech`,
     {
@@ -358,7 +458,7 @@ export async function requestSpeech(
       body: JSON.stringify({
         model: args.modelId,
         input: args.input,
-        voice: args.voice ?? DEFAULT_NARRATION_VOICE,
+        voice,
         response_format: "mp3",
       }),
     },

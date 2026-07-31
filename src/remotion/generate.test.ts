@@ -440,9 +440,81 @@ describe("bug 2 — the music bed covers the whole composition", () => {
     // frame (verified in remotion 4.0.490 `useFrameForVolumeProp`, which adds
     // `loop.durationInFrames * loop.iteration`). Without it the fade would re-run every
     // single loop iteration, ducking the bed repeatedly through the video.
+    //
+    // AMENDED: the inline `volume={(f) => …}` moved into a named `musicVolume` helper when
+    // the duck was added, because the level is now two composed rules rather than one. The
+    // property is unchanged and `extend` is MORE load-bearing than before: under the
+    // default "repeat" the DUCK would also re-fire on every iteration, so the bed would dip
+    // at moments no one is speaking.
     expect(video).toContain('loopVolumeCurveBehavior="extend"');
-    expect(video).toContain("volume={(f) =>");
+    expect(video).toContain("volume={musicVolume}");
+    expect(video).toContain("const musicVolume = (f) =>");
     expect(video).toContain("[59, 74]"); // last 1.5s of the 74-frame composition
+  });
+
+  it("U-T13: the bed DUCKS under each scene's narration and comes back up between", () => {
+    // Shipped: music sat at a flat 0.4 and narration carried no `volume` prop at all, so
+    // the balance between two unnormalized assets was luck. The windows are derived from
+    // the SAME inputs the emit loop already has — the scene's start frame and its MEASURED
+    // narration length — so a scene with no narration clip contributes no window.
+    //
+    // richManifest: sc-1 starts at 0 with 1.5s of narration (15 frames at 10fps); sc-2
+    // starts at 20 with 3.4s (34 frames); sc-3 has no narration at all.
+    expect(video).toContain("const musicDuckWindows = [[0, 15], [20, 54]];");
+    // The 0.35s ramp at each edge, so the bed slides under the voice rather than stepping.
+    expect(video).toContain("[a - 4, a, b, b + 4], [1, 0, 0, 1]");
+    // DUCKED, not muted: a bed that vanishes under every verse is a different bug.
+    expect(video).toContain("const MUSIC_DUCKED_LEVEL = 0.12;");
+    expect(video).toContain("const MUSIC_LEVEL = 0.4;");
+    // Overlapping/adjacent windows take the MINIMUM gate — two consecutive narrated scenes
+    // must not un-duck each other in the frames where both ramps are live.
+    expect(video).toContain("Math.min(");
+  });
+
+  it("U-T14: with NO per-scene narration there is no duck at all", () => {
+    // The honest fallback, and the reason no golden moves: the shelter fixture and every
+    // manifest committed before per-scene narration existed emit exactly what they emit
+    // today. A duck window can only come from a measured narration clip.
+    const noNarration = {
+      ...richManifest,
+      scenes: richManifest.scenes.map((s) => {
+        const { narrationAssetKey: _k, narrationDurationSeconds: _d, ...rest } = s as {
+          narrationAssetKey?: string;
+          narrationDurationSeconds?: number;
+        } & typeof s;
+        return rest;
+      }),
+    };
+    const v = fileMap(generateManifestFiles(noNarration)).get("src/Video.tsx") as string;
+    expect(v).not.toContain("musicDuckWindows");
+    expect(v).not.toContain("MUSIC_DUCKED_LEVEL");
+    // …and the tail fade still happens, so "no duck" did not quietly become "no curve".
+    expect(v).toContain('loopVolumeCurveBehavior="extend"');
+  });
+
+  it("U-T15: the LEGACY whole-project narration track never ducks", () => {
+    // A pre-per-scene manifest carries one narration asset mounted outside every
+    // <Sequence>, with no scene boundaries and no measured length. There is no window we
+    // could derive, so ducking would mean guessing when someone is speaking — and a bed
+    // that dips at the wrong moments is worse than one that does not dip.
+    const legacy = fileMap(
+      generateManifestFiles({
+        ...richManifest,
+        scenes: richManifest.scenes.map((s) => {
+          const { narrationAssetKey: _k, narrationDurationSeconds: _d, ...rest } = s as {
+            narrationAssetKey?: string;
+            narrationDurationSeconds?: number;
+          } & typeof s;
+          return rest;
+        }),
+        narratorVoice: {
+          description: "Warm narrator",
+          assetKey: "projects/p/assets/narration-full",
+        },
+      }),
+    ).get("src/Video.tsx") as string;
+    expect(legacy).toContain("narrationAssetKeySrc ? <Audio");
+    expect(legacy).not.toContain("musicDuckWindows");
   });
 
   it("U-T7: with NO measured duration the bed stays a plain <Audio> (no guessing)", () => {
@@ -501,20 +573,28 @@ describe("bug 3 — Ken Burns on stills, OffthreadVideo on clips", () => {
     }
   });
 
-  it("U-T10: a VIDEO-kind asset renders through <OffthreadVideo> and gets NO pan", () => {
+  it("U-T10: a VIDEO-kind asset renders through <OffthreadVideo>, MUTED, and gets NO pan", () => {
     // Latent second bug: before the manifest could distinguish a still from a clip, EVERY
     // visual — including a generated video — went through <Img>, which renders a single
     // frame of it at best.
     //
-    // SCOPE OF THIS TEST, stated plainly: it drives `visualAssetKind: "video"` EXPLICITLY
-    // via the fixture. Nothing in this suite — or anywhere else — asserts that the field is
-    // ever POPULATED, because no producer writes it: it is read here and in the nextjs
-    // preview, and plumbed through all four schema mirrors, but `setSceneVisual` /
-    // `IMAGE_GENERATED` write only `visualAssetKey`. So this makes closing the latent bug
-    // possible; it does not close it. A generated video asset is still rendered through
-    // <Img> in production until a producer sets the kind.
+    // SCOPE, CORRECTED 2026-07-30. This test used to say the branch was unreachable in
+    // production because nothing wrote `visualAssetKind`. That is STALE: the studio's
+    // `VIDEO_GENERATED` reducer case writes `kind: "video"` alongside the key, and
+    // `lib/studio/storyboard.ts` carries it into the manifest. The branch is live, which
+    // is why the user hears a generated clip's own soundtrack clashing with the narration.
+    //
+    // `muted` is the fix. The clip is requested as a VISUAL; whatever audio the video model
+    // happened to produce is never wanted, and it arrives at full level over a narration
+    // track this composition is at the same time carefully ducking the music under.
+    //
+    // This assertion is a SOURCE-text claim and is deliberately not the only pin: both
+    // scene fixtures here are stills, so adding `muted` moves zero goldens. The behavioural
+    // proof — render a clip with a loud soundtrack and measure silence — is `E-V1` in
+    // `tests/e2e/render-bug-proofs.bundle.e2e.ts`.
     const gamma = files.get("src/scenes/Gamma.tsx") as string;
     expect(gamma).toContain("<OffthreadVideo");
+    expect(gamma).toContain("muted");
     expect(gamma).not.toContain("<Img");
     expect(gamma).not.toContain("scale: interpolate(");
   });

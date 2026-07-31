@@ -108,6 +108,23 @@ export function toneWav(seconds: number, frequencyHz = 440): Buffer {
   return wavFromPcm16(pcm, { sampleRate: TONE_SAMPLE_RATE, channels: 1 });
 }
 
+/**
+ * `seconds` of digital SILENCE in the same container as {@link toneWav}.
+ *
+ * Needed to measure ONE track in a mix. The music-duck proof asks "how loud is the bed
+ * while narration is playing?" — and a narration tone would drown the answer, because
+ * `windowLevel` measures the SUM. A silent narration clip keeps the duck WINDOW (which is
+ * derived from the manifest's `narrationAssetKey`/`narrationDurationSeconds`, not from the
+ * audio) while leaving the measured level as the music alone.
+ */
+export function silentWav(seconds: number): Buffer {
+  const samples = Math.round(seconds * TONE_SAMPLE_RATE);
+  return wavFromPcm16(Buffer.alloc(samples * 2), {
+    sampleRate: TONE_SAMPLE_RATE,
+    channels: 1,
+  });
+}
+
 // --- WAV analysis ---------------------------------------------------------------
 
 /**

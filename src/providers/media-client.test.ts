@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { ProviderHttpError, retryUnlessPermanent } from "./errors";
 import {
   audioDurationSeconds,
+  clearSpeechVoiceCache,
   decodeDataUri,
   downloadBytes,
   fetchAssetBytes,
@@ -287,18 +288,114 @@ describe("requestSpeech — the DEDICATED /api/v1/audio/speech endpoint", () => 
     expect(result.durationSeconds).toBeCloseTo(3.528, 6);
   });
 
-  it("U-M10: always sends a voice — the live endpoint rejects the request without one", async () => {
-    // Verified live: omitting `voice` returns
-    // `{"code":"invalid_type","path":["voice"],"message":"expected string, received undefined"}`.
-    const rec = recorder(
-      () => new Response(mp3Frames("mpeg2-24k-mono", 2), { status: 200 }),
+  /**
+   * When the caller names no voice, the voice is DISCOVERED from the provider's own
+   * speech catalogue — it is never a constant in this file.
+   *
+   * `DEFAULT_NARRATION_VOICE = "alloy"` used to live here, and it was both load-bearing
+   * and wrong. Load-bearing because omitting `voice` is a hard 400 (verified live:
+   * `{"error":{"message":"An explicit voice is required for this TTS provider.","code":400}}`).
+   * Wrong because `alloy` is not one of `hexgrad/kokoro-82m`'s 54 voices — it survived
+   * only via an undocumented OpenAI→Kokoro ALIAS layer, and on a model that does not alias
+   * it is a hard 400 that fails the whole generation.
+   *
+   * Substituting a real Kokoro id would have reintroduced the exact anti-pattern this run
+   * deletes: asserting a voice for a model without asking the provider. `supported_voices`
+   * is a top-level key on every entry of `GET /api/v1/models?output_modalities=speech`,
+   * the endpoint answers unauthenticated, and the api already reads it — so the honest
+   * default is the model's own first published voice.
+   */
+  const speechCatalogue = (
+    entries: Array<{ id: string; supported_voices?: unknown }>,
+  ) =>
+    new Response(JSON.stringify({ data: entries }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+  /** Route by URL: the catalogue GET and the speech POST are different requests. */
+  function speechRecorder(
+    entries: Array<{ id: string; supported_voices?: unknown }>,
+    audio = mp3Frames("mpeg2-24k-mono", 2),
+  ) {
+    return recorder((req) =>
+      req.url.includes("/audio/speech")
+        ? new Response(audio, { status: 200, headers: { "content-type": "audio/mpeg" } })
+        : speechCatalogue(entries),
     );
+  }
+
+  it("U-M10: with no voice named, the model's OWN first published voice is sent", async () => {
+    clearSpeechVoiceCache();
+    const rec = speechRecorder([
+      { id: "other/tts", supported_voices: ["nope"] },
+      { id: "hexgrad/kokoro-82m", supported_voices: ["af_alloy", "am_adam"] },
+    ]);
     await requestSpeech(
       { ...CFG, fetchImpl: rec.fetch },
       { modelId: "hexgrad/kokoro-82m", input: "x" },
     );
-    expect(typeof JSON.parse(rec.reqs[0].body).voice).toBe("string");
-    expect(JSON.parse(rec.reqs[0].body).voice.length).toBeGreaterThan(0);
+
+    const speech = rec.reqs.find((r) => r.url.includes("/audio/speech"))!;
+    expect(JSON.parse(speech.body).voice).toBe("af_alloy");
+    // Read from the catalogue for THIS model, not the first entry in the list.
+    const list = rec.reqs.find((r) => r.url.includes("output_modalities=speech"))!;
+    expect(list.method ?? "GET").toBe("GET");
+  });
+
+  it("U-M10b: an unpublished vocabulary is a LOUD 502, never a guessed id", async () => {
+    // `supported_voices: null` is a real live state (6 of 19 speech models). Guessing here
+    // is what produced the reported bug; 502 is retryable, so a provider blip does not
+    // permanently fail the generation, and a genuinely voice-less model fails visibly
+    // rather than narrating in someone else's voice.
+    clearSpeechVoiceCache();
+    for (const entries of [
+      [{ id: "hexgrad/kokoro-82m", supported_voices: null }],
+      [{ id: "hexgrad/kokoro-82m", supported_voices: [] }],
+      [{ id: "someone/else" }],
+    ]) {
+      clearSpeechVoiceCache();
+      const rec = speechRecorder(entries);
+      const err = await requestSpeech(
+        { ...CFG, fetchImpl: rec.fetch },
+        { modelId: "hexgrad/kokoro-82m", input: "x" },
+      ).catch((e) => e);
+      expect(err, JSON.stringify(entries)).toBeInstanceOf(ProviderHttpError);
+      expect((err as ProviderHttpError).status).toBe(502);
+      // Nothing was posted to the speech endpoint — no guess reached the provider.
+      expect(rec.reqs.some((r) => r.url.includes("/audio/speech"))).toBe(false);
+    }
+  });
+
+  it("U-M10c: an explicitly named voice never triggers a catalogue read", async () => {
+    // Narration is synthesized ONE CLIP PER SCENE, so this path runs 5–10 times per
+    // generation. The studio always names a voice now; the discovery is the fallback for
+    // legacy manifests and non-studio callers only.
+    clearSpeechVoiceCache();
+    const rec = speechRecorder([
+      { id: "hexgrad/kokoro-82m", supported_voices: ["af_alloy"] },
+    ]);
+    await requestSpeech(
+      { ...CFG, fetchImpl: rec.fetch },
+      { modelId: "hexgrad/kokoro-82m", input: "x", voice: "am_adam" },
+    );
+    expect(rec.reqs).toHaveLength(1);
+    expect(JSON.parse(rec.reqs[0].body).voice).toBe("am_adam");
+  });
+
+  it("U-M10d: the discovered vocabulary is cached across scenes", async () => {
+    clearSpeechVoiceCache();
+    const rec = speechRecorder([
+      { id: "hexgrad/kokoro-82m", supported_voices: ["af_alloy"] },
+    ]);
+    const cfg = { ...CFG, fetchImpl: rec.fetch };
+    for (const input of ["one", "two", "three"]) {
+      await requestSpeech(cfg, { modelId: "hexgrad/kokoro-82m", input });
+    }
+    expect(rec.reqs.filter((r) => r.url.includes("output_modalities=speech"))).toHaveLength(
+      1,
+    );
+    expect(rec.reqs.filter((r) => r.url.includes("/audio/speech"))).toHaveLength(3);
   });
 
   it("U-M11: surfaces a non-2xx as a ProviderHttpError", async () => {

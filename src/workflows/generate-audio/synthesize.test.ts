@@ -46,7 +46,10 @@ describe("buildNarrationSceneArgs", () => {
       speech: {
         modelId: "resolved/speech-model",
         input: "In the beginning God created the heaven and the earth.",
-        voice: "alloy",
+        // MOVED: this read `"alloy"`, the shipped `DEFAULT_NARRATION_VOICE`. This fixture
+        // chose no voice, and resolving that now belongs to `requestSpeech` — the one
+        // place that reads the model's own published vocabulary. See U-S4b.
+        voice: undefined,
       },
     });
     expect(args[1].sceneId).toBe("s2");
@@ -83,11 +86,19 @@ describe("buildNarrationSceneArgs", () => {
     }
   });
 
-  it("U-S4b: falls back to the default provider voice when no id was chosen", () => {
-    // Absent is a real state: every manifest committed before this feature existed, and
-    // any project whose user never opened the voice list.
+  it("U-S4b: leaves the voice UNSET when no id was chosen — it does not pick one here", () => {
+    // MOVED. This used to assert `"alloy"`, the shipped `DEFAULT_NARRATION_VOICE`, which
+    // is not one of `hexgrad/kokoro-82m`'s 54 voices at all. It only ever worked through
+    // an undocumented OpenAI→Kokoro alias layer, and on a model that does not alias it is
+    // a hard 400 that fails the entire generation.
+    //
+    // Absent stays a real state (every manifest committed before the picker existed), but
+    // resolving it belongs at the ONE place that knows the model's own vocabulary —
+    // `requestSpeech`, which reads `supported_voices` from the provider. A builder that
+    // substituted an id here would be asserting a voice for a model it never asked about,
+    // which is the whole bug.
     for (const a of buildNarrationSceneArgs(narration)) {
-      expect(a.speech.voice).toBe("alloy");
+      expect(a.speech.voice).toBeUndefined();
     }
   });
 
@@ -98,10 +109,22 @@ describe("buildNarrationSceneArgs", () => {
     // (`requestSpeech` sends exactly {model, input, voice, response_format}).
     for (const req of [narration, narrationWithVoice]) {
       for (const a of buildNarrationSceneArgs(req)) {
-        expect(a.speech.voice).not.toContain("JEJ");
-        expect(a.speech.voice).not.toContain("baritone");
+        // Either no voice at all (the provider resolves one from its own catalogue) or a
+        // real id — never the prose. Asserted as an explicit disjunction rather than by
+        // letting `undefined` satisfy a `not.toContain`, which would make the case pass
+        // for the wrong reason on the fixture that chose nothing.
+        expect(typeof a.speech.voice === "string" || a.speech.voice === undefined).toBe(
+          true,
+        );
+        if (typeof a.speech.voice === "string") {
+          expect(a.speech.voice).not.toContain("JEJ");
+          expect(a.speech.voice).not.toContain("baritone");
+        }
       }
     }
+    // …and the fixture that DID choose one really does reach the disjunction's live arm,
+    // so the guard above is not vacuous.
+    expect(buildNarrationSceneArgs(narrationWithVoice)[0].speech.voice).toBe("zac");
   });
 
   it("U-S4d: an id chosen for one scene is used for EVERY scene — one narrator per video", () => {
