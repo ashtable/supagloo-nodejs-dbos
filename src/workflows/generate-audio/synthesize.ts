@@ -1,3 +1,4 @@
+import type { GenerateNarrationInput } from "@supagloo/database-lib";
 import {
   type RequestMusicArgs,
   type RequestSpeechArgs,
@@ -60,22 +61,27 @@ export interface NarrationSceneArgs {
 }
 
 /**
- * The chosen provider voice id, read STRUCTURALLY off the parsed narration input.
+ * The chosen provider voice id, or `undefined` when the project never picked one.
  *
- * `GenerateNarrationInputSchema` is `NarrationSpecSchema.passthrough()`, so a top-level
- * key survives validation here even though this repo's pinned `@supagloo/database-lib`
- * copy does not yet DECLARE it — the same mechanism `faithAlignment` already rides for
- * image generations. The cast is the forward declaration.
+ * Absent stays absent: resolving an unset voice belongs to `requestSpeech`, the one place
+ * that reads the model's OWN published `supported_voices`. Substituting an id here would
+ * assert a voice for a model this builder never asked about.
  *
- * DELETE THE CAST AT THE db-lib BUMP (`NarrationSpecSchema.voiceId` types it).
+ * This used to take `input: unknown` and read the key through a
+ * `(input as { voiceId?: unknown }).voiceId` forward declaration, guarded by
+ * `typeof raw === "string" && raw.length > 0`. Both are gone, and neither removal was a
+ * judgement call. MEASURED against the pinned db-lib (`fc5cf2c`): `NarrationSpecSchema`
+ * DECLARES `voiceId: z.string().min(1).optional()`, and `.passthrough()` exempts only
+ * UNDECLARED keys — so `parseAudioRequest`'s `GenerateNarrationInputSchema.safeParse`
+ * rejects `123`, `null` and `""` outright, and the only values that can reach here are
+ * `undefined` or a non-empty string. The runtime guard could not fire, which also made it
+ * unfalsifiable by any test; the schema is the check and the parameter type is the proof
+ * that it ran.
  *
- * Anything that is not a non-empty string is treated as absent rather than forwarded: an
- * unknown voice is a hard provider 400, and degrading to the default narrator is a far
- * better outcome than failing the whole generation on a malformed id.
+ * Mirrors `render/audio.ts`'s `narrationVoiceFor` — **both sites or neither**.
  */
-function chosenVoiceId(input: unknown): string | undefined {
-  const raw = (input as { voiceId?: unknown } | null | undefined)?.voiceId;
-  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+function chosenVoiceId(input: GenerateNarrationInput): string | undefined {
+  return input.voiceId;
 }
 
 export function buildNarrationSceneArgs(

@@ -14,7 +14,9 @@ import type { AudioRequest } from "./request";
  * duration — verified live, no music model on OpenRouter accepts one.
  */
 
-const narration: AudioRequest = {
+type NarrationRequest = Extract<AudioRequest, { kind: "narration" }>;
+
+const narration: NarrationRequest = {
   kind: "narration",
   userId: "u1",
   model: "resolved/speech-model",
@@ -28,13 +30,19 @@ const narration: AudioRequest = {
   },
 };
 
-/** The same request with the studio's CHOSEN voice attached (feature 1). */
-const narrationWithVoice: AudioRequest = {
+/** The same request with the studio's CHOSEN voice attached (feature 1).
+ *
+ *  CORRECTED 2026-07-30: this was built through two `as Extract<AudioRequest,
+ *  {kind:"narration"}>["input"]` casts, needed only because `voiceId` was not yet declared
+ *  on `NarrationSpecSchema`. The pinned db-lib (`fc5cf2c`) declares it, so both casts are
+ *  gone and the fixture is plainly constructed — which matters, because an `as` suppresses
+ *  excess-property checking, so under the old form a misspelt `voiceId` compiled fine and
+ *  U-S4/U-S4d/U-S4e would have failed as a confusing runtime mismatch instead of at the
+ *  keystroke. Narrowing the fixture's TYPE (rather than casting at each use) is what makes
+ *  `narration.input` a `GenerateNarrationInput` here. */
+const narrationWithVoice: NarrationRequest = {
   ...narration,
-  input: {
-    ...(narration.input as Extract<AudioRequest, { kind: "narration" }>["input"]),
-    voiceId: "zac",
-  } as Extract<AudioRequest, { kind: "narration" }>["input"],
+  input: { ...narration.input, voiceId: "zac" },
 };
 
 describe("buildNarrationSceneArgs", () => {

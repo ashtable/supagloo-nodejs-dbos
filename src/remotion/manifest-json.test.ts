@@ -142,29 +142,34 @@ describe("canonicalizeManifest — aiSettings (U-AS4)", () => {
 // every commit — and for `voiceId` that would restore the exact bug being fixed one
 // commit later, with the studio still displaying the choice it had already lost.
 //
-// Both are read through a locally-declared FORWARD type because this repo's
-// `@supagloo/database-lib` is the nested submodule, pinned until the release step. The
-// reads are structural over a plain JSON object, so the runtime behaviour is correct
-// today. DELETE THE FORWARD TYPE AT THE db-lib BUMP.
-interface ForwardManifest {
-  narratorVoice: { voiceId?: string };
-  scripture?: {
-    reference: string;
-    translation: string;
-    language?: string;
-    passageId?: string;
-  };
-}
-const forwardAs = (m: ProjectManifest, extra: ForwardManifest): ProjectManifest =>
-  ({
-    ...m,
-    ...extra,
-    narratorVoice: { ...m.narratorVoice, ...extra.narratorVoice },
-  }) as ProjectManifest;
+// CORRECTED 2026-07-30. Both fixtures used to be built by a `forwardAs` helper over a
+// locally-declared `ForwardManifest` interface, ending in `as ProjectManifest`, carrying
+// "DELETE THE FORWARD TYPE AT THE db-lib BUMP". The pinned db-lib (`fc5cf2c`) now DECLARES
+// both — `VoiceDescriptorSchema.voiceId` and `ProjectManifestSchema.scripture` — so the
+// forward type is gone.
+//
+// It is worth being precise about what that cast was costing, because it is more than
+// tidiness: `as ProjectManifest` made these fixtures unfalsifiable. A test whose input is
+// FORCED into the type cannot fail when the real field is renamed, retyped or dropped
+// upstream — it would keep compiling and keep asserting a key that nothing else in the
+// system produces. U-V7..U-W14 are now built by plain, cast-free construction, so db-lib
+// losing either field breaks this file at compile time, which is the whole point of
+// deleting the casts in `manifest-json.ts` itself.
+const withFields = (
+  m: ProjectManifest,
+  extra: {
+    narratorVoice?: Partial<ProjectManifest["narratorVoice"]>;
+    scripture?: ProjectManifest["scripture"];
+  },
+): ProjectManifest => ({
+  ...m,
+  ...extra,
+  narratorVoice: { ...m.narratorVoice, ...extra.narratorVoice },
+});
 
 describe("canonicalizeManifest — narratorVoice.voiceId (feature 1)", () => {
   it("U-V7: the chosen voice id survives canonicalization", () => {
-    const manifest = forwardAs(baseManifest, { narratorVoice: { voiceId: "zac" } });
+    const manifest = withFields(baseManifest, { narratorVoice: { voiceId: "zac" } });
     const out = canonicalizeManifest(manifest);
     expect((out.narratorVoice as Record<string, unknown>).voiceId).toBe("zac");
   });
@@ -175,7 +180,7 @@ describe("canonicalizeManifest — narratorVoice.voiceId (feature 1)", () => {
   });
 
   it("U-V9: voiceId is emitted AFTER description/label/assetKey — fixed key order", () => {
-    const manifest = forwardAs(baseManifest, {
+    const manifest = withFields(baseManifest, {
       narratorVoice: { voiceId: "zac" },
     });
     const withAll = {
@@ -205,7 +210,7 @@ describe("canonicalizeManifest — scripture (feature 2)", () => {
 
   it("U-W10: the origin passage survives canonicalization intact", () => {
     const out = canonicalizeManifest(
-      forwardAs(baseManifest, { narratorVoice: {}, scripture }),
+      withFields(baseManifest, { narratorVoice: {}, scripture }),
     );
     expect(out.scripture).toEqual(scripture);
   });
@@ -216,7 +221,7 @@ describe("canonicalizeManifest — scripture (feature 2)", () => {
 
   it("U-W12: the optional halves stay absent rather than materializing as undefined", () => {
     const out = canonicalizeManifest(
-      forwardAs(baseManifest, {
+      withFields(baseManifest, {
         narratorVoice: {},
         scripture: { reference: "Psalm 121", translation: "ASV" },
       }),
@@ -233,7 +238,7 @@ describe("canonicalizeManifest — scripture (feature 2)", () => {
       reference: "Psalm 121",
     };
     const out = canonicalizeManifest(
-      forwardAs(baseManifest, { narratorVoice: {}, scripture: reversed }),
+      withFields(baseManifest, { narratorVoice: {}, scripture: reversed }),
     );
     expect(Object.keys(out.scripture as object)).toEqual([
       "reference",
@@ -245,7 +250,7 @@ describe("canonicalizeManifest — scripture (feature 2)", () => {
 
   it("U-W14: serializeManifest emits both new fields as stable JSON text", () => {
     const text = serializeManifest(
-      forwardAs(baseManifest, { narratorVoice: { voiceId: "zac" }, scripture }),
+      withFields(baseManifest, { narratorVoice: { voiceId: "zac" }, scripture }),
     );
     expect(text).toContain('"voiceId": "zac"');
     expect(text).toContain('"passageId": "PSA.121"');

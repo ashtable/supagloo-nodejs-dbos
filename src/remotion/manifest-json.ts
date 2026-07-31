@@ -83,9 +83,13 @@ export function canonicalizeManifest(
   // Feature 1 — the CHOSEN provider voice id, under the same symmetry invariant. Omitting
   // this branch would erase the user's narrator on the next commit while the studio still
   // displayed the choice it had already lost, and the next render would silently revert to
-  // the default voice. Forward-typed: this repo's pinned db-lib copy does not declare it
-  // yet. DELETE THE CAST AT THE db-lib BUMP.
-  const voiceId = (manifest.narratorVoice as { voiceId?: unknown }).voiceId;
+  // the default voice. Read through the DECLARED type: `VoiceDescriptorSchema.voiceId`
+  // exists at the pinned db-lib (`fc5cf2c`), so the forward-declaring cast that used to
+  // stand here is gone and a rename or removal upstream now breaks this line at compile
+  // time instead of silently emitting nothing. The `!== undefined` check is not a type
+  // guard and stays: it is the omit-unset-optionals rule that keeps the on-disk form
+  // byte-stable, exactly as `label`/`assetKey` above and `music` below do.
+  const { voiceId } = manifest.narratorVoice;
   if (voiceId !== undefined) {
     narratorVoice.voiceId = voiceId;
   }
@@ -102,17 +106,12 @@ export function canonicalizeManifest(
   // without this branch the very first commit from the studio would erase it and the
   // first-time storyboard generation would lose the passage the project was created for.
   // Fixed key order, `undefined` optionals omitted, byte-stable on disk.
-  // Forward-typed. DELETE THE CAST AT THE db-lib BUMP.
-  const scripture = (
-    manifest as {
-      scripture?: {
-        reference: string;
-        translation: string;
-        language?: string;
-        passageId?: string;
-      };
-    }
-  ).scripture;
+  // Read through the DECLARED type: `ProjectManifestSchema.scripture` exists at the pinned
+  // db-lib (`fc5cf2c`), so the hand-written forward shape that used to sit here is gone.
+  // That shape had to be kept in sync by eye; the real `ManifestScriptureSchema` now
+  // enforces it, and a field added upstream fails this block at compile time rather than
+  // being quietly dropped on every commit.
+  const { scripture } = manifest;
   if (scripture !== undefined) {
     const out2: Record<string, unknown> = {
       reference: scripture.reference,

@@ -106,12 +106,18 @@ export function renderSceneNarrationAssetKey(sceneId: string): string {
  * model's own `supported_voices` — so **both sites or neither** now holds by delegation
  * rather than by two constants agreeing.
  *
- * Read structurally because this repo's pinned `@supagloo/database-lib` copy does not yet
- * declare the field. DELETE THE CAST AT THE db-lib BUMP.
+ * This used to read the field through a `(manifest.narratorVoice as { voiceId?: unknown })`
+ * forward declaration, guarded by `typeof raw === "string" && raw.length > 0`. Both are
+ * gone, and neither removal was a judgement call. MEASURED against the pinned db-lib
+ * (`fc5cf2c`): `VoiceDescriptorSchema` DECLARES `voiceId: z.string().min(1).optional()` and
+ * is a plain `z.object`, so it rejects `123`, `null` and `""` and STRIPS unknown keys; the
+ * manifest reaching here is always `readManifest`'s `ProjectManifestSchema.safeParse`
+ * output (`render/workspace.ts`), so the only values that can arrive are `undefined` or a
+ * non-empty string. The runtime guard could not fire, which also made it unfalsifiable by
+ * any test; the schema is the check and the declared type is the proof that it ran.
  */
 function narrationVoiceFor(manifest: ProjectManifest): string | undefined {
-  const raw = (manifest.narratorVoice as { voiceId?: unknown }).voiceId;
-  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  return manifest.narratorVoice.voiceId;
 }
 
 export interface PlanAudioArgs {
